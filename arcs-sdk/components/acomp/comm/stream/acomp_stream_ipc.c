@@ -1,0 +1,173 @@
+#include <stdio.h>
+#include <string.h>
+
+#include "acomp_stream_ipc.h"
+#include "utils/acomp_err.h"
+
+#define TAG "stream_ipc"
+#include "lisa_log.h"
+
+#define CACHE_LINE_SIZE (32)
+                                                                   
+static void stream_notify(struct virtqueue *vqa){
+
+    struct acomp_device* dev;
+    acomp_stream_t *stream;
+    acomp_stream_channel_t* channel;
+    acomp_ipc_stream_update_t *ipc_desc;
+    int ret;
+
+    channel = vqa->priv;
+    stream = channel->priv;
+
+    ipc_desc = psram_malloc_align(CACHE_LINE_SIZE, sizeof(acomp_ipc_stream_update_t));
+    if(ipc_desc == NULL){
+        LISA_LOGE(TAG,"[%s %d] psram_malloc_align failed",__FUNCTION__,__LINE__);
+        return;
+    }
+    ipc_desc->index = channel->idx;
+
+    ret = acomp_ipc_build_frame_send_sync( stream->dev_index,
+                                    ACOMP_CONTEXT_IPC_GLB_CONTROL| IPC_HEADER_REQ_REPALY,
+                                    ACOMP_IPC_CMD_STREAM_UPDATE,
+                                    0,
+                                    ipc_desc,
+                                    sizeof(acomp_ipc_stream_update_t));   
+
+    psram_free(ipc_desc);
+    // LISA_LOGI(TAG,"[%s %d]ret:%d",__FUNCTION__,__LINE__,ret);  
+}
+
+acomp_stream_channel_t* acomp_stream_ipc_channel_create(acomp_stream_t* stream,uint32_t chn,uint32_t dev_index,acomp_stream_chn_create_desc_t *desc){
+
+    uint32_t mem_size;
+    uint8_t* mem_ptr;
+    int ret;
+    acomp_ipc_stream_create_desc_t *ipc_desc;
+
+    acomp_stream_channel_desc_t chn_desc = {
+        .cname = desc->cname,
+        .direction = desc->direction,
+        .vq_id = desc->index,
+        .ring = {
+            .phy_addr = NULL,
+            .align = 32,
+            .num_descs = desc->num_descs,
+            .pad = 32,
+        },
+        .buffer_size = desc->buffer_size,
+        .notify_fc = stream_notify,
+        .callback_fc = NULL,
+        .kick_policy = desc->kick_policy,
+        .user_priv = NULL,
+    };
+
+    mem_size = acomp_stream_calc_mem_size (chn_desc.ring.num_descs, chn_desc.buffer_size, chn_desc.ring.align);
+    if (mem_size == 0) {
+        LISA_LOGE(TAG, "Failed to calculate stream memory size");
+        return NULL;
+    }
+
+    mem_ptr = psram_malloc_align(chn_desc.ring.align, mem_size);
+    if (mem_ptr == NULL) {
+        LISA_LOGE(TAG, "Failed to allocate stream memory");
+        return NULL;
+    }
+    memset(mem_ptr, 0, mem_size);
+    HAL_FlushInvalidateDCache_by_Addr(mem_ptr, mem_size);
+
+    chn_desc.ring.phy_addr = mem_ptr;
+    acomp_stream_channel_t *channel = stream->ops.channel_create(stream, &chn_desc);
+
+    if(!channel){
+        LISA_LOGE(TAG, "Failed to create channel %d", chn);
+        psram_free(mem_ptr);
+        return NULL;
+    }
+    channel->shared_mem_ptr = mem_ptr;
+    channel->shared_mem_size = mem_size;
+
+    ipc_desc = psram_malloc_align(chn_desc.ring.align, sizeof(acomp_ipc_stream_create_desc_t));
+    if (ipc_desc == NULL) {
+        LISA_LOGE(TAG, "Failed to allocate ipc stream create memory");
+        psram_free(mem_ptr);
+        channel->shared_mem_ptr = NULL;
+        channel->shared_mem_size = 0;
+        stream->ops.channel_destroy(channel);
+        return NULL;
+    }
+
+    snprintf(ipc_desc->name, sizeof(ipc_desc->name), "%s", chn_desc.cname);
+    ipc_desc->direction = chn_desc.direction == ACOMP_STREAM_DIRECTION_M2R ? 0 : 1;
+    ipc_desc->index = chn_desc.vq_id;
+    ipc_desc->phy_addr = mem_ptr;
+    ipc_desc->mem_size = mem_size;
+    ipc_desc->align = chn_desc.ring.align;
+    ipc_desc->buffer_size = chn_desc.buffer_size;
+    ipc_desc->kick_policy = chn_desc.kick_policy;
+    
+    ret = acomp_ipc_build_frame_send_sync(dev_index, ACOMP_CONTEXT_IPC_GLB_CONTROL | IPC_HEADER_REQ_REPALY,
+                                        ACOMP_IPC_CMD_STREAM_CREATE, 0, ipc_desc, sizeof(acomp_ipc_stream_create_desc_t));
+    if(ret != ACOMP_ERR_OK){
+        psram_free(ipc_desc);
+        psram_free(mem_ptr);
+        channel->shared_mem_ptr = NULL;
+        channel->shared_mem_size = 0;
+        stream->ops.channel_destroy(channel);
+        return NULL;
+    }
+    psram_free(ipc_desc);
+    return channel;
+}
+
+
+int acomp_stream_ipc_channel_destroy(acomp_stream_t* stream, uint32_t dev_index, uint32_t chn){
+    acomp_ipc_stream_destroy_desc_t ipc_desc;
+    acomp_stream_channel_t *channel;
+    int ret;
+
+    if (stream == NULL) {
+        return ACOMP_ERR_INVALID_STATE;
+    }
+
+    if (chn >= ACOMP_STREAM_MAX_CHANNEL) {
+        return ACOMP_ERR_INVALID_ARG;
+    }
+
+    channel = stream->ch[chn];
+    if (channel == NULL) {
+        return ACOMP_ERR_OK;
+    }
+
+    memset(&ipc_desc, 0, sizeof(ipc_desc));
+    ipc_desc.index = chn;
+    ret = acomp_ipc_build_frame_send_sync(dev_index,
+                                          ACOMP_CONTEXT_IPC_GLB_CONTROL | IPC_HEADER_REQ_REPALY,
+                                          ACOMP_IPC_CMD_STREAM_DESTROY,
+                                          0,
+                                          &ipc_desc,
+                                          sizeof(ipc_desc));
+    if (ret != ACOMP_ERR_OK) {
+        LISA_LOGE(TAG, "destroy remote stream chn(%u) failed: %d", chn, ret);
+        return ret;
+    }
+
+    if (channel->shared_mem_ptr != NULL) {
+        psram_free(channel->shared_mem_ptr);
+        channel->shared_mem_ptr = NULL;
+        channel->shared_mem_size = 0;
+    }
+
+    if (stream->ops.channel_destroy == NULL) {
+        return ACOMP_ERR_INVALID_STATE;
+    }
+
+    ret = stream->ops.channel_destroy(channel);
+    if (ret != ACOMP_STREAM_SUCCESS) {
+        LISA_LOGE(TAG, "destroy local stream chn(%u) failed: %d", chn, ret);
+        return ACOMP_ERR_INVALID_STATE;
+    }
+
+    stream->ch[chn] = NULL;
+    return ACOMP_ERR_OK;
+}

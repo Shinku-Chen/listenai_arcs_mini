@@ -1,0 +1,18 @@
+menu "Voice Player Configuration"
+
+config PA_DEVICE_NAME
+	string "PA Device Name"
+	default "gpioa"
+	help
+	  Specify the PA (Power Amplifier) device name.
+	  Default is "gpioa".
+
+config VOICE_PLAYER_DEFAULT_VOLUME
+	int "Default system volume (0-100)"
+	default 70
+	range 0 100
+	help
+	  System volume used when no saved value exists in KV storage.
+	  This is the initial volume before the user adjusts it.
+
+endmenu

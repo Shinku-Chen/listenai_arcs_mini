@@ -1,0 +1,106 @@
+#ifndef __MODEL_VOICE_H__
+#define __MODEL_VOICE_H__
+
+#include <stdint.h>
+#include <math.h>
+#include <stdbool.h>
+
+#ifdef CONFIG_OTA
+#include "ota_manager.h"
+#endif
+#ifdef CONFIG_LOG_UPLOAD
+#include "log_upload.h"
+#endif
+
+typedef enum {
+    MODEL_VOICE_WAKEUP_MODE_BUTTON = 0,
+    MODEL_VOICE_WAKEUP_MODE_VOICE_SINGLE,
+    MODEL_VOICE_WAKEUP_MODE_VOICE_MULTI,
+    MODEL_VOICE_WAKEUP_MODE_MAX
+} model_voice_wakeup_mode_t;
+
+typedef struct {
+    uint32_t index;
+    uint32_t start_index;
+    uint32_t end_index;
+    uint32_t start_ms;
+    uint32_t end_ms;
+    uint16_t text_len;
+    uint16_t reserved;
+    char text[];
+} model_voice_tts_timeline_t;
+
+int model_voice_off(void);
+int model_voice_on(void);
+
+struct model_voice_cb {
+    void (*on_tts_stoped)(void *arg);
+    void (*on_tts_error)(void *arg);
+    void (*on_tts_playing)(void *arg);
+    void (*on_camera_capture_tone_finished)(void *arg);
+    void (*on_emoji)(void *arg, const char *emoji_name);
+    void (*on_oneshot_emoji)(void *arg, const char *emoji_name);
+    void (*on_mcp_emoji)(void *arg, const char *emoji_name);
+    void (*on_mcp_loading)(void *arg, bool is_loading, const char *loading_text);
+    void (*on_connected)(void *arg);
+    void (*on_disconnected)(void *arg);
+    void (*on_start)(void *arg);
+    void (*on_finished)(void *arg);
+    void (*on_tts_text_start)(void *arg);
+    void (*on_tts_text_update)(const char *text, void *arg);
+    void (*on_tts_text_end)(void *arg);
+    void (*on_tts_text_interrupt)(void *arg);
+    void (*on_tts_timeline_start)(void *arg);
+    void (*on_tts_timeline_update)(const model_voice_tts_timeline_t *timeline, void *arg);
+    void (*on_tts_timeline_end)(void *arg);
+    void (*on_tts_timeline_fallback)(void *arg);
+    void (*on_iat_text_start)(void *arg);
+    void (*on_iat_text_update)(const char *text, void *arg);
+    void (*on_iat_text_end)(void *arg);
+    void (*on_image_rec)(void *arg);
+    void (*on_image_rec_failed)(void *arg);
+    void (*on_image_preview)(void *arg);
+    void (*on_image_url)(void *arg, const char *url);
+    void (*on_info_show)(void *arg);
+    void (*on_show_qrcode)(void *arg);
+    void (*on_standby_texts_changed)(void *arg);
+    void (*on_standby_text_update)(void *arg, const char *text, bool is_cloud_text);
+    void (*on_alarm_stopped)(void *arg);
+    void (*on_battery_query)(void *arg, uint8_t level, uint8_t status);
+#ifdef CONFIG_OTA
+    void (*on_ota_state_change)(const ota_state_t *state, void *arg);
+#endif
+#ifdef CONFIG_LOG_UPLOAD
+    void (*on_log_upload_state_change)(const log_upload_state_t *state, void *arg);
+#endif
+    void (*on_wakeup_mode_changed)(void *arg, model_voice_wakeup_mode_t mode);
+};
+
+int model_voice_init(void);
+int model_voice_cb_register(const struct model_voice_cb *cb, void *arg);
+int model_voice_cb_unregister(const struct model_voice_cb *cb);
+const char *model_voice_role_name_get(void);
+const char *model_voice_role_propmt_get(void);
+uint8_t model_voice_cloud_is_connected(void);
+uint8_t model_voice_cloud_is_running(void);
+uint8_t model_voice_tts_is_playing(void);
+uint8_t model_voice_tts_is_pending(void);
+int model_voice_tts_position_get(uint32_t *position_ms);
+uint8_t model_voice_music_is_playing(void);
+const char *model_voice_music_text_get(void);
+uint8_t model_voice_img_rec_is_mcp(void);
+const char *model_voice_last_iat_text_get(void);
+
+model_voice_wakeup_mode_t model_voice_wakeup_mode_get(void);
+int model_voice_wakeup_mode_set(model_voice_wakeup_mode_t mode);
+int model_voice_interaction_mode_set(int interaction_mode);
+void model_voice_notify_interaction_mode_changed(void);
+const char *model_voice_wakeup_mode_name_get(model_voice_wakeup_mode_t mode);
+int model_voice_img_recognition(uint8_t *rgb565, uint32_t len, int width, int height);
+int model_voice_oneshot_emoji_post(const char *emoji_name);
+
+uint32_t model_voice_standby_text_count_get(void);
+uint32_t model_voice_standby_text_interval_ms_get(void);
+const char *model_voice_standby_text_get(uint32_t index);
+
+#endif

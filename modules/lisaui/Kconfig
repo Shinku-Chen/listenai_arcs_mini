@@ -1,0 +1,31 @@
+menuconfig LISAUI
+    bool "LISAUI menuconfig"
+    default n
+    depends on SDK_MODULE_LVGL8
+    depends on EBUS
+    help
+        Enable LISAUI functionality base on LVGL
+
+if LISAUI
+   
+    choice 
+        prompt "LISAUI environment"
+        default LISAUI_ENV_ARCS_SDK
+        config LISAUI_ENV_ARCS_SDK
+            bool "ARCS SDK"
+        config LISAUI_ENV_SIMULATOR
+            bool "Simulator"
+    endchoice
+
+    config LISAUI_WIDGETS_ASSETS
+        bool "ASSETS"
+        default n          
+
+    config LISAUI_WIDGETS_LLM
+        bool "LLM"
+        default n          
+
+    config LISAUI_WIDGETS_VOICE
+        bool "VOICE"
+        default n
+endif

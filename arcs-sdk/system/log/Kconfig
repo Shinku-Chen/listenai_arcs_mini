@@ -1,0 +1,168 @@
+# Copyright (c) 2025, LISTENAI
+# SPDX-License-Identifier: Apache-2.0
+
+menu "log configuration"
+
+config LOG
+	bool "enable log"
+
+if LOG
+
+choice
+	prompt "log frontend"
+	default LOG_FRONTEND_EASYLOGGER
+	config LOG_FRONTEND_EASYLOGGER
+		bool "easylogger frontend"
+		select SDK_MODULE_EASYLOGGER
+endchoice
+
+config LOG_BACKEND_CONSOLE
+	bool "console backend"
+	default y
+
+rsource "Kconfig.early_log"
+
+config LOG_BACKEND_IPC_WRITER
+	bool "IPC log writer backend"
+	select ARCS_HAL_IPC
+	select ARCS_HAL_IPC_PRINT_WRITER
+	help
+		Forward local logs to the peer core through the IPC debug ring buffer.
+		Works on either IPC role (master or slave); the peer image must
+		enable LOG_BACKEND_IPC_READER.
+
+config LOG_BACKEND_IPC_READER
+	bool "IPC log reader"
+	select ARCS_HAL_IPC
+	select ARCS_HAL_IPC_PRINT_READER
+	help
+		Receive peer-core logs from the IPC debug ring buffer and print them
+		locally. Works on either IPC role (master or slave); the peer image
+		must enable LOG_BACKEND_IPC_WRITER.
+
+config LOG_BACKEND_SEGGER_RTT
+	bool "SEGGER RTT backend"
+	select SUPPORT_SEGGER_RTT
+	help
+		Enable SEGGER RTT as log backend.
+
+config LOG_CLOG_EARLY_UART_FALLBACK
+	bool "Route CLOG to early UART before lisa_log init"
+	depends on SOC_EARLY_LOG
+	default y
+	help
+		Route HAL CLOG/logDbg output to the SoC early UART logger before
+		lisa_log_init() has initialized the normal EasyLogger frontend.
+		After lisa_log_init(), CLOG/logDbg continues through the normal
+		lisa_log path.
+
+if LOG_BACKEND_IPC_WRITER
+
+config LOG_BACKEND_IPC_NAME
+	string "IPC log backend name"
+	default "ipc.log"
+	help
+		Define the name of the IPC log backend.
+
+config LOG_BACKEND_IPC_PREFIX
+	string "IPC log prefix"
+	default "[REMOTE] "
+	help
+		Prefix added to AP-side logs forwarded through the IPC backend.
+
+config LOG_BACKEND_IPC_CACHE_SIZE
+	int "IPC log backend cache size"
+	default 4096
+	range 256 65536
+	help
+		Size of the AP-side cache used before the IPC debug ring is ready.
+
+endif
+
+if LOG_BACKEND_SEGGER_RTT
+
+config LOG_BACKEND_SEGGER_RTT_NAME
+	string "SEGGER RTT log backend name"
+	default "rtt.log"
+	help
+		Define the name of the SEGGER RTT log backend.
+		This name will be used to identify the log backend in the system.
+
+endif
+
+config LOG_MODE_ASYNC
+	bool "asynchronous mode"
+	default y
+	select EASYLOGGER_LOG_MODE_ASYNC if SDK_MODULE_EASYLOGGER
+	help
+		Enable asynchronous logging mode for better performance.
+		Logs will be buffered and output in a separate task.
+
+if LOG_MODE_ASYNC
+config LOG_ASYNC_BUF_SIZE
+	int "asynchronous buffer size"
+	default 10240
+	help
+		Size of the buffer for asynchronous logging (in bytes).
+		Larger buffer can handle more log messages but uses more memory.
+
+config LOG_ASYNC_TASK_STACK_SIZE
+	int "asynchronous task stack size"
+	default 512
+	help
+		Stack size for the asynchronous logging task (in bytes).
+		Increase this if you experience stack overflow in log task.
+
+config LOG_ASYNC_TASK_PRIORITY
+	int "asynchronous task priority"
+	default 1
+	help
+		Priority of the asynchronous logging task.
+		Higher value means higher priority (depends on your RTOS).
+endif
+
+config LOG_LINE_BUF_SIZE
+	int "line buffer size"
+	default 1024
+	help
+		Maximum size of a single log line (in bytes).
+		Log messages longer than this will be truncated.
+
+config LOG_USE_POSIX_TIME
+	bool "use POSIX time"
+	help
+		Enable this to use POSIX time functions for timestamps.
+		Requires POSIX time support in your system.
+
+config LOG_BACKEND_SYS_NAME
+	string "system log backend name"
+	default "sys.log"
+	help
+		Define the name of the system log backend.
+		This name will be used to identify the log backend in the system.
+endif
+
+choice
+	prompt "log level"
+	default LOG_LEVEL_INFO
+	config LOG_LEVEL_ASSERT
+		bool "assert"
+		select EASYLOGGER_LOG_LEVEL_ASSERT if SDK_MODULE_EASYLOGGER
+	config LOG_LEVEL_ERROR
+		bool "error"
+		select EASYLOGGER_LOG_LEVEL_ERROR if SDK_MODULE_EASYLOGGER
+	config LOG_LEVEL_WARN
+		bool "warning"
+		select EASYLOGGER_LOG_LEVEL_WARN if SDK_MODULE_EASYLOGGER
+	config LOG_LEVEL_INFO
+		bool "info"
+		select EASYLOGGER_LOG_LEVEL_INFO if SDK_MODULE_EASYLOGGER
+	config LOG_LEVEL_DEBUG
+		bool "debug"
+		select EASYLOGGER_LOG_LEVEL_DEBUG if SDK_MODULE_EASYLOGGER
+	config LOG_LEVEL_VERBOSE
+		bool "verbose"
+		select EASYLOGGER_LOG_LEVEL_VERBOSE if SDK_MODULE_EASYLOGGER
+endchoice
+
+endmenu

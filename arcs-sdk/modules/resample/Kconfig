@@ -1,0 +1,8 @@
+menu "resample"
+
+config SDK_MODULE_RESAMPLE
+    bool "Enable resample"
+    default n
+    select LISA_OS
+
+endmenu

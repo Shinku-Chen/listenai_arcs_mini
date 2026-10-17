@@ -1,0 +1,31 @@
+# LISA ADC Driver Configuration
+#
+# Copyright (c) 2025, LISTENAI
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig LISA_ADC
+	bool "Enable LISA ADC Driver"
+	depends on LISA_DEVICE
+	help
+			Enable the LISA ADC device driver.
+
+if LISA_ADC
+
+endif # LISA_ADC
+
+if LISA_CH32V003
+
+config LISA_CH32V003_ADC
+	bool "Enable CH32V003 ADC child device"
+	default y
+	select LISA_ADC
+
+config LISA_CH32V003_ADC_TIMEOUT_MS
+	int "CH32V003 ADC conversion timeout (ms)"
+	default 2000
+
+config LISA_CH32V003_ADC_POLL_MS
+	int "CH32V003 ADC status poll interval (ms)"
+	default 10
+
+endif # LISA_CH32V003

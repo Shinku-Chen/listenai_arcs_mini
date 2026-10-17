@@ -1,0 +1,254 @@
+
+config ARCS_HAL_IPC
+    bool "Enable ARCS HAL IPC"
+    select ARCS_HAL_IC_LOCK
+    select RTOS_AL
+    default n
+    help
+        Enable IPC (Inter-Process Communication) support
+
+if ARCS_HAL_IPC
+    config ARCS_HAL_IPC_UTILS_IPC_FUNC_SECTION
+        string "IPC utils function section"
+        default ".itcm_text"
+        help
+            Enable IPC utils function section
+
+    choice
+        prompt "arcs hal wifi/lwip ipc type"
+        default ARCS_HAL_IPC_MASTER if LOG_BACKEND_IPC_READER
+        default ARCS_HAL_IPC_SLAVE if LOG_BACKEND_IPC_WRITER
+        default ARCS_HAL_IPC_MASTER if LWIP
+        default ARCS_HAL_IPC_SLAVE if WIFI
+        config ARCS_HAL_IPC_SLAVE
+            bool "IPC Slave"
+            select ARCS_HAL_IPC_MRPC_SERVER_WIFI if WIFI_LWIP_DIFF_CORE
+            select ARCS_HAL_IPC_MRPC_CLIENT_LWIP if WIFI_LWIP_DIFF_CORE
+        config ARCS_HAL_IPC_MASTER
+            bool "IPC Master"
+            select ARCS_HAL_IPC_MRPC_CLIENT_WIFI if WIFI_LWIP_DIFF_CORE
+            select ARCS_HAL_IPC_MRPC_SERVER_LWIP if WIFI_LWIP_DIFF_CORE
+    endchoice
+
+    config ARCS_HAL_IPC_MRPC_SERVER
+        bool "Enable MRPC server"
+        default y
+        help
+            Enable MRPC (Message Remote Procedure Call) server support
+
+    config ARCS_HAL_IPC_MRPC_CLIENT
+        bool "Enable MRPC client"
+        default y
+        help
+            Enable MRPC (Message Remote Procedure Call) client support
+
+    config ARCS_HAL_IPC_MRPC_SERVER_LWIP
+        bool "Enable LWIP MRPC server"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for LWIP API
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_LWIP
+        bool "Enable LWIP MRPC client"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for LWIP API
+
+    config ARCS_HAL_IPC_MRPC_SERVER_WIFI
+        bool "Enable WIFI MRPC server"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for WIFI API
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_WIFI
+        bool "Enable WIFI MRPC client"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for WIFI API
+
+    config ARCS_HAL_IPC_MRPC_SERVER_NVS
+        bool "Enable NVS MRPC server"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for NVS API
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_NVS
+        bool "Enable NVS MRPC client"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for NVS API
+
+    config ARCS_HAL_IPC_MRPC_SERVER_BT
+        bool "Enable BT MRPC server"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for BT API (runs on AP core with BLE stack)
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_BT
+        bool "Enable BT MRPC client"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        select ARCS_HAL_BTOS_INCLUDE
+        help
+            Enable MRPC client for BT API (runs on CP core to call BLE remotely)
+
+    config ARCS_HAL_IPC_MRPC_SERVER_BT_S2M
+        bool "Enable BT slave-to-master MRPC server"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for BT callbacks from the slave/AP image to the
+            master/CP image.
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_BT_S2M
+        bool "Enable BT slave-to-master MRPC client"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for BT callbacks from the slave/AP image to the
+            master/CP image.
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_FLASH_IF
+        bool "Enable flash if MRPC client"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for flash if API
+
+    config ARCS_HAL_IPC_MRPC_SERVER_FLASH_IF
+        bool "Enable flash if MRPC server"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for flash if API
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_UTILS_S2M
+        bool "Enable utils MRPC client S2M"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for utils API
+    
+    config ARCS_HAL_IPC_MRPC_SERVER_UTILS_S2M
+        bool "Enable utils MRPC server S2M"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for utils API
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_UTILS_M2S
+        bool "Enable utils MRPC client M2S"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for utils API
+    
+    config ARCS_HAL_IPC_MRPC_SERVER_UTILS_M2S
+        bool "Enable utils MRPC server M2S"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for utils API
+
+    config ARCS_HAL_IPC_MRPC_SERVER_AP_PM_LOCK
+        bool "Enable AP PM lock MRPC server"
+        default n
+        select ARCS_HAL_IPC_MRPC_SERVER
+        help
+            Enable MRPC server for AP-side remote PM lock control.
+
+    config ARCS_HAL_IPC_MRPC_CLIENT_AP_PM_LOCK
+        bool "Enable AP PM lock MRPC client"
+        default n
+        select ARCS_HAL_IPC_MRPC_CLIENT
+        help
+            Enable MRPC client for CP-side AP remote PM lock control.
+ 
+    config ARCS_HAL_IPC_HALT_BY_PEER_CORE
+        bool "Halt by peer core"
+        default n
+        help
+            Halt by peer core
+
+    config ARCS_HAL_IPC_HALT_PEER_CORE
+        bool "Halt peer core"
+        default n
+        help
+            Halt peer core
+    
+    config ARCS_HAL_IPC_FLASH_AGENT
+        bool "Enable flash agent"
+        default n
+        depends on ARCS_HAL_FLASH_IF
+        help
+            Enable flash agent
+
+    config ARCS_HAL_IPC_PRINT
+        bool "Enable IPC log forwarding"
+        default n
+        help
+            Enable IPC log forwarding through the shared debug ring buffer.
+            The forwarding direction is set by ARCS_HAL_IPC_PRINT_WRITER /
+            ARCS_HAL_IPC_PRINT_READER and is independent of the IPC
+            master/slave role. When neither direction option is set, the
+            legacy behavior applies: slave builds forward local logs to the
+            peer (writer) and master builds print peer logs (reader).
+
+    config ARCS_HAL_IPC_PRINT_WRITER
+        bool "IPC log writer (forward local logs to peer)"
+        default n
+        select ARCS_HAL_IPC_PRINT
+        help
+            Forward local logs into the shared IPC debug ring buffer so the
+            peer core can print them. Works on either IPC role. The peer
+            image must enable ARCS_HAL_IPC_PRINT_READER.
+
+    config ARCS_HAL_IPC_PRINT_READER
+        bool "IPC log reader (print peer logs locally)"
+        default n
+        select ARCS_HAL_IPC_PRINT
+        help
+            Initialize the shared IPC debug ring buffer and print logs
+            forwarded by the peer core. Works on either IPC role. The peer
+            image must enable ARCS_HAL_IPC_PRINT_WRITER. Only one image may
+            enable the reader.
+
+    if ARCS_HAL_IPC_PRINT
+
+    config ARCS_HAL_IPC_PRINT_BUF_SIZE
+        hex "IPC log ring buffer size"
+        default 0x00000400
+        help
+            Shared IPC debug ring buffer size for forwarded log bytes.
+
+    config ARCS_HAL_IPC_PRINT_NOTIFY_THRESHOLD
+        int "IPC log notify threshold"
+        default 128
+        help
+            Minimum pending IPC log bytes before the sender actively notifies
+            the peer core to drain the shared log ring buffer.
+
+    config ARCS_HAL_IPC_PRINT_POLL_TIMEOUT_MS
+        int "IPC log poll timeout (ms)"
+        default 3000
+        help
+            Maximum wait time for the IPC print receive task before it wakes up
+            and polls the shared log ring buffer again.
+
+    config ARCS_HAL_IPC_PRINT_SOURCE_TAG
+        string "IPC log source tag"
+        default "AP"
+        help
+            Source tag prepended on the IPC master side when printing
+            forwarded peer-core logs.
+
+    endif
+
+endif

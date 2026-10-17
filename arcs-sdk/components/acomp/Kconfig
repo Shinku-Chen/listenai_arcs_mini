@@ -1,0 +1,60 @@
+# Copyright (c) 2025, LISTENAI
+# SPDX-License-Identifier: Apache-2.0
+
+menu "algo components"
+
+config ACOMP
+	bool "algo components"
+
+config ACOMP_MASTER
+	bool "algo components master"
+	default y
+
+if ACOMP
+	config ACOMP_WSP
+		bool "algo component word spell"
+
+	config ACOMP_WAKEUP
+		bool "algo component wakeup"
+
+	config ACOMP_LOGGER
+		bool "algo component logger"
+
+	config ACOMP_FD
+		bool "algo component face detection"
+
+	config ACOMP_PALM
+		bool "algo component palm vein recognition"
+
+	config ACOMP_CV
+		bool "algo component cv"
+
+	config ACOMP_XTTS
+		bool "algo component xtts"
+
+	config ACOMP_TRANSLATION
+		bool "algo component translation"
+
+	config ACOMP_TUNER
+		bool "algo component tuner (EQ/DRC/Limiter)"
+
+	config ACOMP_CAE
+		bool "algo component cae"
+
+rsource "resmgr/Kconfig"
+rsource "wakeup/Kconfig"
+rsource "fd/Kconfig"
+rsource "palm/Kconfig"
+rsource "cv/Kconfig"
+rsource "xtts/Kconfig"
+rsource "translation/Kconfig"
+rsource "tuner/Kconfig"
+rsource "cae/Kconfig"
+endif
+
+if ACOMP_LOGGER
+	rsource "logger/Kconfig"
+endif
+
+rsource "Kconfig.res"
+endmenu

@@ -1,0 +1,13 @@
+menu "lisa player"
+
+config SDK_MODULE_LISA_PLAYER
+    bool "Enable lisa player"
+    select LISA_NET
+    default n
+
+config SDK_MODULE_LISA_PLAYER_DECODE_LOG_AUDIO_CACHE
+    bool "Enable lisa player decode audio cache log"
+    depends on SDK_MODULE_LISA_PLAYER
+    default n
+
+endmenu

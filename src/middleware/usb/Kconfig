@@ -1,0 +1,45 @@
+menu "Application usb menu"
+
+config APP_USB_AUDIO_ENABLE
+    bool "Enable usb audio device"
+    depends on TINY_USB || (CHERRYUSB && CHERRYUSB_DEVICE_AUDIO)
+    default n
+
+config APP_USB_CDC_ENABLE
+    bool "Enable usb cdc device"
+    depends on TINY_USB
+    default n
+
+config APP_USB_ROLE_DETECT
+    bool "Enable automatic hardware USB role switching"
+    depends on BOARD_ARCS_MINI3 && LISA_I2C1
+    depends on CHERRYUSB && CHERRYUSB_DEVICE && CHERRYUSB_HOST
+    default n
+    help
+        Read the USB-C role controller on the Mini 3 I2C1 bus. STATUS bit 0
+        reports connection state; TYPE bit 3 selects Host/Source and bit 4
+        selects Device/Sink.
+
+if APP_USB_ROLE_DETECT
+
+choice
+    prompt "USB role detection mode"
+    default APP_USB_ROLE_DRP
+
+config APP_USB_ROLE_DRP
+    bool "Enable Dual Role Port (DRP) mode"
+    default y
+
+config APP_USB_ROLE_HOST_ONLY
+    bool "Enable Host Only mode"
+    default n
+
+config APP_USB_ROLE_DEVICE_ONLY
+    bool "Enable Device Only mode"
+    default n
+
+endchoice
+
+endif
+
+endmenu

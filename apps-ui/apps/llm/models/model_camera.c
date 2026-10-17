@@ -1,0 +1,280 @@
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+
+#define TAG "model_camera"
+
+#include "lisa_ui_invoke.h"
+#include "lisa_ui_log.h"
+
+#ifdef LISA_UI_PLATFORM_ARCS
+#include "service_camera.h"
+#include "voice_msg.h"
+#endif
+
+struct model_camera_context {
+    uint32_t inited: 1;
+    uint32_t running: 1;
+    uint32_t suspended: 1;
+};
+
+static struct model_camera_context model_camera_ctx = {
+    .inited = 0,
+    .running = 0,
+    .suspended = 0,
+};
+
+#ifdef LISA_UI_PLATFORM_ARCS
+static void bn_camera_hw_init(void *data, uint32_t len, struct voice_invoke_rsp *rsp)
+{
+    int r = service_camera_init();
+    rsp->err = r;
+}
+#endif
+
+int model_camera_init(void)
+{
+    if (model_camera_ctx.inited) {
+        LISA_UI_LOGW("Camera model already initialized");
+        return 0;
+    }
+
+#ifdef LISA_UI_PLATFORM_ARCS
+    struct voice_invoke_rsp rsp = {
+        .err = -1,
+    };
+
+    int r = voice_invoke_sync(bn_camera_hw_init, NULL, 0, &rsp, 1000);
+    if (r) {
+        LISA_UI_LOGE("bn_camera_hw_init sync invoke failed, r:%d", r);
+        return r;
+    } else {
+        if (rsp.err) {
+            LISA_UI_LOGE("bn_camera_hw_init sync invoke resp err, r:%d", rsp.err);
+            return rsp.err;
+        }
+    }
+#else
+    LISA_UI_LOGW("Camera not supported on this platform");
+    return -5;
+#endif
+
+    model_camera_ctx.inited = 1;
+    LISA_UI_LOGD("Camera model initialized");
+
+    return 0;
+}
+
+#ifdef LISA_UI_PLATFORM_ARCS
+struct service_camera_rsp {
+    struct voice_invoke_rsp base;
+    uint8_t *cap_buf;
+    uint32_t buf_len;
+};
+
+static void bn_camera_capture(void *data, uint32_t data_len, struct voice_invoke_rsp *rsp)
+{
+    struct service_camera_rsp *camera_rsp = (struct service_camera_rsp *)rsp;
+
+    if (camera_rsp->cap_buf == NULL) {
+        LISA_UI_LOGE("cap buf is null");
+        camera_rsp->base.err = -1;
+        return;
+    }
+
+    int ret = service_camera_capture(camera_rsp->cap_buf, camera_rsp->buf_len);
+    camera_rsp->base.err = ret;
+}
+#endif
+
+int model_camera_capture(uint8_t *in, uint32_t len)
+{
+#ifdef LISA_UI_PLATFORM_ARCS
+    if (!model_camera_ctx.inited) {
+        LISA_UI_LOGE("Camera model not initialized");
+        return -1;
+    }
+
+    if (in == NULL || len == 0) {
+        LISA_UI_LOGE("Invalid capture buffer");
+        return -2;
+    }
+
+    struct service_camera_rsp rsp = {
+        .base = {
+            .err = -1,
+        },
+        .cap_buf = in,
+        .buf_len = len,
+    };
+
+    int r = voice_invoke_sync(bn_camera_capture, NULL, 0, (struct voice_invoke_rsp *)&rsp, 1000);
+    if (r) {
+        LISA_UI_LOGE("camera cap invoke sync failed, r: %d", r);
+        return r;
+    } else {
+        if (rsp.base.err) {
+            LISA_UI_LOGE("camera cap invoke sync rsp err, r: %d", rsp.base.err);
+            model_camera_ctx.running = 0;
+            return rsp.base.err;
+        }
+    }
+#else
+    LISA_UI_LOGW("Camera not supported on this platform");
+    return -5;
+#endif
+
+    model_camera_ctx.running = 1;
+    return 0;
+}
+
+#ifdef LISA_UI_PLATFORM_ARCS
+static void bn_camera_stop(void *data, uint32_t len, struct voice_invoke_rsp *rsp)
+{
+    (void)data;
+    (void)len;
+
+    rsp->err = service_camera_stop();
+}
+#endif
+
+int model_camera_stop(void)
+{
+#ifdef LISA_UI_PLATFORM_ARCS
+    if (!model_camera_ctx.running) {
+        LISA_UI_LOGD("Camera already stopped, skip stop");
+        return 0;
+    }
+
+    struct voice_invoke_rsp rsp = {
+        .err = -1,
+    };
+
+    int r = voice_invoke_sync(bn_camera_stop, NULL, 0, &rsp, 1000);
+    if (r) {
+        LISA_UI_LOGE("camera stop invoke sync failed, r: %d", r);
+        return r;
+    }
+    if (rsp.err == 0) {
+        model_camera_ctx.running = 0;
+    }
+    return rsp.err;
+#else
+    return -5;
+#endif
+}
+
+#ifdef LISA_UI_PLATFORM_ARCS
+static void bn_camera_suspend(void *data, uint32_t len, struct voice_invoke_rsp *rsp)
+{
+    (void)data;
+    (void)len;
+
+    rsp->err = service_camera_suspend();
+}
+
+static void bn_camera_resume(void *data, uint32_t len, struct voice_invoke_rsp *rsp)
+{
+    (void)data;
+    (void)len;
+
+    rsp->err = service_camera_resume();
+}
+#endif
+
+int model_camera_suspend(void)
+{
+#ifdef LISA_UI_PLATFORM_ARCS
+    struct voice_invoke_rsp rsp = {
+        .err = -1,
+    };
+
+    if (!model_camera_ctx.inited || model_camera_ctx.suspended) {
+        return 0;
+    }
+
+    int r = voice_invoke_sync(bn_camera_suspend, NULL, 0, &rsp, 1000);
+    if (r != 0) {
+        LISA_UI_LOGE("camera suspend invoke failed: %d", r);
+        return r;
+    }
+    if (rsp.err != 0) {
+        LISA_UI_LOGE("camera suspend failed: %d", rsp.err);
+        return rsp.err;
+    }
+
+    model_camera_ctx.running = 0;
+    model_camera_ctx.suspended = 1;
+    return 0;
+#else
+    return -5;
+#endif
+}
+
+int model_camera_resume(void)
+{
+#ifdef LISA_UI_PLATFORM_ARCS
+    struct voice_invoke_rsp rsp = {
+        .err = -1,
+    };
+
+    if (!model_camera_ctx.suspended) {
+        return 0;
+    }
+
+    int r = voice_invoke_sync(bn_camera_resume, NULL, 0, &rsp, 2000);
+    if (r != 0) {
+        LISA_UI_LOGE("camera resume invoke failed: %d", r);
+        return r;
+    }
+    if (rsp.err != 0) {
+        LISA_UI_LOGE("camera resume failed: %d", rsp.err);
+        return rsp.err;
+    }
+
+    model_camera_ctx.inited = 1;
+    model_camera_ctx.running = 0;
+    model_camera_ctx.suspended = 0;
+    return 0;
+#else
+    return -5;
+#endif
+}
+
+int model_camera_get_framesize(uint16_t *width, uint16_t *height)
+{
+    if (!width || !height) {
+        LISA_UI_LOGE("Invalid framesize output parameters");
+        return -2;
+    }
+
+    *width = 0;
+    *height = 0;
+
+#ifdef LISA_UI_PLATFORM_ARCS
+    if (!model_camera_ctx.inited) {
+        LISA_UI_LOGE("Camera model not initialized");
+        return -1;
+    }
+
+    int r = service_camera_get_framesize(width, height);
+    if (r != 0) {
+        *width = 0;
+        *height = 0;
+    }
+    return r;
+#else
+    return 0;
+#endif
+}
+
+bool model_camera_is_running(void)
+{
+    return model_camera_ctx.running;
+}
+
+bool model_camera_is_inited(void)
+{
+    return model_camera_ctx.inited;
+}

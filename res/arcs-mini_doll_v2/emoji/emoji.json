@@ -1,0 +1,192 @@
+{
+  "default_emoji": "neutral",
+  "animations": [
+    {
+      "name": "生气",
+      "loop": {
+        "path": "/生气/frame-%06d.png",
+        "range": [
+          0,
+          10
+        ],
+        "interval_ms": 100,
+        "interval_overrides": [
+          [
+            7,
+            2000
+          ]
+        ]
+      }
+    },
+    {
+      "name": "无表情",
+      "loop": {
+        "path": "/无表情/frame-%06d.png",
+        "range": [
+          0,
+          11
+        ],
+        "interval_ms": 100,
+        "interval_overrides": [
+          [
+            8,
+            2000
+          ]
+        ]
+      }
+    },
+    {
+      "name": "惊讶",
+      "loop": {
+        "path": "/惊讶/frame-%06d.png",
+        "range": [
+          0,
+          10
+        ],
+        "interval_ms": 100,
+        "interval_overrides": [
+          [
+            7,
+            2000
+          ]
+        ]
+      }
+    },
+    {
+      "name": "wifi",
+      "loop": {
+        "path": "/wifi/frame-%06d.png",
+        "range": [
+          0,
+          11
+        ],
+        "interval_ms": 100,
+        "interval_overrides": [
+          [
+            8,
+            2000
+          ]
+        ]
+      }
+    },
+    {
+      "name": "充电",
+      "loop": {
+        "path": "/充电/frame-%06d.png",
+        "range": [
+          0,
+          14
+        ],
+        "interval_ms": 100,
+        "interval_overrides": [
+          [
+            4,
+            500
+          ],
+          [
+            5,
+            500
+          ],
+          [
+            6,
+            500
+          ],
+          [
+            7,
+            500
+          ],
+          [
+            8,
+            500
+          ],
+          [
+            9,
+            500
+          ],
+          [
+            10,
+            500
+          ],
+          [
+            11,
+            500
+          ]
+        ]
+      }
+    },
+    {
+      "name": "喜欢",
+      "loop": {
+        "path": "/喜欢/frame-%06d.png",
+        "range": [
+          0,
+          11
+        ],
+        "interval_ms": 100,
+        "interval_overrides": [
+          [
+            8,
+            2000
+          ]
+        ]
+      }
+    },
+    {
+      "name": "疑惑",
+      "loop": {
+        "path": "/疑惑/frame-%06d.png",
+        "range": [
+          0,
+          11
+        ],
+        "interval_ms": 100,
+        "interval_overrides": [
+          [
+            8,
+            2000
+          ]
+        ]
+      }
+    },
+    {
+      "name": "neutral",
+      "alias": "无表情"
+    },
+    {
+      "name": "wakeup",
+      "alias": "无表情"
+    },
+    {
+      "name": "wait",
+      "alias": "无表情"
+    },
+    {
+      "name": "sleepy",
+      "alias": "无表情"
+    },
+    {
+      "name": "battery",
+      "alias": "充电"
+    },
+    {
+      "name": "angry",
+      "alias": "生气"
+    },
+    {
+      "name": "surprise",
+      "alias": "惊讶"
+    },
+    {
+      "name": "charging",
+      "alias": "充电"
+    },
+    {
+      "name": "love",
+      "alias": "喜欢"
+    },
+    {
+      "name": "confused",
+      "alias": "疑惑"
+    }
+  ]
+}

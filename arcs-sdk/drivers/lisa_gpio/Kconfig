@@ -1,0 +1,33 @@
+# LISA GPIO Driver Configuration
+#
+# Copyright (c) 2025, LISTENAI
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig LISA_GPIO_DEVICE
+	bool "Enable LISA GPIO Driver"
+	depends on LISA_DEVICE
+	help
+			Enable LISA GPIO device driver based on lisa_device framework.
+			Provides simple configuration and output interfaces for GPIO pins.
+
+			This driver wraps the HAL GPIO functions and provides a unified
+			device interface for GPIO operations.
+
+if LISA_GPIO_DEVICE
+
+config LISA_GPIOA
+	bool "Enable LISA GPIO Device PA"
+
+config LISA_GPIOB
+	bool "Enable LISA GPIO Device PB"
+
+endif # LISA_GPIO_DEVICE
+
+if LISA_CH32V003
+
+config LISA_CH32V003_GPIO
+	bool "Enable CH32V003 GPIO child devices"
+	default y
+	select LISA_GPIO_DEVICE
+
+endif # LISA_CH32V003

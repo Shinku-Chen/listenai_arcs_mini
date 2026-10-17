@@ -1,0 +1,185 @@
+config LWIP
+    bool "LwIP TCP/IP Stack"
+    default n
+    select RTOS_AL
+    select ARCS_HAL_WLIF
+    select ARCS_HAL_EVENT
+    select ARCS_HAL_CLI_CMD
+    help
+        Lightweight TCP/IP stack (LwIP)
+
+config LWIP_VERSION
+    string "LwIP Version" if LWIP
+    default "2.2.0"
+    help
+        LwIP version. You have to select one even if you don't enable LWIP. Because WiFi need it.
+
+if LWIP
+
+choice LWIP_NET_IMPL
+    prompt "Network Implementation"
+    default LWIP_NET_REAL
+
+    config LWIP_NET_REAL
+        bool "Real Network Implementation"
+        help
+            Use real network implementation from net_al directory
+
+    config LWIP_NET_SIM
+        bool "Simulated Network Implementation"
+        help
+            Use simulated network implementation (simsocket)
+
+endchoice
+
+config LWIP_TX_BUF_COPY
+    bool "Enable TX buffer copy for LWIP"
+    default n
+    help
+        Enable TX buffer copy for LWIP
+
+config LWIP_SOCKET_UDP_TX_COPY
+    bool "Enable UDP socket TX copy for lwIP sockets"
+    default n
+    help
+        Copy UDP and RAW socket payloads into lwIP-owned buffers in
+        sendto/sendmsg without enabling the broader WiFi/L2 TX_BUF_COPY path.
+
+config LWIP_USB_ECM_TUNING
+    bool "Use USB ECM tuned lwIP TCP options"
+    default n
+    help
+        Enable TCP defaults tuned for USB CDC ECM/cellular links. The default
+        keeps the historical lwIP values so existing WiFi projects are not
+        changed unless a project selects this profile or overrides the values
+        below explicitly.
+
+config LWIP_TCPIP_CORE_LOCKING_INPUT
+    int "lwIP TCP/IP core locking input"
+    default 1
+    range 0 1
+    help
+        Value assigned to LWIP_TCPIP_CORE_LOCKING_INPUT in lwipopts.h.
+        The default keeps the existing input processing model.
+
+config LWIP_PBUF_POOL_SIZE
+    int "lwIP pbuf pool size"
+    default 0
+    range 0 4096
+    help
+        Value assigned to PBUF_POOL_SIZE in lwipopts.h.
+        The default keeps the existing project behavior. Increasing this
+        value allocates more lwIP pbuf pool memory and may affect RAM usage.
+
+config LWIP_TCP_WND_MSS_MULTIPLIER
+    int "lwIP TCP receive window multiplier of TCP_MSS"
+    default 128 if LWIP_USB_ECM_TUNING
+    default 20
+    range 1 256
+    help
+        Value assigned to TCP_WND as a multiplier of TCP_MSS. The default 20
+        keeps the historical SDK value. USB ECM tuning uses a larger window
+        for cellular throughput.
+
+config LWIP_TCP_OOSEQ_MAX_BYTES_MSS_MULTIPLIER
+    int "lwIP TCP OOSEQ max bytes multiplier of TCP_MSS"
+    default 64 if LWIP_USB_ECM_TUNING
+    default 0
+    range 0 1024
+    help
+        Value assigned to TCP_OOSEQ_MAX_BYTES as a multiplier of TCP_MSS.
+        Set to 0 to leave TCP_OOSEQ_MAX_BYTES undefined, matching the
+        historical SDK behavior.
+
+config LWIP_TCP_OOSEQ_MAX_PBUFS
+    int "lwIP TCP OOSEQ max pbufs"
+    default 96 if LWIP_USB_ECM_TUNING
+    default 0
+    range 0 4096
+    help
+        Value assigned to TCP_OOSEQ_MAX_PBUFS. Set to 0 to leave it
+        undefined, matching the historical SDK behavior.
+
+config LWIP_TCP_RTO_TIME
+    int "lwIP initial TCP retransmission timeout in ms"
+    default 3000 if LWIP_USB_ECM_TUNING
+    default 1000
+    range 250 60000
+    help
+        Value assigned to LWIP_TCP_RTO_TIME in lwipopts.h. The default 1000
+        keeps the historical SDK value; USB ECM tuning restores the standard
+        3000 ms initial timeout for weak cellular links.
+
+config LWIP_NETAL_TX_BUF_SIZE
+    int "lwip net-al tx buffer size"
+    default 1536
+
+config LWIP_NETAL_TX_BUF_CNT
+    int "lwip net-al tx buffer count"
+    default 10
+
+config LWIP_NETAL_TX_SAMLL_BUF_SIZE
+    int "lwip net-al tx buffer size"
+    default 128
+
+config LWIP_NETAL_TX_SMALL_BUF_CNT
+    int "lwip net-al tx small buffer count"
+    default 6
+
+config LWIP_OPTION_LWIP_DNS
+    bool "Turn on DNS module. UDP must be available for DNS transport."
+    default n
+
+config LWIP_OPTION_SO_REUSE
+    bool "Enable SO_REUSEADDR option"
+    default n
+
+config LWIP_DHCP_RESTORE_LAST_IP
+    bool "Enable DHCP last IP address restore"
+    default n
+    help
+        Enable restoring last valid IP address obtained from DHCP server
+        after reset/power-up. This feature allows the device to quickly
+        restore its previous IP configuration.
+
+choice LWIP_DHCP_RESTORE_STORAGE_BACKEND
+    prompt "DHCP IP restore storage backend"
+    default LWIP_DHCP_RESTORE_LAST_IP_NONE
+    depends on LWIP_DHCP_RESTORE_LAST_IP
+    help
+        Select the storage backend for DHCP IP address restoration.
+
+    config LWIP_DHCP_RESTORE_LAST_IP_NONE
+        bool "No persistent storage"
+        help
+            Do not use persistent storage for DHCP IP address.
+            IP address will only be cached in RAM.
+
+    config LWIP_DHCP_RESTORE_LAST_IP_FROM_NVS
+        bool "Restore last IP from NVS"
+        help
+            Store and restore last DHCP IP address from Non-Volatile Storage (NVS).
+            This allows the IP address to persist across power cycles.
+
+    config LWIP_DHCP_RESTORE_LAST_IP_FROM_LISA_KV
+        bool "Restore last IP from LISA KV"
+        help
+            Store and restore last DHCP IP address from LISA KV storage.
+            This allows the IP address to persist across power cycles using
+            the LISA KV key-value storage system.
+
+endchoice
+
+config LWIP_DHCP_IP_ADDR_KV_KEY
+    string "DHCP IP address KV storage key"
+    default "lwip.dhcp_ip_addr"
+    depends on LWIP_DHCP_RESTORE_LAST_IP_FROM_LISA_KV
+    help
+        The key name used to store DHCP IP address in LISA KV storage.
+        Default is "lwip.dhcp_ip_addr".
+
+config LWIP_HOOK_NETCONN_EXTERNAL_RESOLVE
+    bool "lwip dns custom hook"
+    default n
+
+endif # LWIP

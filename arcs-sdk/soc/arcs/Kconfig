@@ -1,0 +1,21 @@
+# Copyright (c) 2025, LISTENAI
+# SPDX-License-Identifier: Apache-2.0
+
+config SOC_ARCS
+	bool
+
+if SOC_ARCS
+
+config SOC_HAS_NPU
+	bool "SoC has NPU"
+	help
+		SoC 集成 NPU（神经网络处理单元）。
+		由具体型号的 defconfig 自动设置，无需手动开启。
+
+rsource "../common/Kconfig.mem.arcs"
+
+rsource "hal/Kconfig"
+rsource "common/startup/Kconfig"
+endif # SOC_ARCS
+
+rsource "ls26xx/Kconfig"

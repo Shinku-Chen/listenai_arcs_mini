@@ -1,0 +1,76 @@
+name: sync-upstream
+
+# 把上游（cloud.listenai.com 的 arcs_mini）同步成 master 上的一个快照提交。
+# 机制见 docs/ai/06-upstream-sync.md。
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'      # 每周一 04:00 UTC
+  workflow_dispatch:          # 也可以手动 Run workflow
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://cloud.listenai.com/CSKG836746/arcs-sdk/public/arcs_mini.git
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: 配置 git 身份
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM_URL"
+
+      - name: 同步上游快照
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 upstream master
+          sha=$(git rev-parse FETCH_HEAD); short=${sha:0:8}
+          echo "upstream=$sha"
+
+          # 1) 工作区换成上游树（只动 tracked 文件）
+          git read-tree -u --reset FETCH_HEAD
+
+          # 2) 剔除上游样例工程（整个目录；含 >100MB 素材，GitHub 拒收）
+          rm -rf arcs-sdk/samples
+
+          # 2b) 镜像不带 samples/subsys → 关掉小程序运行时，保证开箱可编
+          if grep -q '^CONFIG_MINIAPP=' apps/arcs-mini/prj.conf; then
+            sed -i 's/^CONFIG_MINIAPP=.*$/CONFIG_MINIAPP=n/' apps/arcs-mini/prj.conf
+          else
+            echo 'CONFIG_MINIAPP=n' >> apps/arcs-mini/prj.conf
+          fi
+
+          # 3) 恢复本仓维护的覆盖层（文档 / 同步脚本 / workflow）
+          git checkout HEAD -- docs/ai tools/sync-upstream.ps1 tools/sync-upstream.sh .github/workflows/sync-upstream.yml 2>/dev/null || true
+          # 4) AGENTS.md 末尾追加指向 docs/ai 的说明（幂等）
+          if [ -f AGENTS.md ] && ! grep -qF '<!-- ai-docs:begin -->' AGENTS.md; then
+            cat >> AGENTS.md <<'BLOCK'
+          <!-- ai-docs:begin -->
+          > **本仓的 AI 开发文档**（快速开始 / 架构 / 烧录 / 踩坑 / 编码约定 / 上游同步）在 [`docs/ai/`](docs/ai/README.md)。
+          > 先读那里，再回到本文的项目规则；两边冲突时以本文件（上游规则）为准。
+          <!-- ai-docs:end -->
+          BLOCK
+          fi
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "上游无变化，跳过"
+            exit 0
+          fi
+
+          git diff --cached --stat | tail -20
+          git commit -q -m "sync: upstream master @$short ($(date -u +%Y-%m-%d))"
+          git push origin HEAD:master

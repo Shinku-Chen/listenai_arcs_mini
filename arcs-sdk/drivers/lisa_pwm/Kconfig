@@ -1,0 +1,41 @@
+# LISA PWM Driver Configuration
+#
+# Copyright (c) 2025, LISTENAI
+# SPDX-License-Identifier: Apache-2.0
+
+config LISA_PWM
+	bool "Enable LISA PWM Driver"
+	depends on LISA_DEVICE
+	help
+			Enable LISA PWM device driver based on lisa_device framework.
+			Provides PWM signal generation and control interfaces.
+
+			This driver wraps the HAL PWM functions and provides a unified
+			device interface for PWM operations including frequency, duty cycle,
+			and polarity control.
+
+			The driver provides one PWM device (pwm0) with 8 independent channels.
+
+if LISA_CH32V003
+
+config LISA_CH32V003_PWM
+	bool "Enable CH32V003 PWM child device"
+	default y
+	select LISA_PWM
+
+config LISA_CH32V003_PWM_CLOCK_FREQUENCY
+	int "CH32V003 PWM source clock frequency"
+	default 48000000
+
+config LISA_CH32V003_PWM_CLOCK_PRESCALER
+	int "CH32V003 PWM clock prescaler"
+	default 480
+
+config LISA_CH32V003_PWM_DEADTIME
+	int "CH32V003 PWM dead-time register value"
+	default 0
+
+config LISA_CH32V003_PWM_BRAKE
+	bool "Enable CH32V003 PWM brake"
+
+endif # LISA_CH32V003

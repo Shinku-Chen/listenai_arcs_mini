@@ -1,0 +1,6 @@
+if (CONFIG_BLE OR CONFIG_BT_DUAL)
+    add_subdirectory(hogp)
+    add_subdirectory(bas)
+    add_subdirectory(dis)
+    add_subdirectory(netcfg_ble/netcfg_bles)
+endif()

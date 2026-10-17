@@ -1,0 +1,6 @@
+# ARCS BOARD CONFIGURATION
+#
+# Copyright (c) 2025, LISTENAI
+# SPDX-License-Identifier: Apache-2.0
+
+osource "$BOARD_KCONFIG_PATH"
