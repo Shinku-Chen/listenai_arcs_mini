@@ -53,16 +53,12 @@ jobs:
             echo 'CONFIG_MINIAPP=n' >> apps/arcs-mini/prj.conf
           fi
 
-          # 3) 恢复本仓维护的覆盖层（文档 / 同步脚本 / workflow）
-          git checkout HEAD -- docs/ai tools/sync-upstream.ps1 tools/sync-upstream.sh .github/workflows/sync-upstream.yml 2>/dev/null || true
-          # 4) AGENTS.md 末尾追加指向 docs/ai 的说明（幂等）
-          if [ -f AGENTS.md ] && ! grep -qF '<!-- ai-docs:begin -->' AGENTS.md; then
-            cat >> AGENTS.md <<'BLOCK'
-          <!-- ai-docs:begin -->
-          > **本仓的 AI 开发文档**（快速开始 / 架构 / 烧录 / 踩坑 / 编码约定 / 上游同步）在 [`docs/ai/`](docs/ai/README.md)。
-          > 先读那里，再回到本文的项目规则；两边冲突时以本文件（上游规则）为准。
-          <!-- ai-docs:end -->
-          BLOCK
+          # 3) 恢复本仓维护的覆盖层（同步脚本 / 指针 / workflow；本仓不放文档）
+          git checkout HEAD -- tools/sync-upstream.ps1 tools/sync-upstream.sh tools/ai-docs-pointer.md .github/workflows/sync-upstream.yml 2>/dev/null || true
+          # 4) AGENTS.md 末尾追加"去 ling 读文档"的指针
+          if [ -f AGENTS.md ] && [ -f tools/ai-docs-pointer.md ]; then
+            echo '' >> AGENTS.md
+            cat tools/ai-docs-pointer.md >> AGENTS.md
           fi
           git add -A
 

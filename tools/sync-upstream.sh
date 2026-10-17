@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 把上游（cloud.listenai.com 的 arcs_mini）同步成本仓 master 的一个快照提交。
-# 机制见 docs/ai/06-upstream-sync.md；Windows 用 tools/sync-upstream.ps1。
+# 机制见 ling 的 docs/firmware/upstream-mirror.md；Windows 用 tools/sync-upstream.ps1。
 #
 #   ./tools/sync-upstream.sh            # 拉取、重建、提交、推送
 #   ./tools/sync-upstream.sh --dry-run  # 只看会改什么
@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 # 上游样例工程整个不入镜像：体积大、构建用不到，且含 >100MB 素材（GitHub 拒收）。
 # 镜像不带 samples/subsys，所以下面会把 CONFIG_MINIAPP 关掉。
 # 本仓维护的覆盖层
-OVERLAY=(docs/ai tools/sync-upstream.ps1 tools/sync-upstream.sh .github/workflows/sync-upstream.yml)
+OVERLAY=(tools/sync-upstream.ps1 tools/sync-upstream.sh tools/ai-docs-pointer.md .github/workflows/sync-upstream.yml)
 
 echo "[sync] fetch $REMOTE/$BRANCH ..."
 git fetch --depth=1 "$REMOTE" "$BRANCH"
@@ -47,16 +47,12 @@ if [ -f "$PRJ" ]; then
 fi
 echo "[sync] 恢复覆盖层：${OVERLAY[*]}"
 git checkout HEAD -- "${OVERLAY[@]}" 2>/dev/null || true
-# 在 AGENTS.md 末尾追加指向 docs/ai 的说明（幂等）
-MARKER='<!-- ai-docs:begin -->'
-if [ -f AGENTS.md ] && ! grep -qF "$MARKER" AGENTS.md; then
-  cat >> AGENTS.md <<'BLOCK'
-<!-- ai-docs:begin -->
-> **本仓的 AI 开发文档**（快速开始 / 架构 / 烧录 / 踩坑 / 编码约定 / 上游同步）在 [`docs/ai/`](docs/ai/README.md)。
-> 先读那里，再回到本文的项目规则；两边冲突时以本文件（上游规则）为准。
-<!-- ai-docs:end -->
-BLOCK
-  echo "[sync] AGENTS.md 追加 docs/ai 指引"
+# 在 AGENTS.md 末尾追加"去 ling 读文档"的指针
+if [ -f AGENTS.md ] && [ -f tools/ai-docs-pointer.md ]; then
+  printf '
+' >> AGENTS.md
+  cat tools/ai-docs-pointer.md >> AGENTS.md
+  echo "[sync] AGENTS.md 追加 ling 文档指针"
 fi
 
 git add -A
