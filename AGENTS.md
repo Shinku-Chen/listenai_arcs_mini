@@ -252,8 +252,10 @@ docker run --rm --init -w $(pwd) -v $(pwd):$(pwd) --platform linux/amd64 ghcr.io
 <!-- ai-docs:begin -->
 ## AI 开发规范在另一个仓库（本仓只做镜像）
 
-本仓是**上游 arcs_mini 的只读镜像**，只同步上游，不放个人文档。
-**改本仓代码前，先读 `Shinku-Chen/ling` 的固件文档**（那边是唯一真相源）：
+本仓有两个用途：**① `master` 只同步上游**（只读快照）；**② 固件代码按功能开 `feat/*` 分支**放这里。
+个人文档**不放本仓**，全部在 `Shinku-Chen/ling`。
+
+**改代码前，先读 ling 的固件文档**（那边是唯一真相源）：
 
 | 我要…… | 去 ling 读 |
 |---|---|
@@ -266,11 +268,13 @@ docker run --rm --init -w $(pwd) -v $(pwd):$(pwd) --platform linux/amd64 ghcr.io
 | mini3 引脚定义（板级事实） | `docs/hardware/board-arcs-mini3.md` |
 | 小程序（Lua）开发 | `docs/development/` |
 
-仓库地址：<https://github.com/Shinku-Chen/ling>
+仓库：<https://github.com/Shinku-Chen/ling>
 
-**本仓的三条硬规则**（上游同步时由脚本自动维护，不要手改）：
-1. `arcs-sdk/samples/` 不入镜像，因此 **`apps/arcs-mini/prj.conf` 的 `CONFIG_MINIAPP=n`**；
+**本仓四条硬规则**（同步时由脚本自动维护，不要手改）：
+1. `master` 是上游快照，**不要直接提交**；固件功能开 `feat/<功能>` 分支（从 `master` 切）。
+2. `arcs-sdk/samples/` 不入镜像，因而 `apps/arcs-mini/prj.conf` 是 **`CONFIG_MINIAPP=n`**；
    要小程序能力时从上游取回 `samples/subsys` 再打开。
-2. 本仓不放文档/规范：新东西一律写进 ling。
-3. 同步用 `tools/sync-upstream.ps1` / `.sh`（或 Actions 每周一自动跑），不要手工改上游文件。
+3. 本仓不放文档/规范：新东西一律写进 ling。
+4. 同步用 `tools/sync-upstream.ps1` / `.sh`（Actions 每周一自动跑），不要手工改上游文件；
+   同步后功能分支用 `git merge origin/master` 跟上。
 <!-- ai-docs:end -->
