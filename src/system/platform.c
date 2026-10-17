@@ -1,0 +1,365 @@
+#include "sys_init.h"
+#include "cJSON.h"
+#include "config_parser.h"
+#include "spiflash.h"
+#include "chip.h"
+#include "nvs.h"
+#include "voice_msg.h"
+#include "evs_utils.h"
+#include "remote_logger.h"
+#include "ic_message.h"
+#include "app_wakeup.h"
+#include "voice_player_comm.h"
+#include "lisa_bluetooth.h"
+#include "sys_network_manager.h"
+#include "sys_wifi.h"
+#include "board.h"
+#include "project_version.h"
+
+#if CONFIG_FILE_SYSTEM
+#include "lsfs.h"
+#include "disk/disk_access.h"
+#include "lisa_sdmmc.h"
+#include "lisa_gpio.h"
+#endif
+
+#include "romfs.h"
+#include <string.h>
+
+#define SDMMC_DEVICE      "SD:"
+#define SDMMC_MOUNT_POINT "/"SDMMC_DEVICE
+
+#define TAG "platform"
+#include "lisa_log.h"
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+#define TONE_BIN_ADDR       (CMN_FLASH_REGION + 0x00100000)
+#define TONE_BIN_SIZE       (1024 * 1024)
+#define WAKE_WORD_BIN_ADDR  (CMN_FLASH_REGION + 0x00200000)
+#define WAKE_WORD_BIN_SIZE  (1536 * 1024)
+#define EMOJI_BIN_ADDR      (CMN_FLASH_REGION + 0x00380000)
+#define EMOJI_BIN_SIZE      ( 768 * 1024)
+#endif // CONFIG_BOARD_ARCS_MINI
+
+extern int lisa_shell_init(void);
+extern int user_usb_start(void);
+extern bool app_usb_msc_enabled(void);
+extern int boot_watchdog_feed(void);
+
+#if CONFIG_FILE_SYSTEM
+static struct lsfs_mount_t sdmmc_mnt = {
+    .type = LSFS_FATFS,
+    .mnt_point = SDMMC_MOUNT_POINT,
+    .fs_data = NULL,
+};
+
+struct lsfs_mount_t *platform_sd_mount_get(void)
+{
+    return &sdmmc_mnt;
+}
+
+static bool platform_tf_card_inserted(void)
+{
+#ifdef TF_DET_DEVICE_NAME
+    lisa_device_t *tf_det_dev = lisa_device_get(TF_DET_DEVICE_NAME);
+    if (!lisa_device_ready(tf_det_dev)) {
+        LOGW("TF detect device %s PD%d not ready", TF_DET_DEVICE_NAME, TF_DET_PIN);
+        return false;
+    }
+
+    int ret = lisa_gpio_configure(tf_det_dev, TF_DET_PIN, LISA_GPIO_INPUT);
+    if (ret != 0) {
+        LOGW("TF detect %s PD%d configure failed: %d", TF_DET_DEVICE_NAME, TF_DET_PIN, ret);
+        return false;
+    }
+
+    int level = lisa_gpio_read_pin(tf_det_dev, TF_DET_PIN);
+    if (level < 0) {
+        LOGW("TF detect %s PD%d read failed: %d", TF_DET_DEVICE_NAME, TF_DET_PIN, level);
+        return false;
+    }
+
+    bool inserted = level == (TF_DET_ACTIVE_LEVEL ? LISA_GPIO_HIGH : LISA_GPIO_LOW);
+    LOGI("TF detect %s PD%d level=%d active_level=%d inserted=%d",
+         TF_DET_DEVICE_NAME, TF_DET_PIN, level, TF_DET_ACTIVE_LEVEL, inserted);
+
+    return inserted;
+#else
+    return true;
+#endif
+}
+#endif
+
+static void *cjson_malloc(size_t sz)
+{
+    return exram_malloc(4, sz);
+}
+
+static void cjson_free(void *ptr)
+{
+    exram_free(ptr);
+}
+
+cJSON_Hooks cjson_hooks = {
+    .malloc_fn = cjson_malloc,
+    .free_fn = cjson_free,
+};
+
+#if CFG_NVS
+#define NVDS_FLASH_ADDRESS_OFFSET (0xFF8000) // The last 32KB of 16B flash
+#define NVDS_FLASH_SIZE           (0x8000)   // 32KB
+struct nvs_fs arcs_nvs_fs;
+FLASH_DEV arcs_flash_dev = {.base_addr = CMN_FLASHC_BASE,
+                            .d_width = 4,
+                            .sclk_div = 0xFF, // divider is 1
+                            .run_mod = RUN_WITHOUT_INT,
+                            .timeout = 0x180000};
+int arcs_nvs_init(void)
+{
+    struct flash_pages_info info;
+    flash_if_init(&arcs_flash_dev, 0, 0);
+    arcs_nvs_fs.offset = NVDS_FLASH_ADDRESS_OFFSET;
+    arcs_nvs_fs.flash_device = &arcs_flash_dev;
+    flash_get_page_info_by_offs(&arcs_flash_dev, arcs_nvs_fs.offset, &info);
+    arcs_nvs_fs.sector_size = info.size;
+    arcs_nvs_fs.sector_count = NVDS_FLASH_SIZE / info.size;
+    nvds_init(&arcs_nvs_fs);
+    return 0;
+}
+#endif
+
+static int voice_platform_init(void)
+{
+    LISA_LOGI(TAG,"Firmware version: %s-%s", PROJECT_VERSION_STR, PROJECT_VERSION_COMMIT);
+    LISA_LOGI(TAG,"Solution build time: %s %s", __DATE__, __TIME__);
+    heap_caps_malloc_extmem_enable(16);
+    cJSON_InitHooks(&cjson_hooks);
+
+    ls_sys_init(8);
+
+    /* HAL IPC is initialized by the SDK before the application. LSF uses its
+     * own initialization and must not be gated by the HAL link signal. */
+    int ipc_ready = (ic_message_init() == IC_MESSAGE_ERR_NONE);
+
+#if CONFIG_LISA_SHELL
+    lisa_shell_init();
+    // lisa_log_backend_add("user.shell", log_shell_backend_output, NULL);
+#endif
+    if (ipc_ready) {
+        LISA_LOGI(TAG, "IC message init end");
+    } else {
+        LISA_LOGW(TAG, "IC message init failed, AP may not be ready");
+    }
+
+#if CONFIG_FILE_SYSTEM
+    disk_init(NULL);
+#if CONFIG_LVFS_POSIX_API
+    lvfs_init();
+#endif
+    lsfs_init();
+
+    if (platform_tf_card_inserted()) {
+        lisa_sdmmc_probe(lisa_device_get("sdmmc0"));
+
+        if (lsfs_mount(&sdmmc_mnt) != 0) {
+            /*
+             * Never format an inserted card automatically.  FatFs cannot
+             * mount NTFS (or any other unsupported/corrupt filesystem), and
+             * formatting here would destroy the user's data.  Leave the
+             * card unmounted; the SD service will report it as unavailable.
+             */
+            LOGW("Failed to mount %s; filesystem unsupported or invalid, skip without formatting",
+                 SDMMC_MOUNT_POINT);
+        } else {
+            LOGI("Mounted %s successfully\n", SDMMC_MOUNT_POINT);
+        }
+    } else {
+        LOGI("TF card not inserted, skip SD mount");
+    }
+#endif
+
+    // Check if KV storage is already initialized (e.g., from factory reset)
+    lisa_kv_init();
+    app_datas_init();
+    int usb_ret = user_usb_start();
+    if (usb_ret != 0) {
+        LISA_LOGE(TAG, "USB initialization failed: %d", usb_ret);
+        return usb_ret;
+    }
+    /* USB-MSC模式下, 不运行应用程序, 只支持USB文件传输 */
+    if (app_usb_msc_enabled()) {
+        LISA_LOGW(TAG," Enter USB MSC mode, application will not start.\n");
+        while (1) {
+            boot_watchdog_feed();
+            lisa_thread_delay(100);
+        }
+    }
+    arcs_nvs_init();
+    #if CONFIG_SAL_USING_POSIX
+     /* Initialize network device subsystem */
+    netdev_init();
+
+    /* Initialize Socket Abstraction Layer */
+    sal_init();
+    #endif
+    
+    if (ipc_ready) {
+        network_probe_init();
+        sys_wifi_init();
+        LISA_LOGI(TAG, "BLE init start\n");
+        lisa_bluetooth_init(NULL);
+        extern void app_ble_netcfg_init(void);
+        app_ble_netcfg_init();
+        LISA_LOGI(TAG, "BLE init end\n");
+    } else {
+        LISA_LOGW(TAG, "IPC not ready, skip WiFi and BLE init");
+    }
+
+#if CONFIG_ACOMP
+    acomp_init();
+#if CONFIG_ACOMP_LOGGER
+    acomp_logger_init();
+    acomp_logger_start();
+    acomp_logger_set_output_callback(remote_log_output_printf);
+#endif
+
+#ifndef CONFIG_BOARD_ARCS_MINI
+    struct romfs *romfs = NULL;
+    if (romfs_init(&romfs, 0x30100000, 0x700000) != 0) {
+        LOGE("romfs init failed");
+        romfs = NULL;
+    }
+
+    char *temp_buf = NULL;
+    char locale[16] = {0};
+    if (lisa_kv_get_string("user.locale", &temp_buf) == 0) {
+        strncpy(locale, temp_buf, sizeof(locale) - 1);
+        lisa_kv_free(temp_buf);
+    }
+#endif // CONFIG_BOARD_ARCS_MINI
+
+#if CONFIG_ACOMP_WAKEUP
+    struct wakeup_algo_resources res = {0};
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+    res.mlp.size = 0;
+    res.wrap.size = 0;
+
+    struct romfs *romfs = NULL;
+    if (romfs_init(&romfs, (const void *)WAKE_WORD_BIN_ADDR, WAKE_WORD_BIN_SIZE) == 0) {
+        if (romfs_info_get(romfs, "/cae_esr.bin", &res.mlp.addr, &res.mlp.size) == 0) {
+            LISA_LOGI(TAG, "algo resource info, name: cae_esr.bin, address: %p, size: %d", res.mlp.addr, res.mlp.size);
+        } else {
+            LISA_LOGW(TAG, "Load cae_esr.bin from wake_word ROMFS failed");
+            res.mlp.size = 0;
+        }
+
+        if (romfs_info_get(romfs, "/wrap.json", &res.wrap.addr, &res.wrap.size) == 0) {
+            LISA_LOGI(TAG, "algo resource info, name: wrap.json, address: %p, size: %d", res.wrap.addr, res.wrap.size);
+        } else {
+            LISA_LOGW(TAG, "Load wrap.json from wake_word ROMFS failed");
+            res.wrap.size = 0;
+        }
+
+        romfs_deinit(&romfs);
+    } else {
+        LISA_LOGW(TAG, "Init wake_word ROMFS failed");
+    }
+
+    if (res.mlp.size == 0 || res.wrap.size == 0) {
+        LISA_LOGW(TAG, "Wakeup algo resources not loaded, wakeup engine will be skipped");
+    }
+    app_wakeup_init(&res);
+#else // !CONFIG_BOARD_ARCS_MINI
+    if (romfs != NULL) {
+        const char *algo_mlp_path = "zh-CN/algo.bin";
+        const char *algo_wrap_path = "zh-CN/wrap.json";
+
+        if (strcmp(locale, "en-GB") == 0) {
+            algo_mlp_path = "en-GB/algo.bin";
+            algo_wrap_path = "en-GB/wrap.json";
+        }
+
+        if (romfs_info_get(romfs, algo_mlp_path, &res.mlp.addr, &res.mlp.size) != 0) {
+            LOGE("romfs file info get failed, path: %s", algo_mlp_path);
+            while (1) {
+                vTaskDelay(100);
+            }
+        }
+        LOGI("algo resource info, name: %s, address: %p, size: %d", algo_mlp_path, res.mlp.addr, res.mlp.size);
+
+        if (romfs_info_get(romfs, algo_wrap_path, &res.wrap.addr, &res.wrap.size) != 0) {
+            LOGE("romfs file info get failed, path: %s", algo_wrap_path);
+            while (1) {
+                vTaskDelay(100);
+            }
+        }
+        LOGI("algo resource info, name: %s, address: %p, size: %d", algo_wrap_path, res.wrap.addr, res.wrap.size);
+    } else {
+        res.mlp.addr = CONFIG_ACOMP_WAKEUP_RES_CAE_ESR_MLP_ADDRESS;
+        res.mlp.size = CONFIG_ACOMP_WAKEUP_RES_CAE_ESR_MLP_LENGTH;
+        res.wrap.addr = CONFIG_ACOMP_WAKEUP_RES_AI_WRAP_ADDRESS;
+        res.wrap.size = CONFIG_ACOMP_WAKEUP_RES_AI_WRAP_LENGTH;
+    }
+    app_wakeup_init(&res);
+#endif // CONFIG_BOARD_ARCS_MINI
+#endif
+
+#endif
+	evs_utils_init();
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+    app_tone_init(TONE_BIN_ADDR, TONE_BIN_SIZE);
+#else // !CONFIG_BOARD_ARCS_MINI
+    if (romfs) {
+        const char *tone_path = "zh-CN/tone.bin";
+        if (strcmp(locale, "en-GB") == 0) {
+            tone_path = "en-GB/tone.bin";
+        }
+        uint8_t *tone_data;
+        uint32_t tone_size;
+
+        if (romfs_info_get(romfs, tone_path, &tone_data, &tone_size) != 0) {
+            LOGE("romfs file info get failed, path: %s", tone_path);
+            while (1) {
+                vTaskDelay(100);
+            }
+        }
+
+        if (app_tone_init((uint32_t)tone_data) != 0) {
+            LOGE("tone init failed, addr: %p", tone_data);
+            while (1) {
+                vTaskDelay(100);
+            }
+        }
+    } else {
+        app_tone_init((uint32_t)0x30100000);
+    }
+#endif // CONFIG_BOARD_ARCS_MINI
+
+    LISA_LOGI(TAG, "tone init end");
+    voice_player_platform_init();
+    sys_network_manager_init(ipc_ready);
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+    extern int lisa_ui_anim_init(uint32_t flash_addr, uint32_t flash_size);
+    lisa_ui_anim_init(EMOJI_BIN_ADDR, EMOJI_BIN_SIZE);
+#endif
+
+    mcp_init();
+
+    voice_msg_pub(VOICE_MSG_PLATFORM_READY, NULL, 0);
+
+    // app_ble_adv_start(0, BLE_ADV_GEN);
+    LISA_LOGI(TAG, "==== Application Ready!!!=====\n");
+
+#ifndef CONFIG_BOARD_ARCS_MINI
+    if (romfs) {
+        romfs_deinit(&romfs);
+    }
+#endif // CONFIG_BOARD_ARCS_MINI
+
+    return 0;
+}
+
+SYS_INIT(voice_platform_init, SYS_INIT_LEVEL_PRE_APPLICATION, 60);
