@@ -528,6 +528,18 @@ void radio_app_handle_action(int action)
         return;
     }
 
+    /* 未配网时锁在配网页：只允许关机（长按）和重新发起配网（5/6/7），
+     * 单击/双击/三击/四击一律不响应，避免用户退出去以后一台空电台什么都放不出来。 */
+    if (!sys_wifi_has_ap() && (radio_page_t)s_state.page == RADIO_PAGE_NETCFG) {
+        if (action != VOICE_MSG_BUTTON_ACTION_LONG_HOLD &&
+            action != VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK &&
+            action != VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK &&
+            action != VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK) {
+            LOGI("netcfg page locked until provisioned (action=%d)", action);
+            return;
+        }
+    }
+
     switch (action) {
     case VOICE_MSG_BUTTON_ACTION_CLICK:
         radio_app_handle_click();
@@ -942,6 +954,14 @@ int radio_app_init(void)
     s_state.foreground = true;
     s_state.nav_confirmed = true;
     s_state.page = RADIO_PAGE_PLAYER;
+
+    /* 没保存过 WiFi = 还没配过网：开机直接进配网页并开始蓝牙广播，
+     * 用户拿手机 App 扫码就能配（配网成功后网络恢复会自动回电台页）。 */
+    if (!sys_wifi_has_ap()) {
+        LOGI("no saved wifi, boot into netcfg page");
+        s_state.page = RADIO_PAGE_NETCFG;
+        app_ble_netcfg_adv_start_delayed();
+    }
 
     radio_app_play_current();
     if (s_state.net_ok) {
