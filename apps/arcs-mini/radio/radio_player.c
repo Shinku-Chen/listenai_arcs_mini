@@ -35,6 +35,8 @@
 #define RADIO_AUDIO_TICK_MS    128
 /* 两次起播尝试之间的最小间隔（防止异常状态下忙循环刷日志） */
 #define RADIO_AUDIO_RETRY_MIN_MS 2000
+/* 起播被别的播放器抢焦点取消时的快速重试间隔（开机提示音就是这种情况） */
+#define RADIO_AUDIO_FOCUS_RETRY_MS 300
 /* 单台连续失败几次后自动换台（公共目录里死链很多） */
 #define RADIO_AUDIO_FAIL_LIMIT  3
 /* 失败后的退避：attempt * 1000 ms */
@@ -236,6 +238,10 @@ static void radio_audio_step(void)
     if (ret != APP_PLAYER_OK) {
         /* 拉流失败（DNS / 连不上 / 超时）：不立刻重试，交给退避窗口 */
         radio_audio_notify_failure("拉流失败");
+    } else if (!radio_audio_pipeline_active(app_player_get_state(s_player))) {
+        /* play() 返回 OK 但没进管线，说明只是存了 pending URL（焦点被别人占着，
+         * 比如开机提示音）。这种情况不要把重试拖满 2 s。 */
+        s_last_attempt_ms = now - (RADIO_AUDIO_RETRY_MIN_MS - RADIO_AUDIO_FOCUS_RETRY_MS);
     }
 }
 

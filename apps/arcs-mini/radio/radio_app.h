@@ -59,6 +59,8 @@ typedef struct {
     char source[RADIO_SOURCE_MAX];
     char detail[RADIO_DETAIL_MAX]; /* 非空时状态行显示它（红色） */
     char station_name[RADIO_NAME_MAX];
+    char station_full[RADIO_FULL_MAX];  /* 目录原名（播放页可能滚播） */
+    char station_desc[RADIO_DESC_MAX]; /* 副标题：流派 / 编码 / 码率 */
 } radio_ui_model_t;
 
 /* 初始化（UI 就绪后调）：注册 nav screen、网络任务、播放器任务，恢复 KV */

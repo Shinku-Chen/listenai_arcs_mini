@@ -38,7 +38,7 @@
 #define RADIO_APP_TICK_MS    200
 
 /** 开机后延后多久自己进电台页：给助手主页 / 配网引导页留出首次展示机会 */
-#define RADIO_AUTOSTART_DELAY_MS 3000
+#define RADIO_AUTOSTART_DELAY_MS 1200
 
 /* 进/出页是异步的：如果 400 ms 后还没到位就再投递一次 */
 #define RADIO_NAV_RETRY_MS 400
@@ -334,6 +334,8 @@ static void radio_app_on_net(radio_net_event_t event, const radio_station_t *lis
     if (s_state.count == 0) {
         radio_app_set_detail((detail != NULL) ? detail : "没有可用电台");
     }
+    /* 失败之后允许下次进页 / 切城市时重新查一次（否则 auto_queried 一直为真） */
+    s_state.auto_queried = false;
     xSemaphoreGive(s_lock);
     LOGW("directory query failed: %s", (detail != NULL) ? detail : "unknown");
 }
@@ -711,6 +713,8 @@ bool radio_app_get_model(radio_ui_model_t *out)
     const radio_station_t *station = radio_app_station_locked(s_state.index);
     if (station != NULL) {
         snprintf(out->station_name, sizeof(out->station_name), "%s", station->name);
+        snprintf(out->station_full, sizeof(out->station_full), "%s", station->full);
+        snprintf(out->station_desc, sizeof(out->station_desc), "%s", station->desc);
         out->freq_decihz = station->freq_decihz;
     }
 
@@ -829,6 +833,7 @@ static int radio_cmd_stat(void)
                model.station_name, (unsigned)model.freq_decihz, model.source,
                (unsigned)model.sleep_choice,
                (model.detail[0] != '\0') ? model.detail : "-");
+    shellPrint(shell, "  full=%s\n  meta=%s\n", model.station_full, model.station_desc);
     shellPrint(shell, "  wanted=%u paused=%u auto=%u played_gen=%u url_gen=%u\n",
                (unsigned)radio_audio_wanted(), (unsigned)s_state.user_paused,
                (unsigned)s_state.auto_queried, (unsigned)radio_audio_debug_generation(0),
@@ -846,11 +851,13 @@ static int radio_cmd_list(void)
             break;
         }
         if (shell != NULL) {
-            shellPrint(shell, "[%u] %s | %s | %u\n", (unsigned)i + 1u, station.name, station.url,
-                       (unsigned)station.freq_decihz);
+            shellPrint(shell, "[%u] %s | %s | %u | %s | %s | %s\n", (unsigned)i + 1u,
+                       station.name, station.url, (unsigned)station.freq_decihz, station.desc,
+                       station.lang, station.full);
         } else {
-            LOGI("[%u] %s | %s | %u", (unsigned)i + 1u, station.name, station.url,
-                 (unsigned)station.freq_decihz);
+            LOGI("[%u] %s | %s | %u | %s | %s | %s", (unsigned)i + 1u, station.name,
+                 station.url, (unsigned)station.freq_decihz, station.desc, station.lang,
+                 station.full);
         }
     }
     return 0;

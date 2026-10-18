@@ -19,8 +19,10 @@
 
 #define RADIO_MAX_STATIONS 10
 #define RADIO_NAME_MAX     48
+#define RADIO_FULL_MAX     72
 #define RADIO_DESC_MAX     64
 #define RADIO_URL_MAX      256
+#define RADIO_LANG_MAX     12
 
 /* 城市名 / 地区名 / 国家码的最大长度（含结尾 NUL） */
 #define RADIO_CITY_MAX    40
@@ -28,10 +30,17 @@
 #define RADIO_COUNTRY_MAX 4
 
 /* 一个电台。freq_decihz 为 0 表示目录里没有可用频率，
- * 界面上按序号把指针铺在刻度上，而不是回到 0。 */
+ * 界面上按序号把指针铺在刻度上，而不是回到 0。
+ *
+ * name —— 屏上短名（目录名太长时提炼成“城市 FM94.7”），用于台单与 KV 记忆
+ * full —— 目录原名（可能在长屏上滚播），比短名信息更多
+ * desc —— 副标题：流派标签（翻中文）+ 编码 + 码率
+ * lang —— 语言（翻中文，认不出就留空） */
 typedef struct {
     char name[RADIO_NAME_MAX];
+    char full[RADIO_FULL_MAX];
     char desc[RADIO_DESC_MAX];
+    char lang[RADIO_LANG_MAX];
     char url[RADIO_URL_MAX];
     uint16_t freq_decihz;
 } radio_station_t;

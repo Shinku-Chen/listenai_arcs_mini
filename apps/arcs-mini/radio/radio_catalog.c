@@ -25,12 +25,18 @@
 /* 内置台（与 leo-radio 的 kFallbackStations 逐条一致，顺序也一致）。
  * 这些是全国性直播流，不对应某个本地发射台，所以没有刻度频率。 */
 static const radio_station_t s_builtin[] = {
-    {"中国之声", "新闻综合 · 网络直播", "http://lhttp.qingting.fm/live/15318317/64k.mp3", 0},
-    {"怀旧音乐", "经典老歌 · 网络直播", "http://lhttp.qingting.fm/live/4804/64k.mp3", 0},
-    {"清晨音乐", "轻松旋律 · 网络直播", "http://lhttp.qingting.fm/live/4915/64k.mp3", 0},
-    {"两广之声", "粤语音乐 · 网络直播", "http://lhttp.qingting.fm/live/20500149/64k.mp3", 0},
-    {"羊城交通", "城市资讯 · 网络直播", "http://lhttp.qingting.fm/live/1262/64k.mp3", 0},
-    {"第一财经", "财经资讯 · 网络直播", "http://lhttp.qingting.fm/live/276/64k.mp3", 0},
+    {.name = "中国之声", .full = "中国之声 · 新闻综合", .desc = "新闻 · MP3",
+     .lang = "国语", .url = "http://lhttp.qingting.fm/live/15318317/64k.mp3"},
+    {.name = "怀旧音乐", .full = "怀旧音乐 · 经典老歌", .desc = "怀旧 · MP3",
+     .lang = "国语", .url = "http://lhttp.qingting.fm/live/4804/64k.mp3"},
+    {.name = "清晨音乐", .full = "清晨音乐 · 轻松旋律", .desc = "轻音乐 · MP3",
+     .lang = "国语", .url = "http://lhttp.qingting.fm/live/4915/64k.mp3"},
+    {.name = "两广之声", .full = "两广之声 · 粤语音乐", .desc = "粤语 · MP3",
+     .lang = "粤语", .url = "http://lhttp.qingting.fm/live/20500149/64k.mp3"},
+    {.name = "羊城交通", .full = "羊城交通 · 城市资讯", .desc = "交通 · MP3",
+     .lang = "粤语", .url = "http://lhttp.qingting.fm/live/1262/64k.mp3"},
+    {.name = "第一财经", .full = "第一财经 · 财经资讯", .desc = "财经 · MP3",
+     .lang = "国语", .url = "http://lhttp.qingting.fm/live/276/64k.mp3"},
 };
 
 /* 城市表（与 leo-radio 的 kCityChoices 一致；query 为 NULL 表示自动定位） */
@@ -101,6 +107,29 @@ static void copy_text(char *target, size_t capacity, const char *source)
         return;
     }
     snprintf(target, capacity, "%s", (source != NULL) ? source : "");
+}
+
+/* UTF-8 安全截断：不会把多字节字符切成半截 */
+static void copy_text_utf8(char *target, size_t capacity, const char *source)
+{
+    size_t len;
+
+    if (target == NULL || capacity == 0) {
+        return;
+    }
+    if (source == NULL) {
+        target[0] = '\0';
+        return;
+    }
+    len = strlen(source);
+    if (len >= capacity) {
+        len = capacity - 1;
+        while (len > 0 && (((unsigned char)source[len]) & 0xC0) == 0x80) {
+            --len;
+        }
+    }
+    memcpy(target, source, len);
+    target[len] = '\0';
 }
 
 static bool ascii_only(const char *text)
@@ -298,8 +327,9 @@ static void make_display_name(char *target, size_t capacity, const char *raw_nam
         }
     }
 
-    snprintf(target, capacity, "%s 电台 %u", (city != NULL) ? city : "",
-             (unsigned)(sequence + 1));
+    /* 解析不到频率：直接用目录原名（之前退化成“城市 电台 N”，信息量为零） */
+    copy_text_utf8(target, capacity, raw_name);
+    (void)sequence;
 }
 
 /* ==================== 内置台单 ==================== */
@@ -385,6 +415,169 @@ int radio_catalog_build_region_query(const char *country, const char *region,
                        RADIO_DIRECTORY_BASE, encoded_country, encoded,
                        (unsigned)(RADIO_DIRECTORY_LIMIT));
     return (written > 0 && (size_t)written < capacity) ? 0 : -1;
+}
+
+/* ==================== 台单副标题 ==================== */
+
+/* radio-browser 的 tags 是英文（"news,talk"、"classical"、"jazz"），
+ * 能认出来的翻成中文，认不出的就不展示——在 240 宽的屏上混排英文更难看。 */
+static const struct {
+    const char *en;
+    const char *cn;
+} s_tag_names[] = {
+    {"news", "新闻"},        {"talk", "谈话"},
+    {"music", "音乐"},       {"pop", "流行"},
+    {"rock", "摇滚"},        {"jazz", "爵士"},
+    {"classical", "古典"},   {"dance", "舞曲"},
+    {"oldies", "怀旧"},      {"sports", "体育"},
+    {"culture", "文化"},     {"traffic", "交通"},
+    {"business", "财经"},    {"finance", "财经"},
+    {"children", "少儿"},    {"comedy", "相声"},
+    {"folk", "民谣"},        {"chinese", "华语"},
+    {"mandarin", "国语"},    {"cantonese", "粤语"},
+    {"easy listening", "轻音乐"}, {"instrumental", "器乐"},
+    {"hits", "金曲"},        {"top 40", "榜单"},
+    {"local", "本地"},       {"lifestyle", "生活"},
+    {"entertainment", "娱乐"}, {"variety", "综艺"},
+    {"education", "教育"},   {"public", "公共"},
+    {"country", "乡村"},     {"blues", "蓝调"},
+    {"electronic", "电子"},  {"reggae", "雷鬼"},
+    {"soundtrack", "影视原声"}, {"religious", "宗教"},
+    {"60s", "六十年代"},     {"70s", "七十年代"},
+    {"80s", "八十年代"},     {"90s", "九十年代"},
+};
+
+static bool text_equal_ci(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        const char ca = (char)tolower((int)(unsigned char)*a);
+        const char cb = (char)tolower((int)(unsigned char)*b);
+        if (ca != cb) {
+            return false;
+        }
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* 返回标签的中文名；不认识的返回 NULL */
+static const char *translate_tag(const char *tag, size_t len)
+{
+    char key[24];
+
+    if (len == 0 || len >= sizeof(key)) {
+        return NULL;
+    }
+    memcpy(key, tag, len);
+    key[len] = '\0';
+
+    for (size_t i = 0; i < sizeof(s_tag_names) / sizeof(s_tag_names[0]); ++i) {
+        if (text_equal_ci(key, s_tag_names[i].en)) {
+            return s_tag_names[i].cn;
+        }
+    }
+    return NULL;
+}
+
+/* 用 tags / codec / bitrate / votes 拼副标题："新闻 · 谈话 · MP3 64k"
+ * 没有可用标签时用目录的 votes（收听热度）顶上，比写一句固定文案信息量大。 */
+static void build_desc(char *out, size_t capacity, const char *tags, const char *codec,
+                       int bitrate, int votes)
+{
+    size_t used = 0;
+    uint8_t picked = 0;
+
+    out[0] = '\0';
+    if (tags != NULL) {
+        const char *p = tags;
+        while (*p != '\0' && picked < 2) {
+            const char *comma = strchr(p, ',');
+            size_t len = (comma != NULL) ? (size_t)(comma - p) : strlen(p);
+            while (len > 0 && (*p == ' ' || *p == '\t')) {
+                ++p;
+                --len;
+            }
+            while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t')) {
+                --len;
+            }
+
+            const char *cn = translate_tag(p, len);
+            if (cn != NULL) {
+                const int written = snprintf(out + used, capacity - used,
+                                             (picked == 0) ? "%s" : " · %s", cn);
+                if (written > 0 && (size_t)written < capacity - used) {
+                    used += (size_t)written;
+                    ++picked;
+                }
+            }
+            if (comma == NULL) {
+                break;
+            }
+            p = comma + 1;
+        }
+    }
+
+    if (picked == 0) {
+        if (votes > 0) {
+            snprintf(out, capacity, "热度 %d", votes);
+        } else {
+            snprintf(out, capacity, "%s", "广播电台");
+        }
+        used = strlen(out);
+    }
+
+    /* 编码 + 码率：目录里大多数中文台 bitrate 是 0，那就只写编码 */
+    const char *codec_text = (codec != NULL && codec[0] != '\0') ? codec : "MP3";
+    if (bitrate > 0 && bitrate < 1000) {
+        snprintf(out + used, capacity - used, " · %s %dk", codec_text, bitrate);
+    } else {
+        snprintf(out + used, capacity - used, " · %s", codec_text);
+    }
+}
+
+/* 语言：只认常见的，认不出就留空（不展示英文） */
+static const char *translate_language(const char *language)
+{
+    static const struct {
+        const char *en;
+        const char *cn;
+    } table[] = {
+        {"chinese", "国语"},  {"mandarin", "国语"},  {"cantonese", "粤语"},
+        {"english", "英语"},  {"japanese", "日语"},  {"korean", "韩语"},
+        {"french", "法语"},   {"german", "德语"},    {"spanish", "西班牙语"},
+        {"russian", "俄语"},  {"italian", "意大利语"}, {"portuguese", "葡萄牙语"},
+        {"hindi", "印地语"},  {"arabic", "阿拉伯语"}, {"turkish", "土耳其语"},
+        {"dutch", "荷兰语"},  {"thai", "泰语"},      {"vietnamese", "越南语"},
+    };
+    char key[24];
+    size_t len;
+
+    if (language == NULL) {
+        return NULL;
+    }
+    /* 只取第一个语言（目录里常见 "chinese,english"） */
+    const char *comma = strchr(language, ',');
+    len = (comma != NULL) ? (size_t)(comma - language) : strlen(language);
+    while (len > 0 && (*language == ' ' || *language == '\t')) {
+        ++language;
+        --len;
+    }
+    while (len > 0 && (language[len - 1] == ' ' || language[len - 1] == '\t')) {
+        --len;
+    }
+    if (len == 0 || len >= sizeof(key)) {
+        return NULL;
+    }
+    memcpy(key, language, len);
+    key[len] = '\0';
+
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i) {
+        if (text_equal_ci(key, table[i].en)) {
+            return table[i].cn;
+        }
+    }
+    return NULL;
 }
 
 /* ==================== 响应解析 ==================== */
@@ -509,7 +702,18 @@ size_t radio_catalog_parse_stations(const cJSON *root,
 
         candidate.freq_decihz = radio_catalog_parse_frequency(raw_name);
         make_display_name(candidate.name, sizeof(candidate.name), raw_name, city, count);
-        copy_text(candidate.desc, sizeof(candidate.desc), "城市电台 · 网络直播");
+        copy_text_utf8(candidate.full, sizeof(candidate.full), raw_name);
+        /* 副标题：优先用目录里的 tags（翻中文）+ 编码/码率 */
+        const cJSON *bitrate_item = cJSON_GetObjectItemCaseSensitive(entry, "bitrate");
+        const int bitrate = cJSON_IsNumber(bitrate_item) ? bitrate_item->valueint : 0;
+        const cJSON *votes_item = cJSON_GetObjectItemCaseSensitive(entry, "votes");
+        const int votes = cJSON_IsNumber(votes_item) ? votes_item->valueint : 0;
+        build_desc(candidate.desc, sizeof(candidate.desc), json_string(entry, "tags"),
+                   json_string(entry, "codec"), bitrate, votes);
+        const char *lang = translate_language(json_string(entry, "language"));
+        if (lang != NULL) {
+            copy_text(candidate.lang, sizeof(candidate.lang), lang);
+        }
         out[count++] = candidate;
     }
 
