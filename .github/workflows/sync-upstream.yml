@@ -54,11 +54,11 @@ jobs:
           fi
 
           # 3) 恢复本仓维护的覆盖层（同步脚本 / 指针 / workflow；本仓不放文档）
-          git checkout HEAD -- tools/sync-upstream.ps1 tools/sync-upstream.sh tools/ai-docs-pointer.md .github/workflows/sync-upstream.yml 2>/dev/null || true
+          git checkout HEAD -- .github/scripts/sync-upstream.ps1 .github/scripts/sync-upstream.sh .github/ai-docs-pointer.md .github/workflows/sync-upstream.yml 2>/dev/null || true
           # 4) AGENTS.md 末尾追加"去文档仓读文档"的指针
-          if [ -f AGENTS.md ] && [ -f tools/ai-docs-pointer.md ]; then
+          if [ -f AGENTS.md ] && [ -f .github/ai-docs-pointer.md ]; then
             echo '' >> AGENTS.md
-            cat tools/ai-docs-pointer.md >> AGENTS.md
+            cat .github/ai-docs-pointer.md >> AGENTS.md
           fi
           git add -A
 
