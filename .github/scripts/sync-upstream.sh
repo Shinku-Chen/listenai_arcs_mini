@@ -17,7 +17,7 @@ cd "$(dirname "$0")/../.."   # 脚本在 <repo>/.github/scripts/
 # 上游样例工程整个不入镜像：体积大、构建用不到，且含 >100MB 素材（GitHub 拒收）。
 # 镜像不带 samples/subsys，所以下面会把 CONFIG_MINIAPP 关掉。
 # 本仓维护的覆盖层
-OVERLAY=(.github/scripts/sync-upstream.ps1 .github/scripts/sync-upstream.sh .github/ai-docs-pointer.md .github/workflows/sync-upstream.yml)
+OVERLAY=(.github)
 
 echo "[sync] fetch $REMOTE/$BRANCH ..."
 git fetch --depth=1 "$REMOTE" "$BRANCH"
