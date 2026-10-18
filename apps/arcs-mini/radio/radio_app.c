@@ -21,6 +21,7 @@
 
 #include "voice_msg.h"
 #include "sys_network_manager.h"
+#include "sys_wifi.h"
 #include "service_volume.h"
 #include "service_power_policy.h"
 
@@ -35,6 +36,9 @@
 #define RADIO_APP_TASK_STACK 4096
 #define RADIO_APP_TASK_PRIO  4
 #define RADIO_APP_TICK_MS    200
+
+/** 开机后延后多久自己进电台页：给助手主页 / 配网引导页留出首次展示机会 */
+#define RADIO_AUTOSTART_DELAY_MS 3000
 
 /* 进/出页是异步的：如果 400 ms 后还没到位就再投递一次 */
 #define RADIO_NAV_RETRY_MS 400
@@ -74,6 +78,12 @@ typedef struct {
     bool busy;
     bool auto_queried;
     bool user_paused;
+    bool nav_confirmed;  /* 电台页已经真的上到前台一次 */
+
+#ifdef CONFIG_RADIO_AUTO_START
+    bool autostart_pending;
+    uint32_t autostart_at_ms;
+#endif
 
     uint32_t last_nav_ms;
 } radio_state_t;
@@ -348,6 +358,7 @@ static void radio_app_open(void)
         return;
     }
     s_state.foreground = true;
+    s_state.nav_confirmed = false;
     s_state.page = RADIO_PAGE_PLAYER;
     s_state.menu_index = RADIO_MENU_LIST;
     s_state.list_index = s_state.index;
@@ -382,6 +393,7 @@ static void radio_app_close(void)
         return;
     }
     s_state.foreground = false;
+    s_state.nav_confirmed = false;
 
     /* 不清 user_paused：下次进来仍然从当前台开始播 */
     radio_audio_stop();
@@ -550,8 +562,11 @@ bool radio_app_intercept_action(int action)
         return false;
     }
 
-    if (!s_state.foreground) {
-        /* 电台唯一入口：四击 */
+    /* 只有电台页真的在最上面时才独占按键。若它被别的页面（如扫码绑定页）
+     * 盖住，就退回普通行为；四击在任何时候都能把电台重新提到最前。 */
+    const bool on_top = s_state.foreground && radio_ui_is_visible();
+
+    if (!on_top) {
         if (action == VOICE_MSG_BUTTON_ACTION_QUADRUPLE_CLICK) {
             radio_app_open();
             return true;
@@ -637,14 +652,32 @@ static void radio_app_task(void *argument)
             }
         }
 
-        /* 3. 前台但页面没到位：补投递一次（LVGL 可能还没起来） */
-        if (s_state.foreground && !radio_ui_is_visible()) {
-            const uint32_t now = radio_app_now_ms();
-            if ((uint32_t)(now - s_state.last_nav_ms) >= RADIO_NAV_RETRY_MS) {
-                s_state.last_nav_ms = now;
-                lv_async_call(radio_app_nav_show_worker, NULL);
+        /* 3. 前台但页面没到位：补投递一次（LVGL 可能还没起来）。
+         *    一旦上到前台就不再重投，否则会把后来叠上来的页面（如扫码绑定页）
+         *    每 400 ms 顶下去一次。 */
+        if (s_state.foreground) {
+            if (radio_ui_is_visible()) {
+                s_state.nav_confirmed = true;
+            } else if (!s_state.nav_confirmed) {
+                const uint32_t now = radio_app_now_ms();
+                if ((uint32_t)(now - s_state.last_nav_ms) >= RADIO_NAV_RETRY_MS) {
+                    s_state.last_nav_ms = now;
+                    lv_async_call(radio_app_nav_show_worker, NULL);
+                }
             }
         }
+
+#ifdef CONFIG_RADIO_AUTO_START
+        /* 4. 开机自动进电台页 */
+        if (s_state.autostart_pending &&
+            (int32_t)(radio_app_now_ms() - s_state.autostart_at_ms) >= 0) {
+            s_state.autostart_pending = false;
+            if (!s_state.foreground) {
+                LOGI("autostart radio page");
+                radio_app_open();
+            }
+        }
+#endif
 
         vTaskDelay(pdMS_TO_TICKS(RADIO_APP_TICK_MS));
     }
@@ -930,6 +963,18 @@ int radio_app_init(void)
     radio_audio_set_fail_cb(radio_app_on_player_failed);
 
     s_state.inited = true;
+
+#ifdef CONFIG_RADIO_AUTO_START
+    /* 只有配过网的设备才自动进电台页：从没配网的设备必须停在助手主页，
+     * 否则用户看不到扫码绑定 / 配网引导，也不好进 BLE 配网。 */
+    if (sys_wifi_has_ap()) {
+        s_state.autostart_pending = true;
+        s_state.autostart_at_ms = radio_app_now_ms() + RADIO_AUTOSTART_DELAY_MS;
+        LOGI("radio will autostart in %u ms", (unsigned)RADIO_AUTOSTART_DELAY_MS);
+    } else {
+        LOGW("no saved wifi, skip radio autostart");
+    }
+#endif
 
     if (xTaskCreate(radio_app_task, "radio.app", RADIO_APP_TASK_STACK, NULL,
                     RADIO_APP_TASK_PRIO, &s_task) != pdPASS) {
