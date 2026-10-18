@@ -43,7 +43,10 @@
 /** 开机后延后多久自己进电台页：给助手主页 / 配网引导页留出首次展示机会 */
 #define RADIO_AUTOSTART_DELAY_MS 1200
 
-/* 进/出页是异步的：如果 400 ms 后还没到位就再投递一次 */
+/* 开机后多久内忽略按键（长按开机松手会被当成 CLICK/LONG_HOLD） */
+#define RADIO_BOOT_KEY_GUARD_MS 6000
+
+/* 进/出页是异步的：如果 400 ms 还没到位就再投递一次 */
 #define RADIO_NAV_RETRY_MS 400
 
 /* 卷加一档 */
@@ -82,6 +85,7 @@ typedef struct {
     bool auto_queried;
     bool user_paused;
     bool nav_confirmed;  /* 电台页已经真的上到前台一次 */
+    uint32_t boot_ms;    /* 初始化时刻：用来忽略开机那一下的按键 */
 
 #ifdef CONFIG_RADIO_AUTO_START
     bool autostart_pending;
@@ -522,6 +526,14 @@ void radio_app_handle_action(int action)
         return;
     }
 
+    /* 开机按键保护：用户是"长按功能键 3 秒"开机的，松手那一下会被按键驱动
+     * 识别成 CLICK / LONG_HOLD。若直接执行，表现就是"刚开机就换台"甚至
+     * "刚开机又关机"。开机后 6 s 内的按键一律忽略（实测松手事件会在开机后 3~4 s 才上报）。 */
+    if ((uint32_t)(radio_app_now_ms() - s_state.boot_ms) < RADIO_BOOT_KEY_GUARD_MS) {
+        LOGI("ignore button %d during boot guard", action);
+        return;
+    }
+
     switch (action) {
     case VOICE_MSG_BUTTON_ACTION_CLICK:
         radio_app_handle_click();
@@ -900,6 +912,9 @@ int radio_app_init(void)
         if (sys_network_get_status(&status) == 0 && status.connected) {
             s_state.net_ok = true;
         }
+        /* 必须同步给播放器：它有自己的 s_net_ok，只有"变化"时才会被任务更新，
+         * 开机时网络已经在线就没有变化事件，不同步的话播放器永远认为没网、从不拉流。 */
+        radio_audio_set_network(s_state.net_ok);
     }
 
     radio_app_restore_kv();
@@ -920,6 +935,7 @@ int radio_app_init(void)
     radio_audio_set_fail_cb(radio_app_on_player_failed);
 
     s_state.inited = true;
+    s_state.boot_ms = radio_app_now_ms();
 
     /* 按键：纯电台固件里没有 app_button 模块，自己订阅消息总线 */
     (void)voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, radio_app_on_button, NULL);
