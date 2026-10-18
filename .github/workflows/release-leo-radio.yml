@@ -1,116 +1,34 @@
 name: release-leo-radio
 
-# LEO 网络电台（功能固件）自动构建 + Release。
+# LEO 网络电台固件的发版入口（瘦壳）。
 #
-# 触发：push 到 feat/leo-radio、或手动 Run workflow。
-# 产物：app 镜像（cskburn 0x600000 / ADB 单分区刷）、整包 lpk、OTA 包、combined hex。
+# 真正的打包逻辑在 master 的 .github/workflows/release-firmware.yml，
+# 这里只负责：什么事件算发版（打 tag）、用哪个板型 / 产物前缀 / Release 正文。
+# 换新分支做别的功能固件时，复制本文件改 4 个 with 参数即可。
 #
-# 工具链用 arcs-sdk/tools/scripts 从阿里云 OSS 公开地址下载（不用 env.sh：
-# 它在 Actions 的 bash -e 里会静默退出），缓存到 ~/.listenai，命中后构建约 2 分钟。
+#   git tag leo-radio-v3.0.3 -m "LEO 电台 3.0.3"
+#   git push origin leo-radio-v3.0.3
 
 on:
   push:
-    branches: [feat/leo-radio]
-    paths-ignore:
-      - '.github/release-notes-leo-radio.md'
+    tags:
+      - 'leo-radio-*'
   workflow_dispatch:
     inputs:
       publish:
-        description: '创建 GitHub Release'
+        description: '创建/更新 GitHub Release'
         type: boolean
         default: true
 
 permissions:
   contents: write
 
-concurrency:
-  group: release-leo-radio-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      BOARD: arcs_mini3
-      BUILD_DIR: build-leo-radio
-      INSTALL_DIR: /home/runner/.listenai
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # version.cmake 用 git 短 hash 拼版本号，需要完整历史
-          fetch-depth: 0
-
-      - name: 缓存工具链
-        uses: actions/cache@v4
-        with:
-          path: ~/.listenai
-          key: listenai-toolchain-${{ runner.os }}-${{ hashFiles('arcs-sdk/tools/scripts/prepare_toolchain.sh', 'arcs-sdk/tools/scripts/prepare_listenai_tools.sh') }}
-
-      - name: 安装工具链（缓存命中则只做校验）
-        run: |
-          set -euo pipefail
-          if [ ! -x "$INSTALL_DIR/gcc/bin/riscv64-unknown-elf-gcc" ]; then
-            bash ./arcs-sdk/tools/scripts/prepare_toolchain.sh "$INSTALL_DIR"
-          fi
-          if [ ! -x "$INSTALL_DIR/listenai-tools/cmake/bin/cmake" ]; then
-            bash ./arcs-sdk/tools/scripts/prepare_listenai_tools.sh "$INSTALL_DIR"
-          fi
-          {
-            echo "NUCLEI_TOOLCHAIN_PATH=$INSTALL_DIR/gcc"
-            echo "LISTENAI_TOOLS_PATH=$INSTALL_DIR/listenai-tools"
-            echo "ARCS_BASE=$GITHUB_WORKSPACE/arcs-sdk"
-          } >> "$GITHUB_ENV"
-          echo "$INSTALL_DIR/gcc/bin" >> "$GITHUB_PATH"
-          "$INSTALL_DIR/gcc/bin/riscv64-unknown-elf-gcc" --version | head -1
-          "$INSTALL_DIR/listenai-tools/cmake/bin/cmake" --version | head -1
-
-      - name: 构建固件
-        run: |
-          set -euo pipefail
-          # build.sh 在仓库里是 644（不可执行），显式用 bash 调
-          bash ./build.sh -S ./apps/arcs-mini -B "$BUILD_DIR" -DBOARD="$BOARD" 2>&1 | tee build.log
-          echo "---- 内存账 ----"
-          grep -A 6 "Memory region" build.log || echo "未找到内存报告"
-
-      - name: 收集产物
-        run: |
-          set -euo pipefail
-          VERSION=$(sed -n 's/^major: *//p' apps/arcs-mini/version | head -1)
-          MINOR=$(sed -n 's/^minor: *//p' apps/arcs-mini/version | head -1)
-          BUILD=$(sed -n 's/^build: *//p' apps/arcs-mini/version | head -1)
-          SHORT_SHA=$(git rev-parse --short=7 HEAD)
-          DATE=$(date -u +%Y%m%d)
-          FULL_VER="${VERSION}.${MINOR}.${BUILD}"
-          mkdir -p out
-          cp "$BUILD_DIR/arcs-mini.bin" "out/leo-radio-${FULL_VER}-${SHORT_SHA}-app.bin"
-          cp "$BUILD_DIR"/arcs-mini3.lpk "out/leo-radio-${FULL_VER}-${SHORT_SHA}-full.lpk"
-          cp "$BUILD_DIR"/arcs-mini3-v*.ota.txz "out/leo-radio-${FULL_VER}-${SHORT_SHA}.ota.txz"
-          cp "$BUILD_DIR"/arcs-mini3.combined.hex "out/leo-radio-${FULL_VER}-${SHORT_SHA}.combined.hex"
-          {
-            echo "version=${FULL_VER}"
-            echo "sha=${SHORT_SHA}"
-            echo "tag=leo-radio-${DATE}-${SHORT_SHA}"
-          } >> "$GITHUB_ENV"
-          ls -l out
-
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: leo-radio-${{ env.version }}-${{ env.sha }}
-          path: out
-          if-no-files-found: error
-
-      - name: 创建/更新 Release
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/feat/leo-radio') || inputs.publish
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # 同一 commit 重跑时先清掉旧 release，避免 assets 重复
-          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$tag" out/* \
-            --title "LEO Radio ${version} (${sha})" \
-            --notes-file .github/release-notes-leo-radio.md \
-            --latest
-          gh release view "$tag" --json url -q .url
+  release:
+    uses: Shinku-Chen/listenai_arcs_mini/.github/workflows/release-firmware.yml@master
+    with:
+      board: arcs_mini3
+      app_dir: apps/arcs-mini
+      build_name: leo-radio
+      notes_file: .github/release-notes-leo-radio.md
+      publish: ${{ github.event_name == 'push' || inputs.publish }}
