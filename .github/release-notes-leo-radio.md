@@ -42,6 +42,20 @@ adb shell "radio key click"   # 模拟按键：click/double/triple/quad/five/lon
 adb shell "radio show|hide|next|play|pause|city <n>"
 ```
 
+
+## 发版（打 tag 自动构建）
+
+```bash
+git switch feat/leo-radio && git pull
+git tag -a leo-radio-v3.0.4 -m "LEO 网络电台 3.0.4"
+git push origin leo-radio-v3.0.4          # 触发 release-leo-radio → 调用 master 的通用流水线
+```
+
+- 打包逻辑在 **master** 的 `.github/workflows/release-firmware.yml`（`workflow_call` 可复用）。
+  本分支只有十几行的 caller，换新功能固件时复制它改 4 个 `with` 参数即可。
+- 也可以 Actions → `release-leo-radio`（或 master 的 `release-firmware`）→ Run workflow 手动跑。
+- Release tag 直接用打的 tag 名；`--latest` 会把它标成最新。
+
 --- 
 
 源码分支 `feat/leo-radio`；固件文档见 <https://github.com/Shinku-Chen/listenai_arcs_mini_doc>
