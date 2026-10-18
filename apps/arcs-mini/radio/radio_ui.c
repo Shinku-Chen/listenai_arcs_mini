@@ -380,7 +380,7 @@ static void build_netcfg(lv_obj_t *root)
     s_lbl_netcfg_state = ui_label(s_page_netcfg, "未连接", C_RED, &lv_font_chinese_16);
     lv_obj_align(s_lbl_netcfg_state, LV_ALIGN_TOP_MID, 0, 186);
 
-    ui_page_hint(s_page_netcfg, "重新配网");
+    ui_page_hint(s_page_netcfg, "重新配网 · 三击返回");
 }
 
 static void build_volume(lv_obj_t *root)
