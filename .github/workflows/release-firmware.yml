@@ -1,0 +1,192 @@
+name: release-firmware
+
+# 通用的「ARCS 固件打包 + Release」流水线（放在 master 的 .github/ 下）。
+#
+# 为什么放 master：本仓 master 是上游快照，但同步脚本会 `git checkout HEAD -- .github`
+# 把这一层保留下来，所以 .github/ 是唯一能长期存活、供所有分支复用的地方。
+#
+# 用法一（推荐，打 tag 自动发版）：在功能分支加一个十几行的 caller，见
+#   .github/workflows/release-leo-radio.yml（feat/leo-radio 分支）
+# 用法二（手动）：Actions → release-firmware → Run workflow，选分支、填板型。
+#
+# 注意：GitHub 的 push 事件（含 tag）使用的是 **被打 tag 的那个 commit 里的 workflow**，
+# 所以 tag 触发必须由功能分支里的 caller 承接；本文件提供 workflow_call 被调用。
+
+on:
+  workflow_call:
+    inputs:
+      board:
+        description: '板型（-DBOARD=）'
+        type: string
+        required: false
+        default: 'arcs_mini3'
+      app_dir:
+        description: '应用工程目录（-S）'
+        type: string
+        required: false
+        default: 'apps/arcs-mini'
+      build_name:
+        description: '产物前缀 / 自动 tag 前缀'
+        type: string
+        required: false
+        default: 'firmware'
+      res_dir:
+        description: '资源目录（partition_table.json 所在），留空自动按板型推导'
+        type: string
+        required: false
+        default: ''
+      notes_file:
+        description: 'Release 正文文件（留空则用 --generate-notes）'
+        type: string
+        required: false
+        default: ''
+      release_tag:
+        description: '指定 release tag（留空：tag 触发用 tag 名，手动触发自动生成）'
+        type: string
+        required: false
+        default: ''
+      publish:
+        description: '创建/更新 GitHub Release'
+        type: boolean
+        required: false
+        default: true
+  workflow_dispatch:
+    inputs:
+      board:
+        description: '板型（-DBOARD=）'
+        type: string
+        default: 'arcs_mini3'
+      app_dir:
+        description: '应用工程目录（-S）'
+        type: string
+        default: 'apps/arcs-mini'
+      build_name:
+        description: '产物前缀 / 自动 tag 前缀'
+        type: string
+        default: 'firmware'
+      res_dir:
+        description: '资源目录（留空按板型推导）'
+        type: string
+        default: ''
+      notes_file:
+        description: 'Release 正文文件（留空用自动生成）'
+        type: string
+        default: ''
+      release_tag:
+        description: '指定 release tag（留空自动生成）'
+        type: string
+        default: ''
+      publish:
+        description: '创建/更新 GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-firmware-${{ github.ref }}-${{ inputs.build_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      INSTALL_DIR: /home/runner/.listenai
+      BUILD_DIR: build-firmware
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # version.cmake 用 git 短 hash 拼版本号，需要完整历史
+          fetch-depth: 0
+
+      - name: 缓存工具链
+        uses: actions/cache@v4
+        with:
+          path: ~/.listenai
+          key: listenai-toolchain-${{ runner.os }}-${{ hashFiles('arcs-sdk/tools/scripts/prepare_toolchain.sh', 'arcs-sdk/tools/scripts/prepare_listenai_tools.sh') }}
+
+      - name: 安装工具链（缓存命中则只做校验）
+        run: |
+          set -euo pipefail
+          if [ ! -x "$INSTALL_DIR/gcc/bin/riscv64-unknown-elf-gcc" ]; then
+            bash ./arcs-sdk/tools/scripts/prepare_toolchain.sh "$INSTALL_DIR"
+          fi
+          if [ ! -x "$INSTALL_DIR/listenai-tools/cmake/bin/cmake" ]; then
+            bash ./arcs-sdk/tools/scripts/prepare_listenai_tools.sh "$INSTALL_DIR"
+          fi
+          {
+            echo "NUCLEI_TOOLCHAIN_PATH=$INSTALL_DIR/gcc"
+            echo "LISTENAI_TOOLS_PATH=$INSTALL_DIR/listenai-tools"
+            echo "ARCS_BASE=$GITHUB_WORKSPACE/arcs-sdk"
+          } >> "$GITHUB_ENV"
+          echo "$INSTALL_DIR/gcc/bin" >> "$GITHUB_PATH"
+          "$INSTALL_DIR/gcc/bin/riscv64-unknown-elf-gcc" --version | head -1
+          "$INSTALL_DIR/listenai-tools/cmake/bin/cmake" --version | head -1
+
+      - name: 构建固件
+        run: |
+          set -euo pipefail
+          # build.sh 在仓库里是 644（不可执行），必须用 bash 调
+          bash ./build.sh -S "./${{ inputs.app_dir }}" -B "$BUILD_DIR" -DBOARD="${{ inputs.board }}" 2>&1 | tee build.log
+          echo "---- 内存账 ----"
+          grep -A 8 "Memory region" build.log || echo "未找到内存报告（增量构建未重链）"
+
+      - name: 收集产物
+        run: |
+          set -euo pipefail
+          VER=$(sed -n 's/^major: *//p' "${{ inputs.app_dir }}/version" | head -1)
+          MINOR=$(sed -n 's/^minor: *//p' "${{ inputs.app_dir }}/version" | head -1)
+          BUILD=$(sed -n 's/^build: *//p' "${{ inputs.app_dir }}/version" | head -1)
+          FULL_VER="${VER}.${MINOR}.${BUILD}"
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          DATE=$(date -u +%Y%m%d)
+          PREFIX="${{ inputs.build_name }}"
+
+          # tag 名：tag 触发用 tag 名，手动触发用 (输入 tag | 自动生成)
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.release_tag }}" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${PREFIX}-${DATE}-${SHORT_SHA}"
+          fi
+
+          mkdir -p out
+          cp "$BUILD_DIR/arcs-mini.bin" "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}-app.bin"
+          cp "$BUILD_DIR/arcs-mini"*.lpk "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}-full.lpk"
+          cp "$BUILD_DIR/arcs-mini"-v*.ota.txz "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}.ota.txz"
+          cp "$BUILD_DIR/arcs-mini"*.combined.hex "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}.combined.hex"
+
+          {
+            echo "version=${FULL_VER}"
+            echo "sha=${SHORT_SHA}"
+            echo "tag=${TAG}"
+          } >> "$GITHUB_ENV"
+          ls -l out
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build_name }}-${{ env.version }}-${{ env.sha }}
+          path: out
+          if-no-files-found: error
+
+      - name: 创建/更新 Release
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 同一 tag 重跑时先清掉旧 release，避免 assets 重复
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          NOTES_ARGS=(--generate-notes)
+          if [ -n "${{ inputs.notes_file }}" ] && [ -f "${{ inputs.notes_file }}" ]; then
+            NOTES_ARGS=(--notes-file "${{ inputs.notes_file }}")
+          fi
+          gh release create "$tag" out/* \
+            --title "${{ inputs.build_name }} ${version} (${sha})" \
+            "${NOTES_ARGS[@]}" \
+            --latest
+          gh release view "$tag" --json url -q .url
