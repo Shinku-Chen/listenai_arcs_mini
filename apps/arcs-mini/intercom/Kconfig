@@ -1,0 +1,16 @@
+config INTERCOM
+    bool "对讲机（BLE NUS + 文本对话）"
+    default n
+    depends on LISA_BLUETOOTH
+    depends on LISA_BLUETOOTH_BLE
+    depends on APPLICATION_UI
+    help
+      在固件内实现对讲机：注册 Nordic UART Service（128-bit UUID）作为 BLE 外设，
+      按 A5 5A 帧协议与手机端的对讲机 App 通信（文本上下行 + turn 控制）。
+
+      本期能力：握手 hello/status、文本气泡上屏、按住说话（turn_start/cancel/end）、
+      网关状态与音量控制。上行语音（Opus）与下行 TTS 未实现，hello 的 caps 如实
+      不带 opus / tts_opus。
+
+      与既有能力的关系：复用 SDK 的 BLE 栈与广播（配网小程序不受影响）；本模块只在
+      扫描响应里追加 128-bit 服务 UUID 与 LING-xxxx 名字。

@@ -452,6 +452,16 @@ static void app_button_on_changed(void *unused, uint32_t msg_id, void *data,
         return;
     }
 
+#ifdef CONFIG_INTERCOM
+    /* 对讲页在前台时独占点击序列：按住说话不能被当成关机/配网/相机触发。 */
+    {
+        extern bool ic_app_intercept_action(int action);
+        if (ic_app_intercept_action((int)evt->action)) {
+            return;
+        }
+    }
+#endif
+
 #ifdef CONFIG_MINIAPP
     if (miniapp_is_active()) {
         if (evt->action == VOICE_MSG_BUTTON_ACTION_CLICK) {

@@ -199,6 +199,12 @@ static void publish_button_event(uint8_t btn_id, lisa_btn_event_t action, bool f
 static void btn_event_callback(lisa_btn_event_t event, uint8_t btn_id, void *user)
 {
     (void)user;
+#ifdef CONFIG_INTERCOM
+    /* 对讲机需要"按下 / 松开"两个边沿，而消息总线对主功能键只放行点击与 LONG_HOLD。
+     * 这里直接分发原始边沿，不改写既有的 publish_button_event 过滤策略。 */
+    extern void ic_app_on_raw_button(lisa_btn_event_t event, uint8_t btn_id);
+    ic_app_on_raw_button(event, btn_id);
+#endif
     publish_button_event(btn_id, event, true);
 }
 

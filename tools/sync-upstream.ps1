@@ -32,16 +32,19 @@ if (Test-Path -LiteralPath $samplesDir) {
     Write-Host "[sync] 已剔除 arcs-sdk/samples/（含 subsys）"
 }
 
-# 镜像不带 samples/subsys，必须关掉小程序运行时，否则构建找不到 Lua 绑定源码
+# 镜像不带 samples/subsys，必须关掉小程序运行时，否则构建找不到 Lua 绑定源码。
+# ⚠️ 必须以字节方式读写：prj.conf 是 UTF-8（含中文注释），
+#    用 Set-Content / Out-File 会被转成系统 ANSI（GBK），Kconfig 直接报 Malformed utf-8。
 $prj = 'apps/arcs-mini/prj.conf'
 if (Test-Path -LiteralPath $prj) {
-    $lines = Get-Content -LiteralPath $prj
-    if ($lines -match '^CONFIG_MINIAPP=') {
-        $lines = $lines -replace '^CONFIG_MINIAPP=.*$', 'CONFIG_MINIAPP=n'
+    $enc  = New-Object System.Text.UTF8Encoding($false)
+    $text = $enc.GetString([System.IO.File]::ReadAllBytes($prj))
+    if ($text -match '(?m)^CONFIG_MINIAPP=') {
+        $text = [regex]::Replace($text, '(?m)^CONFIG_MINIAPP=.*$', 'CONFIG_MINIAPP=n')
     } else {
-        $lines += 'CONFIG_MINIAPP=n'
+        $text = $text.TrimEnd() + "`r`n" + 'CONFIG_MINIAPP=n' + "`r`n"
     }
-    Set-Content -LiteralPath $prj -Value $lines -NoNewline:$false
+    [System.IO.File]::WriteAllText($prj, $text, $enc)
     Write-Host "[sync] prj.conf: CONFIG_MINIAPP=n（镜像不含 samples/subsys）"
 }
 # 本仓维护的覆盖层：同步时保留，不随上游覆盖（本仓不放文档，只留同步工具与指针）

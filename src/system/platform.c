@@ -30,6 +30,24 @@
 #define SDMMC_MOUNT_POINT "/"SDMMC_DEVICE
 
 #define TAG "platform"
+
+#ifdef CONFIG_INTERCOM
+/* BLE 协议栈就绪后（BT 任务上下文）注册对讲机 GATT 服务 */
+static void platform_ble_ready_cb(uint16_t status)
+{
+    extern int ic_link_init(void);
+    if (status != 0) {
+        LISA_LOGW(TAG, "BLE enable failed: %u, skip intercom link", status);
+        return;
+    }
+    const int ret = ic_link_init();
+    if (ret != 0) {
+        LISA_LOGW(TAG, "ic_link_init failed: %d", ret);
+    } else {
+        LISA_LOGI(TAG, "intercom link registered");
+    }
+}
+#endif
 #include "lisa_log.h"
 
 #ifdef CONFIG_BOARD_ARCS_MINI
@@ -207,7 +225,13 @@ static int voice_platform_init(void)
         network_probe_init();
         sys_wifi_init();
         LISA_LOGI(TAG, "BLE init start\n");
+#ifdef CONFIG_INTERCOM
+        /* 自定义 GATT 服务必须在 BLE 初始化完成回调里注册：该回调由 BT 任务调用，
+         * 从主任务直接 ble_gatt_user_register() 会在协议栈未就绪时挂住（真机黑屏 + USB 消失）。 */
+        lisa_bluetooth_init(platform_ble_ready_cb);
+#else
         lisa_bluetooth_init(NULL);
+#endif
         extern void app_ble_netcfg_init(void);
         app_ble_netcfg_init();
         LISA_LOGI(TAG, "BLE init end\n");

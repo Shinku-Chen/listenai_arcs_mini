@@ -86,6 +86,12 @@ static void app_ble_on_connected(uint8_t conidx, uint16_t conhdl, const gap_bdad
     s_ble_connected = true;
     s_ble_conidx = conidx;
     LISA_LOGI(TAG, "BLE connected, conidx=%u", conidx);
+#ifdef CONFIG_INTERCOM
+    {
+        extern void ic_link_on_connected(uint8_t conidx, const void *peer_addr);
+        ic_link_on_connected(conidx, peer_addr);
+    }
+#endif
 }
 
 void netcfg_bles_con_cleanup(uint8_t conidx, uint16_t reason)
@@ -100,12 +106,24 @@ void netcfg_bles_con_cleanup(uint8_t conidx, uint16_t reason)
 static void app_ble_on_disconnected(uint8_t conidx, uint16_t conhdl, uint16_t reason)
 {
     (void)conhdl;
+#ifdef CONFIG_INTERCOM
+    {
+        extern void ic_link_on_disconnected(uint8_t conidx, uint16_t reason);
+        ic_link_on_disconnected(conidx, reason);
+    }
+#endif
     netcfg_bles_con_cleanup(conidx, reason);
 }
 
 static void app_ble_on_bond(uint8_t conidx, uint8_t info, uint8_t value)
 {
     LISA_LOGI(TAG, "BLE bond event, conidx=%u, info=%u, value=%u", conidx, info, value);
+#ifdef CONFIG_INTERCOM
+    {
+        extern void ic_link_on_bond(uint8_t conidx, uint8_t info, uint8_t value);
+        ic_link_on_bond(conidx, info, value);
+    }
+#endif
 }
 
 void app_ble_netcfg_prepare(void)

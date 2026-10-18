@@ -275,6 +275,14 @@ int main(int argc, char **argv)
 #if CONFIG_APPLICATION_UI
     extern int lisa_ui_init(void);
     lisa_ui_init();
+    #ifdef CONFIG_INTERCOM
+        {
+            extern int ic_app_init(void);
+            if (ic_app_init() != 0) {
+                LOGE("intercom init failed");
+            }
+        }
+    #endif
 #endif
 
 #ifdef CONFIG_MINIAPP
