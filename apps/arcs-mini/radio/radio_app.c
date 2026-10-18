@@ -25,6 +25,8 @@
 #include "service_volume.h"
 #include "service_power_policy.h"
 
+#include "lisa_ui_nav_scr_ids.h"
+
 #include "radio_catalog.h"
 #include "radio_net.h"
 #include "radio_player.h"
@@ -609,6 +611,26 @@ bool radio_app_intercept_action(int action)
 
 /* ==================== 任务 ==================== */
 
+/* 这些页面是“闹钟 / OTA 确认 / 小应用”这类系统或用户明确要求的页面，
+ * 必须让它盖住电台页：（OTA 确认页要等用户按键，顶掉它会把升级流程卡死）。
+ * 其余页面（云端推的二维码页、信息页、被 nav 回主页）一律把电台页拉回来。 */
+static bool radio_app_foreign_page_wins(int top_id)
+{
+    switch (top_id) {
+    case LISA_UI_NAV_SCR_ID_ALARM_RING:
+    case LISA_UI_NAV_SCR_ID_MINIAPP:
+#ifdef CONFIG_OTA
+    case LISA_UI_NAV_SCR_ID_OTA:
+#endif
+#ifdef CONFIG_LOG_UPLOAD
+    case LISA_UI_NAV_SCR_ID_LOG_UPLOAD:
+#endif
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void radio_app_task(void *argument)
 {
     (void)argument;
@@ -654,12 +676,13 @@ static void radio_app_task(void *argument)
             }
         }
 
-        /* 3. 电台页被别的页面压下去了（云端推的二维码页、信息页…）就拉回来。
-         *    电台页拥有屏幕：只要在前台，就每 400ms 重新 nav 一次直到它真的在最上面。
-         *    同时也兼顾了 LVGL 还没起来时的首次进页。 */
+        /* 3. 电台页被别的页面压下去了就拉回来（云端推的二维码页、被 nav 回主页…），
+         *    但闹钟 / OTA 确认 / 小应用这类页面必须让它先执行。 */
         if (s_state.foreground) {
             if (radio_ui_is_visible()) {
                 s_state.nav_confirmed = true;
+            } else if (radio_app_foreign_page_wins(radio_ui_top_id())) {
+                s_state.nav_confirmed = false;
             } else {
                 if (s_state.nav_confirmed) {
                     s_state.nav_confirmed = false;

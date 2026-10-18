@@ -919,7 +919,12 @@ void radio_ui_hide(void)
     (void)lisa_ui_nav_scr_nav_default();
 }
 
+int radio_ui_top_id(void)
+{
+    return lisa_ui_nav_scr_get_top_id();
+}
+
 bool radio_ui_is_visible(void)
 {
-    return lisa_ui_nav_scr_get_top_id() == RADIO_UI_SCR_ID;
+    return radio_ui_top_id() == RADIO_UI_SCR_ID;
 }

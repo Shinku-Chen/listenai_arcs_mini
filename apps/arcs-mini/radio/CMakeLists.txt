@@ -13,6 +13,7 @@ listenai_library_sources(
 listenai_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${PROJECT_TOP_DIR}/apps-ui
+    ${PROJECT_TOP_DIR}/apps-ui/apps/llm
     ${PROJECT_TOP_DIR}/apps-ui/assets/fonts
     ${PROJECT_TOP_DIR}/apps/arcs-mini/services
     ${PROJECT_TOP_DIR}/src/system

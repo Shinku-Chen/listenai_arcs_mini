@@ -22,7 +22,7 @@ int radio_ui_init(void);
 void radio_ui_show(void);
 void radio_ui_hide(void);
 
-/* 当前是否停在电台页（可在任意线程调用） */
-bool radio_ui_is_visible(void);
+/* 当前置顶页面 id（用于“是否被别的页面占屏”判断） */
+int radio_ui_top_id(void);
 
 #endif /* __RADIO_UI_H__ */
