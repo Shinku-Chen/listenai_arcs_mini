@@ -275,6 +275,6 @@ docker run --rm --init -w $(pwd) -v $(pwd):$(pwd) --platform linux/amd64 ghcr.io
 2. `arcs-sdk/samples/` 不入镜像，因而 `apps/arcs-mini/prj.conf` 是 **`CONFIG_MINIAPP=n`**；
    要小程序能力时从上游取回 `samples/subsys` 再打开。
 3. 本仓不放文档/规范：新东西一律写进文档仓。
-4. 同步用 `tools/sync-upstream.ps1` / `.sh`（Actions 每周一自动跑），不要手工改上游文件；
+4. 同步用 `.github/scripts/sync-upstream.ps1` / `.sh`（Actions 每周一自动跑），不要手工改上游文件；
    同步后功能分支用 `git merge origin/master` 跟上。
 <!-- ai-docs:end -->

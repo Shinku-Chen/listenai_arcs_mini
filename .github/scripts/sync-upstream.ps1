@@ -21,7 +21,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+# 本脚本位于 <repo>/.github/scripts/，仓库根是上两级
+$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $root
 
 # 上游的样例工程整个不入镜像：体积大、构建用不到，且含 205MB 的 algo_emmc.bin（GitHub 拒收）。
@@ -45,12 +46,12 @@ if (Test-Path -LiteralPath $prj) {
     Write-Host "[sync] prj.conf: CONFIG_MINIAPP=n（镜像不含 samples/subsys）"
 }
 # 本仓维护的覆盖层：同步时保留，不随上游覆盖（本仓不放文档，只留同步工具与指针）
-$overlay = @('tools/sync-upstream.ps1', 'tools/sync-upstream.sh', 'tools/ai-docs-pointer.md', '.github/workflows/sync-upstream.yml')
+$overlay = @('.github/scripts/sync-upstream.ps1', '.github/scripts/sync-upstream.sh', '.github/ai-docs-pointer.md', '.github/workflows/sync-upstream.yml')
 
 Write-Host "[sync] 恢复覆盖层：$($overlay -join ', ')"
 & git checkout HEAD -- @overlay 2>$null
 # 在 AGENTS.md 末尾追加"去文档仓读文档"的指针（上游 AGENTS.md 本身不动，只在末尾追加）
-$pointerFile = 'tools/ai-docs-pointer.md'
+$pointerFile = '.github/ai-docs-pointer.md'
 if ((Test-Path -LiteralPath 'AGENTS.md') -and (Test-Path -LiteralPath $pointerFile)) {
     $pointer = Get-Content -LiteralPath $pointerFile -Raw
     Add-Content -LiteralPath 'AGENTS.md' -Value ("`n" + $pointer.TrimEnd() + "`n")
