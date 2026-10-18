@@ -654,13 +654,17 @@ static void radio_app_task(void *argument)
             }
         }
 
-        /* 3. 前台但页面没到位：补投递一次（LVGL 可能还没起来）。
-         *    一旦上到前台就不再重投，否则会把后来叠上来的页面（如扫码绑定页）
-         *    每 400 ms 顶下去一次。 */
+        /* 3. 电台页被别的页面压下去了（云端推的二维码页、信息页…）就拉回来。
+         *    电台页拥有屏幕：只要在前台，就每 400ms 重新 nav 一次直到它真的在最上面。
+         *    同时也兼顾了 LVGL 还没起来时的首次进页。 */
         if (s_state.foreground) {
             if (radio_ui_is_visible()) {
                 s_state.nav_confirmed = true;
-            } else if (!s_state.nav_confirmed) {
+            } else {
+                if (s_state.nav_confirmed) {
+                    s_state.nav_confirmed = false;
+                    LOGI("radio page covered, restoring");
+                }
                 const uint32_t now = radio_app_now_ms();
                 if ((uint32_t)(now - s_state.last_nav_ms) >= RADIO_NAV_RETRY_MS) {
                     s_state.last_nav_ms = now;

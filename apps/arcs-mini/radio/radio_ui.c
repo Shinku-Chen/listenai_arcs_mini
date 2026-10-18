@@ -1,14 +1,17 @@
 /*
- * 电台界面实现。播放页布局（240x240，留白优先、不再堆面板框）：
+ * 电台界面实现。
  *
- *   y   3..23   [03/10] CH 徽标（左，琥珀） · 时钟（右）
- *   y  28       分隔线
- *   y  34..52   台名（16px，白，居中，超长裁剪）
- *   y  52..116  主读数：有频率显示 "101.7"，没有频率显示频道号 "03"
- *               （rubik_bold_64，本机可用的唯一大字号）
- *   y 130..170  刻度盘：88 / 108 标尺 + 刻度 + 已调谐高亮段 + 指针
- *   y 179..195  播放图标 + 状态行（含睡眠定时倒计时 / 错误原因）
- *   y 206..222  操作提示
+ * 播放页（240x240）——"仪表卡片 + 文字栈"：
+ *
+ *   y   3..23   [上海 03/10]           82%  12:34      顶栏：来源·频道 / 电量 / 时钟
+ *   y  30..142  ┌────────────────────────────────┐
+ *               │ ● 正在播放            [12:34]   │ 状态药丸（左）+ 睡眠定时（右）
+ *               │            101.7               │ 大号读数（rubik_bold_64）
+ *               │  88 ━━━━━●━━━━━  108           │ 刻度盘 + 已调谐渐变 + 指针
+ *               └────────────────────────────────┘
+ *   y 148..166  台名（目录原名，超宽循环滚播）
+ *   y 168..186  副信息（流派 · 编码 · 码率）
+ *   y 200..218  操作提示（暗灰）
  *
  * 子页面（菜单 / 台单 / 城市 / 音量）挂在同一个根对象下，用 HIDDEN 切换。
  */
@@ -47,7 +50,7 @@
 #define C_PANEL      0x0D1B23
 #define C_PANEL_SOFT 0x11262E
 #define C_CARD       0x10212A /* 主读数卡片底色 */
-#define C_CARD_TOP   0x16303B /* 卡片竖向渐变顶部 */
+#define C_CARD_TOP   0x17303B /* 卡片竖向渐变顶部 */
 #define C_CARD_LINE  0x1E3A46 /* 卡片顶部 1px 高光 */
 #define C_GRID       0x24404A
 #define C_GRID_DIM   0x1A3038
@@ -56,6 +59,7 @@
 #define C_TEXT       0xF4F0DE
 #define C_MUTED      0x849BA0
 #define C_MUTED_DIM  0x5E7278
+#define C_FOOT       0x4A5E66
 #define C_AMBER      0xFFB74D
 #define C_AMBER_SOFT 0x7F5A29
 #define C_GREEN      0x4ED39A
@@ -63,31 +67,26 @@
 
 /* ==================== 播放页几何 ==================== */
 
-/* 主读数卡片：把“完整台名 + 副信息 + 读数 + 刻度盘”圈成一块信息面板 */
 #define CARD_X 10
-#define CARD_Y 28
+#define CARD_Y 30
 #define CARD_W 220
-#define CARD_H 152
+#define CARD_H 112
 #define CARD_R 14
 
-#define CARD_PAD_X 12 /* 卡片内左右内边距 */
+#define HERO_Y   36
+#define NAME_Y   150
+#define META_Y   178
+#define HINT_Y   206
 
-#define NAME_Y  34
-#define META_Y  54
-#define HERO_Y  68
-#define DIAL_X0 26
-#define DIAL_X1 214
-#define DIAL_LABEL_Y 136
-#define DIAL_TRACK_Y 166
-#define DIAL_NEEDLE_W 3
-#define DIAL_NEEDLE_TOP 152
-#define DIAL_NEEDLE_H 22
+#define DIAL_X0        26
+#define DIAL_X1        214
+#define DIAL_TRACK_Y   132
+#define DIAL_NEEDLE_W  3
+#define DIAL_NEEDLE_TOP 110
+#define DIAL_NEEDLE_H  22
 #define DIAL_TICK_COUNT 41
 
-#define CHIP_W 64
-#define CHIP_H 20
-
-/* 行列表页几何：一行两项（台名 + 流派/码率） */
+/* 列表页几何：一行两项（台名 + 流派/码率） */
 #define ROW_Y0 34
 #define ROW_H  42
 #define ROW_X  10
@@ -100,20 +99,16 @@ static lv_obj_t *s_scr;
 
 /* 播放页 */
 static lv_obj_t *s_page_player;
-static lv_obj_t *s_chip;
-static lv_obj_t *s_lbl_ch;
+static lv_obj_t *s_lbl_chip;
 static lv_obj_t *s_lbl_clock;
 static lv_obj_t *s_lbl_batt;
-static lv_obj_t *s_lbl_name;
-static lv_obj_t *s_lbl_meta;
+static lv_obj_t *s_lbl_timer;
 static lv_obj_t *s_lbl_hero;
-static lv_obj_t *s_lbl_freq_lo;
-static lv_obj_t *s_lbl_freq_hi;
 static lv_obj_t *s_dial_on;
 static lv_obj_t *s_dial_off;
 static lv_obj_t *s_needle;
-static lv_obj_t *s_play_icon[3];
-static lv_obj_t *s_lbl_status;
+static lv_obj_t *s_lbl_name;
+static lv_obj_t *s_lbl_meta;
 static lv_obj_t *s_lbl_hint;
 
 /* 菜单页 */
@@ -203,18 +198,6 @@ static void ui_set_bg(lv_obj_t *obj, uint32_t color)
     lv_obj_set_style_bg_color(obj, lv_color_hex(color), LV_PART_MAIN);
 }
 
-static lv_obj_t *ui_page(lv_obj_t *parent)
-{
-    lv_obj_t *page = lv_obj_create(parent);
-
-    lv_obj_remove_style_all(page);
-    lv_obj_set_pos(page, 0, 0);
-    lv_obj_set_size(page, 240, 240);
-    lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
-    return page;
-}
-
 /* 带裁剪的单行标签：必须显式给高度。
  * chinese_16 的 line_height 是 18，但 CJK 字模实际画到 +19/+20，
  * 只给一行高度的话上下会被裁掉 1~2 px（真机上看就是“字被切了”）。 */
@@ -229,6 +212,18 @@ static lv_obj_t *ui_clip_label(lv_obj_t *parent, const char *text, uint32_t colo
     return lbl;
 }
 
+static lv_obj_t *ui_page(lv_obj_t *parent)
+{
+    lv_obj_t *page = lv_obj_create(parent);
+
+    lv_obj_remove_style_all(page);
+    lv_obj_set_pos(page, 0, 0);
+    lv_obj_set_size(page, 240, 240);
+    lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
+    return page;
+}
+
 /* 子页统一的小标题 */
 static void ui_page_title(lv_obj_t *page, const char *text)
 {
@@ -239,7 +234,7 @@ static void ui_page_title(lv_obj_t *page, const char *text)
 
 static void ui_page_hint(lv_obj_t *page, const char *text)
 {
-    lv_obj_t *hint = ui_label(page, text, C_MUTED, &lv_font_chinese_16);
+    lv_obj_t *hint = ui_label(page, text, C_MUTED_DIM, &lv_font_chinese_16);
     lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 206);
 }
 
@@ -249,47 +244,35 @@ static void build_player(lv_obj_t *root)
 {
     s_page_player = ui_page(root);
 
-    /* 顶部：频道徽标 + 时钟 */
-    s_chip = ui_box(s_page_player, 12, 3, CHIP_W, CHIP_H, 6, C_PANEL_SOFT);
-    s_lbl_ch = ui_label(s_chip, "01/01", C_AMBER, &lv_font_chinese_16);
-    lv_obj_center(s_lbl_ch);
+    /* 顶栏：只有频道号、电量、时钟（来源城市放到倒数第二排开头） */
+    s_lbl_chip = ui_label(s_page_player, "01/06", C_AMBER, &lv_font_chinese_16);
+    lv_obj_align(s_lbl_chip, LV_ALIGN_TOP_LEFT, 12, 3);
 
     s_lbl_clock = ui_label(s_page_player, "--:--", C_TEXT, &lv_font_chinese_16);
     lv_obj_align(s_lbl_clock, LV_ALIGN_TOP_RIGHT, -12, 3);
 
-    /* 电量：挂在时钟左边（右对齐偏移是固定的，见 apply_battery） */
     s_lbl_batt = ui_label(s_page_player, "--%", C_MUTED, &lv_font_chinese_16);
     lv_obj_align(s_lbl_batt, LV_ALIGN_TOP_RIGHT, -64, 3);
 
-    /* 主读数卡片：竖向微渐变 + 顶部 1px 高光 */
+    /* 仪表卡片：竖向微渐变 + 顶部 1px 高光。
+     * LVGL 的 VER 渐变从 bg_color（顶）流到 bg_grad_color（底），所以“上亮下暗”。 */
     lv_obj_t *card = ui_box(s_page_player, CARD_X, CARD_Y, CARD_W, CARD_H, CARD_R, C_CARD_TOP);
     lv_obj_set_style_bg_grad_color(card, lv_color_hex(C_CARD), LV_PART_MAIN);
     lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, LV_PART_MAIN);
-    ui_box(card, 12, 1, CARD_W - 24, 1, 0, C_CARD_LINE);
+    ui_box(card, 14, 1, CARD_W - 28, 1, 0, C_CARD_LINE);
 
-    /* 台名：用目录原名，太长就循环滚播（比截断成“上海 FM94.7”信息多） */
-    s_lbl_name = ui_label(s_page_player, "等待网络", C_TEXT, &lv_font_chinese_16);
-    lv_obj_set_width(s_lbl_name, CARD_W - CARD_PAD_X * 2);
-    lv_obj_set_height(s_lbl_name, 20);
-    lv_label_set_long_mode(s_lbl_name, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_align(s_lbl_name, LV_ALIGN_TOP_LEFT, CARD_X + CARD_PAD_X, NAME_Y);
+    /* 睡眠定时：只有开了定时才在卡片右上角出现 */
+    s_lbl_timer = ui_label(s_page_player, "定时 12:34", C_AMBER, &lv_font_chinese_16);
+    lv_obj_align(s_lbl_timer, LV_ALIGN_TOP_RIGHT, -(CARD_X + 12), CARD_Y + 4);
+    lv_obj_add_flag(s_lbl_timer, LV_OBJ_FLAG_HIDDEN);
 
-    /* 副信息：流派标签 + 编码 + 码率 */
-    s_lbl_meta = ui_clip_label(s_page_player, "网络电台", C_MUTED, &lv_font_chinese_16,
-                               CARD_W - CARD_PAD_X * 2);
-    lv_obj_align(s_lbl_meta, LV_ALIGN_TOP_LEFT, CARD_X + CARD_PAD_X, META_Y);
-
-    /* 主读数：rubik 64 只有数字和 '.'，所以只放频率或频道号 */
+    /* 主读数：rubik 64 只有数字和 '.'，所以只放频率或频道号。
+     * 播放状态只看它的颜色：在播=琥珀 / 连接中=暗琥珀 / 暂停=灰。 */
     s_lbl_hero = ui_label(s_page_player, "01", C_AMBER, &lv_font_rubik_bold_64);
     lv_obj_align(s_lbl_hero, LV_ALIGN_TOP_MID, 0, HERO_Y);
 
-    /* 标尺两端 */
-    s_lbl_freq_lo = ui_label(s_page_player, "88", C_MUTED, &lv_font_chinese_16);
-    lv_obj_align(s_lbl_freq_lo, LV_ALIGN_TOP_LEFT, DIAL_X0, DIAL_LABEL_Y);
-    s_lbl_freq_hi = ui_label(s_page_player, "108", C_MUTED, &lv_font_chinese_16);
-    lv_obj_align(s_lbl_freq_hi, LV_ALIGN_TOP_RIGHT, -(240 - DIAL_X1), DIAL_LABEL_Y);
-
-    /* 刻度：41 根，0.5MHz 间隔；每 8 根长刻度（4MHz），每 2 根中刻度（1MHz） */
+    /* 刻度：41 根，0.5MHz 间隔；每 8 根长刻度（4MHz），每 2 根中刻度（1MHz）。
+     * 不摆 88/108 数字：大字号读数已经把频率说清楚了，再塞两个数字会和大数字撞。 */
     for (int i = 0; i < DIAL_TICK_COUNT; ++i) {
         const bool major = (i % 8 == 0);
         const bool medium = (i % 2 == 0);
@@ -312,18 +295,20 @@ static void build_player(lv_obj_t *root)
     s_needle = ui_box(s_page_player, 0, DIAL_NEEDLE_TOP, DIAL_NEEDLE_W, DIAL_NEEDLE_H, 1,
                       C_AMBER);
 
-    /* 状态行：图标 + 文本 */
-    for (int i = 0; i < 3; ++i) {
-        s_play_icon[i] = ui_box(s_page_player, 13, 189, 4, 12, 0, C_GREEN);
-        lv_obj_add_flag(s_play_icon[i], LV_OBJ_FLAG_HIDDEN);
-    }
+    /* 卡片下方：台名 / 来源·流派·码率 / 操作提示，左对齐一条竖线对齐 */
+    s_lbl_name = ui_label(s_page_player, "等待网络", C_TEXT, &lv_font_chinese_16);
+    lv_obj_set_width(s_lbl_name, CARD_W - 4);
+    lv_obj_set_height(s_lbl_name, 20);
+    lv_label_set_long_mode(s_lbl_name, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(s_lbl_name, LV_ALIGN_TOP_LEFT, CARD_X + 6, NAME_Y);
 
-    s_lbl_status = ui_clip_label(s_page_player, "等待网络", C_MUTED, &lv_font_chinese_16, 196);
-    lv_obj_align(s_lbl_status, LV_ALIGN_TOP_LEFT, 30, 186);
+    s_lbl_meta = ui_clip_label(s_page_player, "网络电台", C_MUTED, &lv_font_chinese_16,
+                               CARD_W - 4);
+    lv_obj_align(s_lbl_meta, LV_ALIGN_TOP_LEFT, CARD_X + 6, META_Y);
 
-    s_lbl_hint = ui_label(s_page_player, "单击换台 双击暂停 长按设置", C_MUTED_DIM,
+    s_lbl_hint = ui_label(s_page_player, "单击换台 双击暂停 长按设置", C_FOOT,
                           &lv_font_chinese_16);
-    lv_obj_align(s_lbl_hint, LV_ALIGN_TOP_MID, 0, 208);
+    lv_obj_align(s_lbl_hint, LV_ALIGN_TOP_LEFT, CARD_X + 6, HINT_Y);
 }
 
 static void build_menu(lv_obj_t *root)
@@ -335,11 +320,12 @@ static void build_menu(lv_obj_t *root)
     static const char *const names[RADIO_MENU_COUNT] = {"台单", "城市", "睡眠定时", "音量"};
     for (int i = 0; i < RADIO_MENU_COUNT; ++i) {
         const int y = ROW_Y0 + i * ROW_H;
-        s_menu_row[i] = ui_box(s_page_menu, ROW_X, y, ROW_W, ROW_H - 6, 6, C_PANEL);
+        s_menu_row[i] = ui_box(s_page_menu, ROW_X, y, ROW_W, ROW_BOX_H, 8,
+                               (i == 0) ? C_CARD_TOP : C_PANEL);
         s_menu_name[i] = ui_label(s_menu_row[i], names[i], C_TEXT, &lv_font_chinese_16);
-        lv_obj_align(s_menu_name[i], LV_ALIGN_LEFT_MID, 10, 0);
+        lv_obj_align(s_menu_name[i], LV_ALIGN_LEFT_MID, 12, 0);
         s_menu_value[i] = ui_label(s_menu_row[i], "", C_MUTED, &lv_font_chinese_16);
-        lv_obj_align(s_menu_value[i], LV_ALIGN_RIGHT_MID, -10, 0);
+        lv_obj_align(s_menu_value[i], LV_ALIGN_RIGHT_MID, -12, 0);
     }
 }
 
@@ -354,7 +340,7 @@ static void build_list(lv_obj_t *root)
 
     for (int i = 0; i < RADIO_UI_ROWS; ++i) {
         const int y = ROW_Y0 + i * ROW_H;
-        s_list_row[i] = ui_box(s_page_list, ROW_X, y, ROW_W, ROW_BOX_H, 6, C_PANEL);
+        s_list_row[i] = ui_box(s_page_list, ROW_X, y, ROW_W, ROW_BOX_H, 8, C_PANEL);
 
         s_list_text[i] = ui_clip_label(s_list_row[i], "", C_TEXT, &lv_font_chinese_16,
                                        ROW_W - 16);
@@ -374,10 +360,9 @@ static void build_city(lv_obj_t *root)
 
     for (int i = 0; i < RADIO_UI_ROWS; ++i) {
         const int y = ROW_Y0 + i * ROW_H;
-        s_city_row[i] = ui_box(s_page_city, ROW_X, y, ROW_W, ROW_BOX_H, 6, C_PANEL);
-        s_city_text[i] = ui_clip_label(s_city_row[i], "", C_TEXT, &lv_font_chinese_16,
-                                       ROW_W - 16);
-        lv_obj_align(s_city_text[i], LV_ALIGN_LEFT_MID, 10, 0);
+        s_city_row[i] = ui_box(s_page_city, ROW_X, y, ROW_W, ROW_BOX_H, 8, C_PANEL);
+        s_city_text[i] = ui_label(s_city_row[i], "", C_TEXT, &lv_font_chinese_16);
+        lv_obj_align(s_city_text[i], LV_ALIGN_LEFT_MID, 12, 0);
     }
 }
 
@@ -490,35 +475,6 @@ static void apply_battery(void)
     ui_set_color(s_lbl_batt, color);
 }
 
-static const char *playback_text(const radio_ui_model_t *m)
-{
-    switch ((radio_pb_state_t)m->playback) {
-    case RADIO_PB_CONNECTING:
-        return "正在连接";
-    case RADIO_PB_PLAYING:
-        return "正在播放";
-    case RADIO_PB_ERROR:
-        return "信号中断 正在重连";
-    case RADIO_PB_STOPPED:
-    default:
-        return "已暂停";
-    }
-}
-
-static uint32_t playback_color(const radio_ui_model_t *m)
-{
-    switch ((radio_pb_state_t)m->playback) {
-    case RADIO_PB_PLAYING:
-        return C_GREEN;
-    case RADIO_PB_ERROR:
-    case RADIO_PB_CONNECTING:
-        return C_AMBER;
-    default:
-        return C_MUTED;
-    }
-}
-
-/* 主读数用色：在播=琥珀，重连=暗琥珀，暂停=灰 */
 static uint32_t hero_color(const radio_ui_model_t *m)
 {
     switch ((radio_pb_state_t)m->playback) {
@@ -538,39 +494,32 @@ static void format_mmss(uint32_t ms, char *out, size_t capacity)
     snprintf(out, capacity, "%u:%02u", (unsigned)(total / 60u), (unsigned)(total % 60u));
 }
 
-/* 三角 / 双竖条图标 */
-static void apply_play_icon(bool playing, bool paused, uint32_t color)
+/* 刻度条（指针 + 已调谐段）跟大数字同色系：暂停时一并变灰，
+ * 否则数字灰了、刻度还亮着，看起来像还在播。 */
+static void apply_dial_color(uint32_t hero)
 {
-    if (s_play_icon[0] == NULL) {
-        return;
-    }
-    if (playing) {
-        lv_obj_set_size(s_play_icon[0], 4, 12);
-        lv_obj_set_pos(s_play_icon[0], 13, 189);
-        lv_obj_set_size(s_play_icon[1], 6, 6);
-        lv_obj_set_pos(s_play_icon[1], 17, 192);
-        lv_obj_set_size(s_play_icon[2], 6, 2);
-        lv_obj_set_pos(s_play_icon[2], 23, 194);
-        lv_obj_clear_flag(s_play_icon[0], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_play_icon[1], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_play_icon[2], LV_OBJ_FLAG_HIDDEN);
-        for (int i = 0; i < 3; ++i) {
-            ui_set_bg(s_play_icon[i], color);
-        }
-    } else if (paused) {
-        lv_obj_set_size(s_play_icon[0], 4, 12);
-        lv_obj_set_pos(s_play_icon[0], 14, 189);
-        lv_obj_set_size(s_play_icon[1], 4, 12);
-        lv_obj_set_pos(s_play_icon[1], 21, 189);
-        lv_obj_clear_flag(s_play_icon[0], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_play_icon[1], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_play_icon[2], LV_OBJ_FLAG_HIDDEN);
-        ui_set_bg(s_play_icon[0], color);
-        ui_set_bg(s_play_icon[1], color);
+    uint32_t needle;
+    uint32_t base;
+    uint32_t grad;
+
+    if (hero == C_AMBER) {
+        needle = C_AMBER;
+        base = C_AMBER_SOFT;
+        grad = C_AMBER;
+    } else if (hero == C_AMBER_SOFT) {
+        needle = C_AMBER_SOFT;
+        base = C_GRID;
+        grad = C_AMBER_SOFT;
     } else {
-        lv_obj_add_flag(s_play_icon[0], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_play_icon[1], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_play_icon[2], LV_OBJ_FLAG_HIDDEN);
+        needle = C_MUTED_DIM;
+        base = C_GRID;
+        grad = C_MUTED_DIM;
+    }
+
+    ui_set_bg(s_needle, needle);
+    if (s_dial_on != NULL) {
+        lv_obj_set_style_bg_color(s_dial_on, lv_color_hex(base), LV_PART_MAIN);
+        lv_obj_set_style_bg_grad_color(s_dial_on, lv_color_hex(grad), LV_PART_MAIN);
     }
 }
 
@@ -578,21 +527,45 @@ static void refresh_player(const radio_ui_model_t *m)
 {
     char text[96];
 
-    /* 频道徽标 */
+    /* 顶栏：只有频道号 */
     snprintf(text, sizeof(text), "%02u/%02u", (unsigned)(m->station_index + 1u),
              (unsigned)(m->station_count == 0 ? 1u : m->station_count));
-    ui_set_text(s_lbl_ch, text);
+    ui_set_text(s_lbl_chip, text);
+
+    /* 睡眠定时：开定时时在卡片右上角显示倒计时 */
+    if (m->sleep_left_ms > 0) {
+        char left[12];
+        format_mmss(m->sleep_left_ms, left, sizeof(left));
+        snprintf(text, sizeof(text), "定时 %s", left);
+        ui_set_text(s_lbl_timer, text);
+        lv_obj_clear_flag(s_lbl_timer, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_lbl_timer, LV_OBJ_FLAG_HIDDEN);
+    }
 
     /* 台名：优先用目录原名（信息更多，超宽会循环滚播） */
     ui_set_text(s_lbl_name,
                 (m->station_full[0] != '\0') ? m->station_full :
                 ((m->station_name[0] != '\0') ? m->station_name :
                  (m->network_ok ? "没有可用电台" : "等待网络")));
-    ui_set_text(s_lbl_meta,
-                (m->station_desc[0] != '\0') ? m->station_desc :
-                (m->network_ok ? "网络电台" : "等待网络"));
 
-    /* 主读数：有频率显示频率，没有就显示频道号（rubik 64 只有数字和 '.'） */
+    /* 倒数第二排：来源城市在前，后面接流派/编码/码率；
+     * 搜台/出错时这一排改成提示，用颜色区分（不额外占一行）。 */
+    if (m->detail[0] != '\0') {
+        ui_set_text(s_lbl_meta, m->detail);
+        ui_set_color(s_lbl_meta, C_RED);
+    } else if (m->busy) {
+        ui_set_text(s_lbl_meta, "正在搜索电台 …");
+        ui_set_color(s_lbl_meta, C_AMBER);
+    } else {
+        const char *source = (m->source[0] != '\0') ? m->source : "内置";
+        const char *desc = (m->station_desc[0] != '\0') ? m->station_desc : "网络电台";
+        snprintf(text, sizeof(text), "%s · %s", source, desc);
+        ui_set_text(s_lbl_meta, text);
+        ui_set_color(s_lbl_meta, C_MUTED);
+    }
+
+    /* 主读数：有频率显示频率，没有就显示频道号；颜色表达播放状态 */
     char freq[12] = {0};
     radio_catalog_format_frequency(m->freq_decihz, freq, sizeof(freq));
     if (freq[0] != '\0') {
@@ -602,31 +575,7 @@ static void refresh_player(const radio_ui_model_t *m)
         ui_set_text(s_lbl_hero, text);
     }
     ui_set_color(s_lbl_hero, hero_color(m));
-
-    /* 状态行：错误 > 正在搜台 > 倒计时 > 普通状态。
-     * 搜台要几秒（定位 + 目录），不提示的话用户会以为“列表没刷新”。 */
-    if (m->detail[0] != '\0') {
-        ui_set_text(s_lbl_status, m->detail);
-        ui_set_color(s_lbl_status, C_RED);
-    } else if (m->busy) {
-        ui_set_text(s_lbl_status, "正在搜索电台 …");
-        ui_set_color(s_lbl_status, C_AMBER);
-    } else if (m->sleep_left_ms > 0) {
-        char left[12];
-        format_mmss(m->sleep_left_ms, left, sizeof(left));
-        snprintf(text, sizeof(text), "%s · 定时 %s", playback_text(m), left);
-        ui_set_text(s_lbl_status, text);
-        ui_set_color(s_lbl_status, playback_color(m));
-    } else {
-        snprintf(text, sizeof(text), "%s · %s", playback_text(m),
-                 (m->source[0] != '\0') ? m->source : "内置");
-        ui_set_text(s_lbl_status, text);
-        ui_set_color(s_lbl_status, playback_color(m));
-    }
-
-    const bool playing = (m->playback == RADIO_PB_PLAYING);
-    apply_play_icon(playing, m->playback == RADIO_PB_STOPPED && !m->busy,
-                    playing ? C_GREEN : C_MUTED);
+    apply_dial_color(hero_color(m));
 
     s_needle_target = (int16_t)dial_x_for_station(m->freq_decihz, m->station_index,
                                                   m->station_count);
@@ -638,7 +587,7 @@ static void refresh_menu(const radio_ui_model_t *m)
 
     for (int i = 0; i < RADIO_MENU_COUNT; ++i) {
         const bool selected = ((uint8_t)i == m->menu_index);
-        ui_set_bg(s_menu_row[i], selected ? C_PANEL_SOFT : C_PANEL);
+        ui_set_bg(s_menu_row[i], selected ? C_CARD_TOP : C_PANEL);
         ui_set_color(s_menu_name[i], selected ? C_AMBER : C_TEXT);
         ui_set_color(s_menu_value[i], selected ? C_AMBER : C_MUTED);
     }
@@ -681,11 +630,11 @@ static void refresh_list(const radio_ui_model_t *m)
         snprintf(text, sizeof(text), "%02u  %s", (unsigned)(index + 1u),
                  (station.full[0] != '\0') ? station.full : station.name);
         ui_set_text(s_list_text[i], text);
-        ui_set_text(s_list_meta[i], (station.desc[0] != '\0') ? station.desc : "broadcast");
+        ui_set_text(s_list_meta[i], (station.desc[0] != '\0') ? station.desc : "广播电台");
 
         const bool selected = (index == m->list_index);
         const bool playing = (index == m->station_index) && (m->playback == RADIO_PB_PLAYING);
-        ui_set_bg(s_list_row[i], selected ? C_PANEL_SOFT : C_PANEL);
+        ui_set_bg(s_list_row[i], selected ? C_CARD_TOP : C_PANEL);
         ui_set_color(s_list_text[i], selected ? C_AMBER : (playing ? C_GREEN : C_TEXT));
         ui_set_color(s_list_meta[i], selected ? C_AMBER_SOFT : C_MUTED_DIM);
     }
@@ -709,7 +658,7 @@ static void refresh_city(const radio_ui_model_t *m)
         ui_set_text(s_city_text[i], radio_app_city_name(index));
 
         const bool selected = (index == m->city_index);
-        ui_set_bg(s_city_row[i], selected ? C_PANEL_SOFT : C_PANEL);
+        ui_set_bg(s_city_row[i], selected ? C_CARD_TOP : C_PANEL);
         ui_set_color(s_city_text[i], selected ? C_AMBER : C_TEXT);
     }
 }
@@ -860,22 +809,16 @@ static void destroy(void)
     s_page_list = NULL;
     s_page_city = NULL;
     s_page_volume = NULL;
-    s_chip = NULL;
-    s_lbl_ch = NULL;
+    s_lbl_chip = NULL;
     s_lbl_clock = NULL;
     s_lbl_batt = NULL;
-    s_lbl_name = NULL;
-    s_lbl_meta = NULL;
+    s_lbl_timer = NULL;
     s_lbl_hero = NULL;
-    s_lbl_freq_lo = NULL;
-    s_lbl_freq_hi = NULL;
     s_dial_on = NULL;
     s_dial_off = NULL;
     s_needle = NULL;
-    for (int i = 0; i < 3; ++i) {
-        s_play_icon[i] = NULL;
-    }
-    s_lbl_status = NULL;
+    s_lbl_name = NULL;
+    s_lbl_meta = NULL;
     s_lbl_hint = NULL;
     for (int i = 0; i < RADIO_MENU_COUNT; ++i) {
         s_menu_row[i] = NULL;

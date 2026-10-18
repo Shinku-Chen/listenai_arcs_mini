@@ -41,8 +41,9 @@
 #define RADIO_AUDIO_FAIL_LIMIT  3
 /* 失败后的退避：attempt * 1000 ms */
 #define RADIO_AUDIO_BACKOFF_MS  1000
-/* 被别的播放器抢占超过这个时间，试探性地重新申请焦点 */
-#define RADIO_AUDIO_HOLD_PROBE_MS 5000
+/* 被别的播放器抢占后，隔多久试探性重新申请焦点。
+ * 开机提示音只有 1s 左右，这里不能设 5s（否则播放在开机后要等 5s 才起来） */
+#define RADIO_AUDIO_HOLD_PROBE_MS 1200
 
 /* ==================== 状态 ==================== */
 
