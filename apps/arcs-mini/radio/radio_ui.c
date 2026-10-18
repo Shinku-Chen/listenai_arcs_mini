@@ -380,7 +380,7 @@ static void build_netcfg(lv_obj_t *root)
     s_lbl_netcfg_state = ui_label(s_page_netcfg, "未连接", C_RED, &lv_font_chinese_16);
     lv_obj_align(s_lbl_netcfg_state, LV_ALIGN_TOP_MID, 0, 186);
 
-    ui_page_hint(s_page_netcfg, "手机 App 扫码配网 · 三击返回");
+    ui_page_hint(s_page_netcfg, "重新配网");
 }
 
 static void build_volume(lv_obj_t *root)
@@ -766,7 +766,7 @@ static void refresh(void)
         refresh_volume(&m);
         break;
     case RADIO_PAGE_NETCFG:
-        ui_set_text(s_lbl_netcfg_state, m.network_ok ? "已连接（重新配网会覆盖当前网络）" : "未连接");
+        ui_set_text(s_lbl_netcfg_state, m.network_ok ? "已连接" : "未连接");
         ui_set_color(s_lbl_netcfg_state, m.network_ok ? C_GREEN : C_RED);
         break;
     case RADIO_PAGE_PLAYER:
