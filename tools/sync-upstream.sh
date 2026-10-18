@@ -47,7 +47,7 @@ if [ -f "$PRJ" ]; then
 fi
 echo "[sync] 恢复覆盖层：${OVERLAY[*]}"
 git checkout HEAD -- "${OVERLAY[@]}" 2>/dev/null || true
-# 在 AGENTS.md 末尾追加"去 ling 读文档"的指针
+# 在 AGENTS.md 末尾追加"去文档仓读文档"的指针
 if [ -f AGENTS.md ] && [ -f tools/ai-docs-pointer.md ]; then
   printf '
 ' >> AGENTS.md

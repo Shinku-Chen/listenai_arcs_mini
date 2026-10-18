@@ -49,7 +49,7 @@ $overlay = @('tools/sync-upstream.ps1', 'tools/sync-upstream.sh', 'tools/ai-docs
 
 Write-Host "[sync] 恢复覆盖层：$($overlay -join ', ')"
 & git checkout HEAD -- @overlay 2>$null
-# 在 AGENTS.md 末尾追加"去 ling 读文档"的指针（上游 AGENTS.md 本身不动，只在末尾追加）
+# 在 AGENTS.md 末尾追加"去文档仓读文档"的指针（上游 AGENTS.md 本身不动，只在末尾追加）
 $pointerFile = 'tools/ai-docs-pointer.md'
 if ((Test-Path -LiteralPath 'AGENTS.md') -and (Test-Path -LiteralPath $pointerFile)) {
     $pointer = Get-Content -LiteralPath $pointerFile -Raw
