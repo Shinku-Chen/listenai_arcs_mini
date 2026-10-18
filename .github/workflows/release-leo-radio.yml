@@ -1,0 +1,110 @@
+name: release-leo-radio
+
+# LEO 网络电台（功能固件）自动构建 + Release。
+#
+# 触发：push 到 feat/leo-radio、或手动 Run workflow。
+# 产物：app 镜像（cskburn 0x600000 / ADB 单分区刷）、整包 lpk、OTA 包、combined hex。
+#
+# 工具链来自 arcs-sdk/tools/scripts（阿里云 OSS 公开地址），
+# 用 actions/cache 缓存到 ~/.listenai，命中后二次构建约 2 分钟。
+
+on:
+  push:
+    branches: [feat/leo-radio]
+    paths-ignore:
+      - '.github/release-notes-leo-radio.md'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: '创建 GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-leo-radio-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BOARD: arcs_mini3
+      BUILD_DIR: build-leo-radio
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # version.cmake 用 git 短 hash 拼版本号，需要完整历史
+          fetch-depth: 0
+
+      - name: 缓存工具链
+        uses: actions/cache@v4
+        with:
+          path: ~/.listenai
+          key: listenai-toolchain-${{ runner.os }}-${{ hashFiles('arcs-sdk/tools/scripts/prepare_toolchain.sh', 'arcs-sdk/tools/scripts/prepare_listenai_tools.sh') }}
+
+      - name: 安装/校验工具链
+        run: |
+          set -o pipefail
+          source ./arcs-sdk/env.sh
+
+      - name: 构建固件
+        run: |
+          set -euo pipefail
+          source ./arcs-sdk/env.sh >/dev/null 2>&1
+          ./build.sh -S ./apps/arcs-mini -B "$BUILD_DIR" -DBOARD="$BOARD"
+          echo "---- 产物 ----"
+          ls -l "$BUILD_DIR"/arcs-mini.bin "$BUILD_DIR"/*.lpk "$BUILD_DIR"/*.ota.txz "$BUILD_DIR"/*.combined.hex
+
+      - name: 打印内存账
+        run: |
+          set -euo pipefail
+          source ./arcs-sdk/env.sh >/dev/null 2>&1
+          # 重新跑一次 ninja，链接已是最新时仍会打印 Memory region（见 AGENTS.md 的构建数据要求）
+          ninja -C "$BUILD_DIR" 2>&1 | tee /tmp/ninja.log || true
+          grep -A 6 "Memory region" /tmp/ninja.log || echo "ninja 未重链，跳过内存报告"
+
+      - name: 收集产物
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^major: *//p' apps/arcs-mini/version | head -1)
+          MINOR=$(sed -n 's/^minor: *//p' apps/arcs-mini/version | head -1)
+          BUILD=$(sed -n 's/^build: *//p' apps/arcs-mini/version | head -1)
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          DATE=$(date -u +%Y%m%d)
+          mkdir -p out
+          cp "$BUILD_DIR/arcs-mini.bin" "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}-app.bin"
+          cp "$BUILD_DIR"/arcs-mini3.lpk "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}-full.lpk"
+          cp "$BUILD_DIR"/arcs-mini3-v*.ota.txz "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}.ota.txz"
+          cp "$BUILD_DIR"/arcs-mini3.combined.hex "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}.combined.hex"
+          {
+            echo "version=${VERSION}.${MINOR}.${BUILD}"
+            echo "sha=${SHORT_SHA}"
+            echo "date=${DATE}"
+            echo "tag=leo-radio-${DATE}-${SHORT_SHA}"
+          } >> "$GITHUB_ENV"
+          ls -l out
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: leo-radio-${{ env.version }}-${{ env.sha }}
+          path: out
+          if-no-files-found: error
+
+      - name: 创建/更新 Release
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/feat/leo-radio') || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 同一 commit 重跑时先清掉旧 release，避免 assets 重复
+          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" out/* \
+            --title "LEO Radio ${version} (${sha})" \
+            --notes-file .github/release-notes-leo-radio.md \
+            --latest
+          gh release view "$tag" --json url -q .url
