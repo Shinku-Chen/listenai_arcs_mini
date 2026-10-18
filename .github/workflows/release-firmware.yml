@@ -153,11 +153,22 @@ jobs:
             TAG="${PREFIX}-${DATE}-${SHORT_SHA}"
           fi
 
+          # 产物名带板型后缀（arcs_mini3 → arcs-mini3.*），用 glob 兜住任意板型
+          shopt -s nullglob
+          APP=( "$BUILD_DIR"/arcs-mini.bin )
+          LPK=( "$BUILD_DIR"/arcs-mini*.lpk )
+          OTA=( "$BUILD_DIR"/arcs-mini*-v*.ota.txz )
+          HEX=( "$BUILD_DIR"/arcs-mini*.combined.hex )
+          if [ ${#APP[@]} -eq 0 ] || [ ${#LPK[@]} -eq 0 ] || [ ${#OTA[@]} -eq 0 ] || [ ${#HEX[@]} -eq 0 ]; then
+            echo "::error::产物缺失（app=${#APP[@]} lpk=${#LPK[@]} ota=${#OTA[@]} hex=${#HEX[@]}）"
+            ls -l "$BUILD_DIR" | head -40
+            exit 1
+          fi
           mkdir -p out
-          cp "$BUILD_DIR/arcs-mini.bin" "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}-app.bin"
-          cp "$BUILD_DIR/arcs-mini"*.lpk "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}-full.lpk"
-          cp "$BUILD_DIR/arcs-mini"-v*.ota.txz "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}.ota.txz"
-          cp "$BUILD_DIR/arcs-mini"*.combined.hex "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}.combined.hex"
+          cp "${APP[0]}" "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}-app.bin"
+          cp "${LPK[0]}" "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}-full.lpk"
+          cp "${OTA[0]}" "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}.ota.txz"
+          cp "${HEX[0]}" "out/${PREFIX}-${FULL_VER}-${SHORT_SHA}.combined.hex"
 
           {
             echo "version=${FULL_VER}"
