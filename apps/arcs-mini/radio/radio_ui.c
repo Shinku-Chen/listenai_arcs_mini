@@ -31,6 +31,7 @@
 #include "lisa_ui_nav_scr.h"
 #include "listen_system.h"
 #include "battery/battery.h"
+#include "sys_wifi.h"
 
 #include "radio_app.h"
 #include "radio_player.h"
@@ -132,6 +133,7 @@ static lv_obj_t *s_city_text[RADIO_UI_ROWS];
 /* 蓝牙配网页 */
 static lv_obj_t *s_page_netcfg;
 static lv_obj_t *s_lbl_netcfg_state;
+static lv_obj_t *s_lbl_netcfg_hint;
 
 /* 音量页 */
 static lv_obj_t *s_page_volume;
@@ -380,7 +382,12 @@ static void build_netcfg(lv_obj_t *root)
     s_lbl_netcfg_state = ui_label(s_page_netcfg, "未连接", C_RED, &lv_font_chinese_16);
     lv_obj_align(s_lbl_netcfg_state, LV_ALIGN_TOP_MID, 0, 186);
 
-    ui_page_hint(s_page_netcfg, "重新配网 · 三击返回");
+    /* 底部提示：只有"已配过网、用户主动进来重配"时才显示；
+     * 未配网时页面是锁死的，显示"三击返回"会误导。 */
+    s_lbl_netcfg_hint = ui_label(s_page_netcfg, "重新配网 · 三击返回", C_MUTED_DIM,
+                                 &lv_font_chinese_16);
+    lv_obj_align(s_lbl_netcfg_hint, LV_ALIGN_TOP_MID, 0, 206);
+    lv_obj_add_flag(s_lbl_netcfg_hint, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void build_volume(lv_obj_t *root)
@@ -768,6 +775,11 @@ static void refresh(void)
     case RADIO_PAGE_NETCFG:
         ui_set_text(s_lbl_netcfg_state, m.network_ok ? "已连接" : "未连接");
         ui_set_color(s_lbl_netcfg_state, m.network_ok ? C_GREEN : C_RED);
+        if (sys_wifi_has_ap()) {
+            lv_obj_clear_flag(s_lbl_netcfg_hint, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_lbl_netcfg_hint, LV_OBJ_FLAG_HIDDEN);
+        }
         break;
     case RADIO_PAGE_PLAYER:
     default:
