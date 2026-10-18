@@ -39,6 +39,7 @@ typedef enum {
     RADIO_MENU_CITY,
     RADIO_MENU_SLEEP,
     RADIO_MENU_VOLUME,
+    RADIO_MENU_NET,     /* 网络：显示连接状态，双击进配网页重新配网 */
     RADIO_MENU_COUNT,
 } radio_menu_t;
 

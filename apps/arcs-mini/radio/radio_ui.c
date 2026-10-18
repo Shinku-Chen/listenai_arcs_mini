@@ -88,11 +88,11 @@
 #define DIAL_TICK_COUNT 41
 
 /* 列表页几何：一行两项（台名 + 流派/码率） */
-#define ROW_Y0 34
-#define ROW_H  42
+#define ROW_Y0 32
+#define ROW_H  35
 #define ROW_X  10
 #define ROW_W  220
-#define ROW_BOX_H 40
+#define ROW_BOX_H 32
 
 /* ==================== 控件句柄 ==================== */
 
@@ -131,6 +131,7 @@ static lv_obj_t *s_city_text[RADIO_UI_ROWS];
 
 /* 蓝牙配网页 */
 static lv_obj_t *s_page_netcfg;
+static lv_obj_t *s_lbl_netcfg_state;
 
 /* 音量页 */
 static lv_obj_t *s_page_volume;
@@ -306,7 +307,7 @@ static void build_player(lv_obj_t *root)
                                CARD_W - 4);
     lv_obj_align(s_lbl_meta, LV_ALIGN_TOP_LEFT, CARD_X + 6, META_Y);
 
-    s_lbl_hint = ui_label(s_page_player, "单击换台 双击暂停 长按设置", C_FOOT,
+    s_lbl_hint = ui_label(s_page_player, "单击换台 双击暂停 三击设置", C_FOOT,
                           &lv_font_chinese_16);
     lv_obj_align(s_lbl_hint, LV_ALIGN_TOP_LEFT, CARD_X + 6, HINT_Y);
 }
@@ -317,7 +318,7 @@ static void build_menu(lv_obj_t *root)
     ui_page_title(s_page_menu, "电台设置");
     ui_page_hint(s_page_menu, "单击选择 双击确认 三击返回");
 
-    static const char *const names[RADIO_MENU_COUNT] = {"台单", "城市", "睡眠定时", "音量"};
+    static const char *const names[RADIO_MENU_COUNT] = {"台单", "城市", "睡眠定时", "音量", "网络"};
     for (int i = 0; i < RADIO_MENU_COUNT; ++i) {
         const int y = ROW_Y0 + i * ROW_H;
         s_menu_row[i] = ui_box(s_page_menu, ROW_X, y, ROW_W, ROW_BOX_H, 8,
@@ -344,11 +345,11 @@ static void build_list(lv_obj_t *root)
 
         s_list_text[i] = ui_clip_label(s_list_row[i], "", C_TEXT, &lv_font_chinese_16,
                                        ROW_W - 16);
-        lv_obj_align(s_list_text[i], LV_ALIGN_TOP_LEFT, 10, 1);
+        lv_obj_align(s_list_text[i], LV_ALIGN_TOP_LEFT, 10, 0);
 
         s_list_meta[i] = ui_clip_label(s_list_row[i], "", C_MUTED, &lv_font_chinese_16,
                                        ROW_W - 16);
-        lv_obj_align(s_list_meta[i], LV_ALIGN_TOP_LEFT, 10, 19);
+        lv_obj_align(s_list_meta[i], LV_ALIGN_TOP_LEFT, 10, 17);
     }
 }
 
@@ -376,11 +377,10 @@ static void build_netcfg(lv_obj_t *root)
     lv_img_set_src(qr, &png_ble_netcfg_bind_qr_png);
     lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 34);
 
-    lv_obj_t *hint = ui_label(s_page_netcfg, "手机 App 扫码配网", C_MUTED,
-                              &lv_font_chinese_16);
-    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 186);
+    s_lbl_netcfg_state = ui_label(s_page_netcfg, "未连接", C_RED, &lv_font_chinese_16);
+    lv_obj_align(s_lbl_netcfg_state, LV_ALIGN_TOP_MID, 0, 186);
 
-    ui_page_hint(s_page_netcfg, "三击返回");
+    ui_page_hint(s_page_netcfg, "手机 App 扫码配网 · 三击返回");
 }
 
 static void build_volume(lv_obj_t *root)
@@ -614,6 +614,10 @@ static void refresh_menu(const radio_ui_model_t *m)
 
     snprintf(text, sizeof(text), "%u", (unsigned)m->volume);
     ui_set_text(s_menu_value[RADIO_MENU_VOLUME], text);
+
+    ui_set_text(s_menu_value[RADIO_MENU_NET], m->network_ok ? "已连接" : "未连接");
+    ui_set_color(s_menu_value[RADIO_MENU_NET],
+                 m->network_ok ? (m->menu_index == RADIO_MENU_NET ? C_AMBER : C_GREEN) : C_RED);
 }
 
 static void refresh_list(const radio_ui_model_t *m)
@@ -760,6 +764,10 @@ static void refresh(void)
         break;
     case RADIO_PAGE_VOLUME:
         refresh_volume(&m);
+        break;
+    case RADIO_PAGE_NETCFG:
+        ui_set_text(s_lbl_netcfg_state, m.network_ok ? "已连接（重新配网会覆盖当前网络）" : "未连接");
+        ui_set_color(s_lbl_netcfg_state, m.network_ok ? C_GREEN : C_RED);
         break;
     case RADIO_PAGE_PLAYER:
     default:

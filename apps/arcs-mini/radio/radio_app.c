@@ -447,8 +447,13 @@ static void radio_app_handle_double_click(void)
             break;
         }
         case RADIO_MENU_VOLUME:
-        default:
             s_state.page = RADIO_PAGE_VOLUME;
+            break;
+        case RADIO_MENU_NET:
+        default:
+            /* 重新配网：进配网页（显示二维码）并开始 BLE 广播 */
+            s_state.page = RADIO_PAGE_NETCFG;
+            app_ble_netcfg_adv_start_delayed();
             break;
         }
         break;
@@ -487,36 +492,25 @@ static void radio_app_handle_triple_click(void)
         break;
     case RADIO_PAGE_PLAYER:
     default:
-        /* 纯电台里播放页就是根页面，没有"退出" */
+        /* 播放页三击 = 进设置菜单 */
+        s_state.menu_index = RADIO_MENU_LIST;
+        s_state.page = RADIO_PAGE_MENU;
         break;
     }
 }
 
-/* 长按：子页回播放页；播放页执行关机（与上游助手固件一致的系统语义） */
+/* 长按：任何页面都是关机（与上游助手固件一致的系统语义） */
 static void radio_app_handle_long_hold(void)
 {
-    if ((radio_page_t)s_state.page == RADIO_PAGE_PLAYER) {
-        LOGI("power button long hold, shutting down");
-        power_shutdown();
-        return;
-    }
-    s_state.page = ((radio_page_t)s_state.page == RADIO_PAGE_VOLUME) ? RADIO_PAGE_MENU
-                                                                    : RADIO_PAGE_PLAYER;
+    LOGI("power button long hold, shutting down");
+    power_shutdown();
 }
 
 /* 四击：播放页进设置菜单；子页回播放页 */
 static void radio_app_handle_quadruple_click(void)
 {
-    if ((radio_page_t)s_state.page != RADIO_PAGE_PLAYER) {
-        s_state.page = RADIO_PAGE_PLAYER;
-        return;
-    }
-    if ((radio_page_t)s_state.page == RADIO_PAGE_PLAYER) {
-        s_state.menu_index = RADIO_MENU_LIST;
-        s_state.page = RADIO_PAGE_MENU;
-    } else {
-        s_state.page = RADIO_PAGE_PLAYER;
-    }
+    /* 四击与三击同义：播放页进设置，子页回上一级 */
+    radio_app_handle_triple_click();
 }
 
 /* 按键总入口：纯电台里没有别的页面，所以所有点击序列都归电台。 */
