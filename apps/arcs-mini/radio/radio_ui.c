@@ -27,6 +27,7 @@
 #include <lvgl.h>
 
 #include "lisa_ui_fonts.h"
+#include "lisa_ui_assets.h" /* 配网二维码（与助手固件用的是同一张图） */
 #include "lisa_ui_nav_scr.h"
 #include "listen_system.h"
 #include "battery/battery.h"
@@ -127,6 +128,9 @@ static lv_obj_t *s_list_meta[RADIO_UI_ROWS];
 static lv_obj_t *s_page_city;
 static lv_obj_t *s_city_row[RADIO_UI_ROWS];
 static lv_obj_t *s_city_text[RADIO_UI_ROWS];
+
+/* 蓝牙配网页 */
+static lv_obj_t *s_page_netcfg;
 
 /* 音量页 */
 static lv_obj_t *s_page_volume;
@@ -360,6 +364,23 @@ static void build_city(lv_obj_t *root)
         s_city_text[i] = ui_label(s_city_row[i], "", C_TEXT, &lv_font_chinese_16);
         lv_obj_align(s_city_text[i], LV_ALIGN_LEFT_MID, 12, 0);
     }
+}
+
+static void build_netcfg(lv_obj_t *root)
+{
+    s_page_netcfg = ui_page(root);
+    ui_page_title(s_page_netcfg, "蓝牙配网");
+
+    /* 二维码：与助手固件用同一张配网图（手机 App 扫它下发 SSID/密码） */
+    lv_obj_t *qr = lv_img_create(s_page_netcfg);
+    lv_img_set_src(qr, &png_ble_netcfg_bind_qr_png);
+    lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 34);
+
+    lv_obj_t *hint = ui_label(s_page_netcfg, "手机 App 扫码配网", C_MUTED,
+                              &lv_font_chinese_16);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 186);
+
+    ui_page_hint(s_page_netcfg, "三击返回");
 }
 
 static void build_volume(lv_obj_t *root)
@@ -700,6 +721,7 @@ static void refresh(void)
         lv_obj_add_flag(s_page_list, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_page_city, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_page_volume, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_page_netcfg, LV_OBJ_FLAG_HIDDEN);
         switch ((radio_page_t)m.page) {
         case RADIO_PAGE_MENU:
             lv_obj_clear_flag(s_page_menu, LV_OBJ_FLAG_HIDDEN);
@@ -712,6 +734,9 @@ static void refresh(void)
             break;
         case RADIO_PAGE_VOLUME:
             lv_obj_clear_flag(s_page_volume, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case RADIO_PAGE_NETCFG:
+            lv_obj_clear_flag(s_page_netcfg, LV_OBJ_FLAG_HIDDEN);
             break;
         case RADIO_PAGE_PLAYER:
         default:
@@ -773,6 +798,7 @@ static void build(void)
     build_menu(s_scr);
     build_list(s_scr);
     build_city(s_scr);
+    build_netcfg(s_scr);
     build_volume(s_scr);
 
     s_rendered_page = 0xFF;

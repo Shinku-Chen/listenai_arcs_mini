@@ -15,6 +15,7 @@ listenai_include_directories(
     ${PROJECT_TOP_DIR}/apps-ui
     ${PROJECT_TOP_DIR}/apps-ui/apps/llm
     ${PROJECT_TOP_DIR}/apps-ui/assets/fonts
+    ${CMAKE_BINARY_DIR}/generated/assets
     ${PROJECT_TOP_DIR}/apps/arcs-mini/services
     ${PROJECT_TOP_DIR}/src/system
     ${PROJECT_TOP_DIR}/src/middleware/system

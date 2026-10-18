@@ -31,6 +31,7 @@ typedef enum {
     RADIO_PAGE_LIST,
     RADIO_PAGE_CITY,
     RADIO_PAGE_VOLUME,
+    RADIO_PAGE_NETCFG,   /* 蓝牙配网：显示配网二维码 */
 } radio_page_t;
 
 typedef enum {

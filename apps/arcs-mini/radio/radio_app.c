@@ -466,12 +466,15 @@ static void radio_app_handle_double_click(void)
     }
 }
 
-/* 三击：返回上一级；播放页直接退出电台 */
+/* 三击：返回上一级 */
 static void radio_app_handle_triple_click(void)
 {
     switch ((radio_page_t)s_state.page) {
     case RADIO_PAGE_VOLUME:
         s_state.page = RADIO_PAGE_MENU;
+        break;
+    case RADIO_PAGE_NETCFG:
+        s_state.page = RADIO_PAGE_PLAYER;
         break;
     case RADIO_PAGE_LIST:
     case RADIO_PAGE_CITY:
@@ -500,6 +503,10 @@ static void radio_app_handle_long_hold(void)
 /* 四击：播放页进设置菜单；子页回播放页 */
 static void radio_app_handle_quadruple_click(void)
 {
+    if ((radio_page_t)s_state.page != RADIO_PAGE_PLAYER) {
+        s_state.page = RADIO_PAGE_PLAYER;
+        return;
+    }
     if ((radio_page_t)s_state.page == RADIO_PAGE_PLAYER) {
         s_state.menu_index = RADIO_MENU_LIST;
         s_state.page = RADIO_PAGE_MENU;
@@ -534,10 +541,10 @@ void radio_app_handle_action(int action)
     case VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK:
-        /* 五/六/七击：重新进入 BLE 配网（音量键序与助手固件保持一致） */
-        s_state.page = RADIO_PAGE_PLAYER;
+        /* 五/六/七击：进入 BLE 配网页（屏幕显示配网二维码）并开始广播 */
+        s_state.page = RADIO_PAGE_NETCFG;
         xSemaphoreTake(s_lock, portMAX_DELAY);
-        radio_app_set_detail("已开始蓝牙配网");
+        radio_app_set_detail(NULL);
         xSemaphoreGive(s_lock);
         app_ble_netcfg_adv_start_delayed();
         LOGI("ble netcfg requested by button");
@@ -586,6 +593,9 @@ static void radio_app_task(void *argument)
             radio_audio_set_network(ok);
             if (ok) {
                 s_state.auto_queried = false;
+                if ((radio_page_t)s_state.page == RADIO_PAGE_NETCFG) {
+                    s_state.page = RADIO_PAGE_PLAYER; /* 配网成功，回到电台页 */
+                }
                 if (s_state.foreground) {
                     radio_app_start_auto_query();
                 }
