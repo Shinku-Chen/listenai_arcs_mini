@@ -461,6 +461,17 @@ static void app_button_on_changed(void *unused, uint32_t msg_id, void *data,
     }
 #endif
 
+#ifdef CONFIG_RADIO
+    /* 电台页在前台时独占点击序列；不在前台时四击是它的唯一入口。
+     * 必须放在云端异常重定向之前：否则三击"返回"会被当成打开信息页。 */
+    {
+        extern bool radio_app_intercept_action(int action);
+        if (radio_app_intercept_action((int)evt->action)) {
+            return;
+        }
+    }
+#endif
+
     /* 云端异常时，部分按键只负责打开错误或绑定信息页。 */
     if (app_button_redirect_to_cloud_info(evt->action)) {
         return;

@@ -1,0 +1,18 @@
+config RADIO
+    bool "网络电台（城市台单 + 直播流）"
+    default n
+    depends on APPLICATION_UI
+    depends on APP_PLAYER
+    depends on CJSON
+    help
+      在固件内实现一台"网络收音机"：独立页面（导航 id 92）+ 独占一个
+      app_player 实例（焦点通道 "radio"）播放 http(s) MP3 直播流。
+
+      台单来源：ip-api.com 定位城市 → radio-browser.info 按城市查台；
+      定位或查询失败时回退到内置的 6 个全国性直播台。台单、城市、音量都持久化到 KV。
+
+      入口：电源键四击。页内单击换台、双击播放/暂停、三击返回（播放页直接退出）、
+      长按退出电台并吞掉关机；五/六/七击退出电台并进入 BLE 配网。
+
+      配网不新增任何流程：沿用既有的 BLE 配网（五/六/七击），电台页只负责在无网时
+      提示，用户按提示即可完成配网。

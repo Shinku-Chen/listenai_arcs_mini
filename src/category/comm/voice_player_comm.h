@@ -20,6 +20,9 @@ extern app_player_t *alert_player;
 #ifdef CONFIG_MINIAPP_BUZZER
 extern app_player_t *miniapp_player;
 #endif
+#ifdef CONFIG_RADIO
+extern app_player_t *radio_player;
+#endif
 
 /* ==================== 平台初始化与状态查询 ==================== */
 

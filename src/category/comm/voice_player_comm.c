@@ -20,6 +20,9 @@ app_player_t *alert_player = NULL;
 #ifdef CONFIG_MINIAPP_BUZZER
 app_player_t *miniapp_player = NULL;
 #endif
+#ifdef CONFIG_RADIO
+app_player_t *radio_player = NULL;
+#endif
 
 /** 系统音量（1-100），Kconfig 配置默认值 */
 static int g_system_volume = CONFIG_VOICE_PLAYER_DEFAULT_VOLUME;
@@ -132,6 +135,11 @@ static void volume_thread_func(void *arg)
 #ifdef CONFIG_MINIAPP_BUZZER
         if (miniapp_player != NULL) {
             app_player_set_volume(miniapp_player, volume);
+        }
+#endif
+#ifdef CONFIG_RADIO
+        if (radio_player != NULL) {
+            app_player_set_volume(radio_player, volume);
         }
 #endif
     }
@@ -256,6 +264,21 @@ int voice_player_platform_init(void)
             }
         },
 #endif
+#ifdef CONFIG_RADIO
+        /* 网络电台：与 music 同属“可被打断的后台播放”，优先级略低于 music
+         * （云端歌单优先），但能强制抢占 music，避免两路音频同时出声。
+         * 焦点变化由 radio/radio_player.c 自己接管：直播流不做 pause/resume。 */
+        {
+            .name = "radio",
+            .priority = 52,
+            .capture_names = (const char *[]){"music"},
+            .capture_count = 1,
+            .behavior = {
+                .on_background = APP_PLAYER_FOCUS_LOSS_PAUSE,
+                .on_focus_lost = APP_PLAYER_FOCUS_LOSS_PAUSE,
+            }
+        },
+#endif
     };
 
     /* 初始化 app_player 模块（带焦点管理） */
@@ -298,6 +321,15 @@ int voice_player_platform_init(void)
     miniapp_player = app_player_create("miniapp");
     if (miniapp_player == NULL) {
         LOGE("Failed to create miniapp player");
+        return -1;
+    }
+#endif
+
+#ifdef CONFIG_RADIO
+    /* 电台播放器实例由 radio/radio_player.c 接管（事件/焦点回调 + 状态机任务）。 */
+    radio_player = app_player_create("radio");
+    if (radio_player == NULL) {
+        LOGE("Failed to create radio player");
         return -1;
     }
 #endif
@@ -364,6 +396,9 @@ bool voice_player_is_audio_active(void)
            voice_player_state_is_audio_active(alert_player)
 #ifdef CONFIG_MINIAPP_BUZZER
            || voice_player_state_is_audio_active(miniapp_player)
+#endif
+#ifdef CONFIG_RADIO
+           || voice_player_state_is_audio_active(radio_player)
 #endif
            ;
 }

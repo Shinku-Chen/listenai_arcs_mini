@@ -277,6 +277,17 @@ int main(int argc, char **argv)
     lisa_ui_init();
 #endif
 
+#ifdef CONFIG_RADIO
+    /* 网络电台：注册独立页面（导航 id 92）与播放器/网络任务。
+     * 必须在 lisa_ui_init() 之后，因为导航管理器与 LVGL 已就绪。 */
+    {
+        extern int radio_app_init(void);
+        if (radio_app_init() != 0) {
+            LOGE("radio init failed");
+        }
+    }
+#endif
+
 #ifdef CONFIG_MINIAPP
     if (miniapp_init() != 0) {
         LOGE("Miniapp initialization failed");
