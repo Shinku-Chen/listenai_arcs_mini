@@ -5,8 +5,8 @@ name: release-leo-radio
 # 触发：push 到 feat/leo-radio、或手动 Run workflow。
 # 产物：app 镜像（cskburn 0x600000 / ADB 单分区刷）、整包 lpk、OTA 包、combined hex。
 #
-# 工具链来自 arcs-sdk/tools/scripts（阿里云 OSS 公开地址），
-# 用 actions/cache 缓存到 ~/.listenai，命中后二次构建约 2 分钟。
+# 工具链用 arcs-sdk/tools/scripts 从阿里云 OSS 公开地址下载（不用 env.sh：
+# 它在 Actions 的 bash -e 里会静默退出），缓存到 ~/.listenai，命中后构建约 2 分钟。
 
 on:
   push:
@@ -33,6 +33,7 @@ jobs:
     env:
       BOARD: arcs_mini3
       BUILD_DIR: build-leo-radio
+      INSTALL_DIR: /home/runner/.listenai
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,26 +47,30 @@ jobs:
           path: ~/.listenai
           key: listenai-toolchain-${{ runner.os }}-${{ hashFiles('arcs-sdk/tools/scripts/prepare_toolchain.sh', 'arcs-sdk/tools/scripts/prepare_listenai_tools.sh') }}
 
-      - name: 安装/校验工具链
+      - name: 安装工具链（缓存命中则只做校验）
         run: |
-          set -o pipefail
-          source ./arcs-sdk/env.sh
+          set -euo pipefail
+          if [ ! -x "$INSTALL_DIR/gcc/bin/riscv64-unknown-elf-gcc" ]; then
+            bash ./arcs-sdk/tools/scripts/prepare_toolchain.sh "$INSTALL_DIR"
+          fi
+          if [ ! -x "$INSTALL_DIR/listenai-tools/cmake/bin/cmake" ]; then
+            bash ./arcs-sdk/tools/scripts/prepare_listenai_tools.sh "$INSTALL_DIR"
+          fi
+          {
+            echo "NUCLEI_TOOLCHAIN_PATH=$INSTALL_DIR/gcc"
+            echo "LISTENAI_TOOLS_PATH=$INSTALL_DIR/listenai-tools"
+            echo "ARCS_BASE=$GITHUB_WORKSPACE/arcs-sdk"
+          } >> "$GITHUB_ENV"
+          echo "$INSTALL_DIR/gcc/bin" >> "$GITHUB_PATH"
+          "$INSTALL_DIR/gcc/bin/riscv64-unknown-elf-gcc" --version | head -1
+          "$INSTALL_DIR/listenai-tools/cmake/bin/cmake" --version | head -1
 
       - name: 构建固件
         run: |
           set -euo pipefail
-          source ./arcs-sdk/env.sh >/dev/null 2>&1
-          ./build.sh -S ./apps/arcs-mini -B "$BUILD_DIR" -DBOARD="$BOARD"
-          echo "---- 产物 ----"
-          ls -l "$BUILD_DIR"/arcs-mini.bin "$BUILD_DIR"/*.lpk "$BUILD_DIR"/*.ota.txz "$BUILD_DIR"/*.combined.hex
-
-      - name: 打印内存账
-        run: |
-          set -euo pipefail
-          source ./arcs-sdk/env.sh >/dev/null 2>&1
-          # 重新跑一次 ninja，链接已是最新时仍会打印 Memory region（见 AGENTS.md 的构建数据要求）
-          ninja -C "$BUILD_DIR" 2>&1 | tee /tmp/ninja.log || true
-          grep -A 6 "Memory region" /tmp/ninja.log || echo "ninja 未重链，跳过内存报告"
+          ./build.sh -S ./apps/arcs-mini -B "$BUILD_DIR" -DBOARD="$BOARD" 2>&1 | tee build.log
+          echo "---- 内存账 ----"
+          grep -A 6 "Memory region" build.log || echo "未找到内存报告"
 
       - name: 收集产物
         run: |
@@ -75,15 +80,15 @@ jobs:
           BUILD=$(sed -n 's/^build: *//p' apps/arcs-mini/version | head -1)
           SHORT_SHA=$(git rev-parse --short=7 HEAD)
           DATE=$(date -u +%Y%m%d)
+          FULL_VER="${VERSION}.${MINOR}.${BUILD}"
           mkdir -p out
-          cp "$BUILD_DIR/arcs-mini.bin" "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}-app.bin"
-          cp "$BUILD_DIR"/arcs-mini3.lpk "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}-full.lpk"
-          cp "$BUILD_DIR"/arcs-mini3-v*.ota.txz "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}.ota.txz"
-          cp "$BUILD_DIR"/arcs-mini3.combined.hex "out/leo-radio-${VERSION}.${MINOR}.${BUILD}-${SHORT_SHA}.combined.hex"
+          cp "$BUILD_DIR/arcs-mini.bin" "out/leo-radio-${FULL_VER}-${SHORT_SHA}-app.bin"
+          cp "$BUILD_DIR"/arcs-mini3.lpk "out/leo-radio-${FULL_VER}-${SHORT_SHA}-full.lpk"
+          cp "$BUILD_DIR"/arcs-mini3-v*.ota.txz "out/leo-radio-${FULL_VER}-${SHORT_SHA}.ota.txz"
+          cp "$BUILD_DIR"/arcs-mini3.combined.hex "out/leo-radio-${FULL_VER}-${SHORT_SHA}.combined.hex"
           {
-            echo "version=${VERSION}.${MINOR}.${BUILD}"
+            echo "version=${FULL_VER}"
             echo "sha=${SHORT_SHA}"
-            echo "date=${DATE}"
             echo "tag=leo-radio-${DATE}-${SHORT_SHA}"
           } >> "$GITHUB_ENV"
           ls -l out
