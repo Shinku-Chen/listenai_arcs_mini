@@ -68,7 +68,8 @@ jobs:
       - name: 构建固件
         run: |
           set -euo pipefail
-          ./build.sh -S ./apps/arcs-mini -B "$BUILD_DIR" -DBOARD="$BOARD" 2>&1 | tee build.log
+          # build.sh 在仓库里是 644（不可执行），显式用 bash 调
+          bash ./build.sh -S ./apps/arcs-mini -B "$BUILD_DIR" -DBOARD="$BOARD" 2>&1 | tee build.log
           echo "---- 内存账 ----"
           grep -A 6 "Memory region" build.log || echo "未找到内存报告"
 
