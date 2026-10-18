@@ -102,7 +102,6 @@ static lv_obj_t *s_page_player;
 static lv_obj_t *s_lbl_chip;
 static lv_obj_t *s_lbl_clock;
 static lv_obj_t *s_lbl_batt;
-static lv_obj_t *s_lbl_timer;
 static lv_obj_t *s_lbl_hero;
 static lv_obj_t *s_dial_on;
 static lv_obj_t *s_dial_off;
@@ -261,10 +260,7 @@ static void build_player(lv_obj_t *root)
     lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, LV_PART_MAIN);
     ui_box(card, 14, 1, CARD_W - 28, 1, 0, C_CARD_LINE);
 
-    /* 睡眠定时：只有开了定时才在卡片右上角出现 */
-    s_lbl_timer = ui_label(s_page_player, "定时 12:34", C_AMBER, &lv_font_chinese_16);
-    lv_obj_align(s_lbl_timer, LV_ALIGN_TOP_RIGHT, -(CARD_X + 12), CARD_Y + 4);
-    lv_obj_add_flag(s_lbl_timer, LV_OBJ_FLAG_HIDDEN);
+    /* 睡眠定时不单独占位：开了定时就把左上角的频道号换成倒计时（见 refresh_player） */
 
     /* 主读数：rubik 64 只有数字和 '.'，所以只放频率或频道号。
      * 播放状态只看它的颜色：在播=琥珀 / 连接中=暗琥珀 / 暂停=灰。 */
@@ -527,20 +523,16 @@ static void refresh_player(const radio_ui_model_t *m)
 {
     char text[96];
 
-    /* 顶栏：只有频道号 */
-    snprintf(text, sizeof(text), "%02u/%02u", (unsigned)(m->station_index + 1u),
-             (unsigned)(m->station_count == 0 ? 1u : m->station_count));
-    ui_set_text(s_lbl_chip, text);
-
-    /* 睡眠定时：开定时时在卡片右上角显示倒计时 */
+    /* 左上角：没开定时显示频道号，开了定时换成倒计时（不写“定时”两字） */
     if (m->sleep_left_ms > 0) {
-        char left[12];
-        format_mmss(m->sleep_left_ms, left, sizeof(left));
-        snprintf(text, sizeof(text), "定时 %s", left);
-        ui_set_text(s_lbl_timer, text);
-        lv_obj_clear_flag(s_lbl_timer, LV_OBJ_FLAG_HIDDEN);
+        format_mmss(m->sleep_left_ms, text, sizeof(text));
+        ui_set_text(s_lbl_chip, text);
+        ui_set_color(s_lbl_chip, C_AMBER);
     } else {
-        lv_obj_add_flag(s_lbl_timer, LV_OBJ_FLAG_HIDDEN);
+        snprintf(text, sizeof(text), "%02u/%02u", (unsigned)(m->station_index + 1u),
+                 (unsigned)(m->station_count == 0 ? 1u : m->station_count));
+        ui_set_text(s_lbl_chip, text);
+        ui_set_color(s_lbl_chip, C_AMBER);
     }
 
     /* 台名：优先用目录原名（信息更多，超宽会循环滚播） */
@@ -812,7 +804,6 @@ static void destroy(void)
     s_lbl_chip = NULL;
     s_lbl_clock = NULL;
     s_lbl_batt = NULL;
-    s_lbl_timer = NULL;
     s_lbl_hero = NULL;
     s_dial_on = NULL;
     s_dial_off = NULL;
