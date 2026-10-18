@@ -8,7 +8,9 @@
 #include "evs_utils.h"
 #include "remote_logger.h"
 #include "ic_message.h"
+#if CONFIG_ACOMP
 #include "app_wakeup.h"
+#endif
 #include "voice_player_comm.h"
 #include "lisa_bluetooth.h"
 #include "sys_network_manager.h"
@@ -341,12 +343,14 @@ static int voice_platform_init(void)
     voice_player_platform_init();
     sys_network_manager_init(ipc_ready);
 
-#ifdef CONFIG_BOARD_ARCS_MINI
+#if defined(CONFIG_BOARD_ARCS_MINI) && CONFIG_APPLICATION_UI_ASSISTANT
     extern int lisa_ui_anim_init(uint32_t flash_addr, uint32_t flash_size);
     lisa_ui_anim_init(EMOJI_BIN_ADDR, EMOJI_BIN_SIZE);
 #endif
 
+#if CONFIG_LS_CHAT
     mcp_init();
+#endif
 
     voice_msg_pub(VOICE_MSG_PLATFORM_READY, NULL, 0);
 

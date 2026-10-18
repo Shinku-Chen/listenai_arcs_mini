@@ -4,11 +4,6 @@ listenai_library_sources(
     service_brightness.c
     service_volume.c
     service_button.c
-    service_camera.c
-    service_alarm.c
-    service_image.c
-    service_sd_music.c
-    service_power_policy.c
 )
 
 listenai_include_directories(

@@ -14,7 +14,9 @@
 #include "lisa_log.h"
 #include "lisa_kv.h"
 #include "power_manager.h"
+#if CONFIG_ACOMP
 #include "app_wakeup.h"
+#endif
 #include "project_version.h"
 #include "uboot_features_api.h"
 #include "uboot_ota_api.h"
@@ -1008,8 +1010,10 @@ static int ota_manager_wake_word_update(void)
     download_start_tick = xTaskGetTickCount();
     ota_manager_notify_state(OTA_STATE_UPDATING);
 
-    // 停止算法
+    // 停止算法（纯电台固件没有唤醒词算法，ACOMP 关掉后不再有这一步）
+#if CONFIG_ACOMP
     app_wakeup_stop();
+#endif
 
     LISA_LOGI(TAG, "Begin update wake_word.bin...");
 

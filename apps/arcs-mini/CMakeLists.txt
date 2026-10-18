@@ -40,18 +40,22 @@ endif()
 
 add_subdirectory(tone)
 add_subdirectory(services)
-add_subdirectory(button)
+# 纯电台固件：button/（助手按键语义：拍照预览/云端重定向/配网页跳转）不参与构建，
+# 按键由 radio_app.c 自己订阅 VOICE_MSG_BUTTON_CHANGE 处理。
 listenai_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/miniapp)
 if(CONFIG_MINIAPP)
     add_subdirectory(miniapp)
 endif()
-listenai_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/radio)
+listenai_include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/radio
+    ${PROJECT_TOP_DIR}/apps-ui/lv-i18n
+    ${PROJECT_TOP_DIR}/apps-ui/portable/arcs
+)
 if(CONFIG_RADIO)
     add_subdirectory(radio)
 endif()
-add_subdirectory(mcp-tools)
-add_subdirectory(voice_intent)
-add_subdirectory(voice_player)
+# 纯电台固件：语音意图 / TTS / 音乐 / 闹钟 / MCP 工具都不参与构建
+# （app 层保留 tone 资源加载、button、services）
 
 listenai_add_executable(${PROJECT_NAME})
 

@@ -23,7 +23,8 @@
 #include "sys_network_manager.h"
 #include "sys_wifi.h"
 #include "service_volume.h"
-#include "service_power_policy.h"
+#include "power_manager.h"
+#include "app_ble_common.h"
 
 #include "lisa_ui_nav_scr_ids.h"
 
@@ -344,71 +345,15 @@ static void radio_app_on_net(radio_net_event_t event, const radio_station_t *lis
 
 /* ==================== 导航（必须走 UI 线程） ==================== */
 
-static void radio_app_nav_show_worker(void *arg)
-{
-    (void)arg;
-    radio_ui_show();
-}
-
-static void radio_app_nav_hide_worker(void *arg)
-{
-    (void)arg;
-    radio_ui_hide();
-}
-
-static void radio_app_open(void)
-{
-    if (s_state.foreground) {
-        return;
-    }
-    s_state.foreground = true;
-    s_state.nav_confirmed = false;
-    s_state.page = RADIO_PAGE_PLAYER;
-    s_state.menu_index = RADIO_MENU_LIST;
-    s_state.list_index = s_state.index;
-    s_state.last_nav_ms = radio_app_now_ms();
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    radio_app_set_detail(s_state.net_ok ? NULL : "等待网络");
-    xSemaphoreGive(s_lock);
-
-    lv_async_call(radio_app_nav_show_worker, NULL);
-
-    /* 电台页在前台时不进 IDLE/HIBERNATE：与小程序前台同一策略，
-     * 否则播放中会被降亮度/挂起 USB，表现为"黑屏 + ADB 掉线" */
-    service_power_policy_set_miniapp_active(true);
-
-    if (s_state.count == 0) {
-        radio_app_install_builtin();
-    }
-    radio_app_play_current();
-
-    /* 有网且本次开机还没查过目录：进页就查一次（换城市、地点变了也能自动跟上） */
-    if (s_state.net_ok) {
-        radio_app_start_auto_query();
-    }
-
-    LOGI("radio page opened (%u stations, source=%s)", (unsigned)s_state.count,
-         s_state.source);
-}
-
+/* 页面一直是导航栈的默认页（见 radio_app_init），这里只负责"停播"。 */
 static void radio_app_close(void)
 {
-    if (!s_state.foreground) {
-        return;
-    }
-    s_state.foreground = false;
-    s_state.nav_confirmed = false;
-
-    /* 不清 user_paused：下次进来仍然从当前台开始播 */
     radio_audio_stop();
     (void)radio_net_cancel();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_state.busy = false;
+    s_state.user_paused = true;
     xSemaphoreGive(s_lock);
-
-    lv_async_call(radio_app_nav_hide_worker, NULL);
-    service_power_policy_set_miniapp_active(false);
-    LOGI("radio page closed");
 }
 
 /* ==================== 按键 ==================== */
@@ -535,100 +480,94 @@ static void radio_app_handle_triple_click(void)
         break;
     case RADIO_PAGE_PLAYER:
     default:
-        radio_app_close();
+        /* 纯电台里播放页就是根页面，没有"退出" */
         break;
     }
 }
 
-/* 长按：播放页进设置菜单；子页回上一级（不落到「长按=关机」） */
+/* 长按：子页回播放页；播放页执行关机（与上游助手固件一致的系统语义） */
 static void radio_app_handle_long_hold(void)
 {
-    switch ((radio_page_t)s_state.page) {
-    case RADIO_PAGE_PLAYER:
+    if ((radio_page_t)s_state.page == RADIO_PAGE_PLAYER) {
+        LOGI("power button long hold, shutting down");
+        power_shutdown();
+        return;
+    }
+    s_state.page = ((radio_page_t)s_state.page == RADIO_PAGE_VOLUME) ? RADIO_PAGE_MENU
+                                                                    : RADIO_PAGE_PLAYER;
+}
+
+/* 四击：播放页进设置菜单；子页回播放页 */
+static void radio_app_handle_quadruple_click(void)
+{
+    if ((radio_page_t)s_state.page == RADIO_PAGE_PLAYER) {
         s_state.menu_index = RADIO_MENU_LIST;
         s_state.page = RADIO_PAGE_MENU;
-        break;
-    case RADIO_PAGE_VOLUME:
-        s_state.page = RADIO_PAGE_MENU;
-        break;
-    case RADIO_PAGE_LIST:
-    case RADIO_PAGE_CITY:
-    case RADIO_PAGE_MENU:
-    default:
+    } else {
         s_state.page = RADIO_PAGE_PLAYER;
-        break;
     }
 }
 
-bool radio_app_intercept_action(int action)
+/* 按键总入口：纯电台里没有别的页面，所以所有点击序列都归电台。 */
+void radio_app_handle_action(int action)
 {
     if (!s_state.inited) {
-        return false;
-    }
-
-    /* 只有电台页真的在最上面时才独占按键。若它被别的页面（如扫码绑定页）
-     * 盖住，就退回普通行为；四击在任何时候都能把电台重新提到最前。 */
-    const bool on_top = s_state.foreground && radio_ui_is_visible();
-
-    if (!on_top) {
-        if (action == VOICE_MSG_BUTTON_ACTION_QUADRUPLE_CLICK) {
-            radio_app_open();
-            return true;
-        }
-        return false;
+        return;
     }
 
     switch (action) {
     case VOICE_MSG_BUTTON_ACTION_CLICK:
         radio_app_handle_click();
-        return true;
+        break;
     case VOICE_MSG_BUTTON_ACTION_DOUBLE_CLICK:
         radio_app_handle_double_click();
-        return true;
+        break;
     case VOICE_MSG_BUTTON_ACTION_TRIPLE_CLICK:
         radio_app_handle_triple_click();
-        return true;
+        break;
     case VOICE_MSG_BUTTON_ACTION_QUADRUPLE_CLICK:
-        radio_app_close();
-        return true;
+        radio_app_handle_quadruple_click();
+        break;
     case VOICE_MSG_BUTTON_ACTION_LONG_HOLD:
-        /* 电台页里长按不再区分「关机」，只用做进/出设置 */
         radio_app_handle_long_hold();
-        return true;
+        break;
     case VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK:
-        /* 放行给 BLE 配网：先退出电台，避免两套页面打架 */
-        radio_app_close();
-        return false;
-    case VOICE_MSG_BUTTON_ACTION_REPEAT_CLICK:
-        /* 连击 8+ = 恢复出厂，电台页里吞掉，避免误触 */
-        return true;
+        /* 五/六/七击：重新进入 BLE 配网（音量键序与助手固件保持一致） */
+        s_state.page = RADIO_PAGE_PLAYER;
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        radio_app_set_detail("已开始蓝牙配网");
+        xSemaphoreGive(s_lock);
+        app_ble_netcfg_adv_start_delayed();
+        LOGI("ble netcfg requested by button");
+        break;
     default:
-        return false;
+        /* 连击 8+ 等动作在纯电台里没有语义，直接忽略 */
+        break;
     }
 }
 
-/* ==================== 任务 ==================== */
-
-/* 这些页面是“闹钟 / OTA 确认 / 小应用”这类系统或用户明确要求的页面，
- * 必须让它盖住电台页：（OTA 确认页要等用户按键，顶掉它会把升级流程卡死）。
- * 其余页面（云端推的二维码页、信息页、被 nav 回主页）一律把电台页拉回来。 */
-static bool radio_app_foreign_page_wins(int top_id)
+/* 兼容入口：app_button.c 里保留的调用点（纯电台固件里那个模块不会被链接） */
+bool radio_app_intercept_action(int action)
 {
-    switch (top_id) {
-    case LISA_UI_NAV_SCR_ID_ALARM_RING:
-    case LISA_UI_NAV_SCR_ID_MINIAPP:
-#ifdef CONFIG_OTA
-    case LISA_UI_NAV_SCR_ID_OTA:
-#endif
-#ifdef CONFIG_LOG_UPLOAD
-    case LISA_UI_NAV_SCR_ID_LOG_UPLOAD:
-#endif
-        return true;
-    default:
-        return false;
+    radio_app_handle_action(action);
+    return true;
+}
+
+/* 按键消息回调（订阅 VOICE_MSG_BUTTON_CHANGE） */
+static void radio_app_on_button(void *unused, uint32_t msg_id, void *data, uint32_t len,
+                                void *user_data)
+{
+    (void)unused;
+    (void)msg_id;
+    (void)user_data;
+
+    const voice_msg_button_evt_t *evt = (const voice_msg_button_evt_t *)data;
+    if (evt == NULL || len < sizeof(*evt) || evt->button_id != 0) {
+        return;
     }
+    radio_app_handle_action((int)evt->action);
 }
 
 static void radio_app_task(void *argument)
@@ -675,38 +614,6 @@ static void radio_app_task(void *argument)
                 }
             }
         }
-
-        /* 3. 电台页被别的页面压下去了就拉回来（云端推的二维码页、被 nav 回主页…），
-         *    但闹钟 / OTA 确认 / 小应用这类页面必须让它先执行。 */
-        if (s_state.foreground) {
-            if (radio_ui_is_visible()) {
-                s_state.nav_confirmed = true;
-            } else if (radio_app_foreign_page_wins(radio_ui_top_id())) {
-                s_state.nav_confirmed = false;
-            } else {
-                if (s_state.nav_confirmed) {
-                    s_state.nav_confirmed = false;
-                    LOGI("radio page covered, restoring");
-                }
-                const uint32_t now = radio_app_now_ms();
-                if ((uint32_t)(now - s_state.last_nav_ms) >= RADIO_NAV_RETRY_MS) {
-                    s_state.last_nav_ms = now;
-                    lv_async_call(radio_app_nav_show_worker, NULL);
-                }
-            }
-        }
-
-#ifdef CONFIG_RADIO_AUTO_START
-        /* 4. 开机自动进电台页 */
-        if (s_state.autostart_pending &&
-            (int32_t)(radio_app_now_ms() - s_state.autostart_at_ms) >= 0) {
-            s_state.autostart_pending = false;
-            if (!s_state.foreground) {
-                LOGI("autostart radio page");
-                radio_app_open();
-            }
-        }
-#endif
 
         vTaskDelay(pdMS_TO_TICKS(RADIO_APP_TICK_MS));
     }
@@ -978,6 +885,12 @@ int radio_app_init(void)
     s_state.page = RADIO_PAGE_PLAYER;
     s_state.net_ok = false;
     radio_app_set_source(radio_catalog_builtin_source());
+    {
+        sys_network_status_t status;
+        if (sys_network_get_status(&status) == 0 && status.connected) {
+            s_state.net_ok = true;
+        }
+    }
 
     radio_app_restore_kv();
     radio_app_install_builtin();
@@ -998,17 +911,23 @@ int radio_app_init(void)
 
     s_state.inited = true;
 
-#ifdef CONFIG_RADIO_AUTO_START
-    /* 只有配过网的设备才自动进电台页：从没配网的设备必须停在助手主页，
-     * 否则用户看不到扫码绑定 / 配网引导，也不好进 BLE 配网。 */
-    if (sys_wifi_has_ap()) {
-        s_state.autostart_pending = true;
-        s_state.autostart_at_ms = radio_app_now_ms() + RADIO_AUTOSTART_DELAY_MS;
-        LOGI("radio will autostart in %u ms", (unsigned)RADIO_AUTOSTART_DELAY_MS);
-    } else {
-        LOGW("no saved wifi, skip radio autostart");
+    /* 按键：纯电台固件里没有 app_button 模块，自己订阅消息总线 */
+    (void)voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, radio_app_on_button, NULL);
+
+    /* 电台页就是整个 UI：注册成导航栈的默认页（等价于 open + push + show） */
+    if (radio_ui_set_default() != 0) {
+        LOGE("radio_ui_set_default failed");
+        return -1;
     }
-#endif
+    s_state.foreground = true;
+    s_state.nav_confirmed = true;
+    s_state.page = RADIO_PAGE_PLAYER;
+
+    radio_app_play_current();
+    if (s_state.net_ok) {
+        radio_app_start_auto_query();
+    }
+    LOGI("leo-radio page is the root screen");
 
     if (xTaskCreate(radio_app_task, "radio.app", RADIO_APP_TASK_STACK, NULL,
                     RADIO_APP_TASK_PRIO, &s_task) != pdPASS) {

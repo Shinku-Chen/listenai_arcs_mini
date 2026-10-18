@@ -25,4 +25,7 @@ void radio_ui_hide(void);
 /* 当前置顶页面 id（用于“是否被别的页面占屏”判断） */
 int radio_ui_top_id(void);
 
+/* 把电台页注册成导航栈的默认页（纯电台固件里它就是整个 UI）。返回 0 成功。 */
+int radio_ui_set_default(void);
+
 #endif /* __RADIO_UI_H__ */

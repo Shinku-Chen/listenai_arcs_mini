@@ -6,6 +6,14 @@ config APPLICATION_UI
 
 if APPLICATION_UI
 
+config APPLICATION_UI_ASSISTANT
+    bool "assistant pages (home / qrcode / settings)"
+    default y
+    help
+      助手页面（主页、扫码配网、设置、闹钟页）与它们的 models/presenters。
+      纯功能固件（如 leo-radio 网络电台）可以关掉：这些页面不会被初始化，
+      也不需要 cloud / voice_intent 这些模块的头文件。
+
 config ALARM_RING_AUTO_RETURN_MS
     int "Alarm ring UI auto return timeout (ms)"
     default 60000

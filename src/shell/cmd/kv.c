@@ -140,9 +140,11 @@ static int kv_cmd_set(int argc, char **argv)
                 shellPrint(shellGetCurrent(),"flash set %s:%d failed\n", key, int_temp);
             } else {
                 shellPrint(shellGetCurrent(),"flash set %s:%d success\n", key, int_temp);
+#if CONFIG_APPLICATION_UI_ASSISTANT
                 if (!strcmp(key, KV_KEY_INT_MODE)) {
                     kv_apply_interaction_mode((app_interaction_mode_t)int_temp);
                 }
+#endif
             }
         } else if (!strcmp(type, "bool")) {
             int bool_temp = atoi(value);

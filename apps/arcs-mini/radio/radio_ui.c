@@ -909,6 +909,11 @@ int radio_ui_init(void)
     return ret;
 }
 
+int radio_ui_set_default(void)
+{
+    return lisa_ui_nav_scr_default_set(&s_radio_nav_scr);
+}
+
 void radio_ui_show(void)
 {
     (void)lisa_ui_nav_scr_nav_to(RADIO_UI_SCR_ID);

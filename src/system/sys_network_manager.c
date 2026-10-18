@@ -5,7 +5,9 @@
 #include "lisa_semaphore.h"
 #include "lisa_thread.h"
 #include "voice_msg.h"
+#if CONFIG_LS_CHAT
 #include "voice_cloud.h"
+#endif
 
 #include "app_datas.h"
 #include "kv_user.h"
@@ -173,7 +175,9 @@ static void sys_network_apply_mode(sys_network_mode_t mode, bool persist)
     s_mgr.switching = true;
     sys_network_sync_app_data();
     voice_msg_pub(VOICE_MSG_SYSTEM_NETWORK_SWITCHING, NULL, 0);
+#if CONFIG_LS_CHAT
     voice_cloud_disconnect();
+#endif
 
     if (mode == SYS_NETWORK_MODE_WIFI) {
         /* 严格 WiFi：不起 modem，也不回落 */
