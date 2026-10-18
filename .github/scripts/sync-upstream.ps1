@@ -48,8 +48,8 @@ if (Test-Path -LiteralPath $prj) {
     [System.IO.File]::WriteAllText($prj, $text, $enc)
     Write-Host "[sync] prj.conf: CONFIG_MINIAPP=n（镜像不含 samples/subsys）"
 }
-# 本仓维护的覆盖层：同步时保留，不随上游覆盖（本仓不放文档，只留同步工具与指针）
-$overlay = @('.github/scripts/sync-upstream.ps1', '.github/scripts/sync-upstream.sh', '.github/ai-docs-pointer.md', '.github/workflows/sync-upstream.yml')
+# 本仓自建数据全部在 .github/ 下，同步时整体保留、不随上游覆盖
+$overlay = @('.github')
 
 Write-Host "[sync] 恢复覆盖层：$($overlay -join ', ')"
 & git checkout HEAD -- @overlay 2>$null

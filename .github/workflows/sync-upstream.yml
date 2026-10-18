@@ -53,8 +53,8 @@ jobs:
             echo 'CONFIG_MINIAPP=n' >> apps/arcs-mini/prj.conf
           fi
 
-          # 3) 恢复本仓维护的覆盖层（同步脚本 / 指针 / workflow；本仓不放文档）
-          git checkout HEAD -- .github/scripts/sync-upstream.ps1 .github/scripts/sync-upstream.sh .github/ai-docs-pointer.md .github/workflows/sync-upstream.yml 2>/dev/null || true
+          # 3) 恢复本仓自建数据（全部在 .github/ 下：同步脚本 / 指针 / workflow）
+          git checkout HEAD -- .github
           # 4) AGENTS.md 末尾追加"去文档仓读文档"的指针
           if [ -f AGENTS.md ] && [ -f .github/ai-docs-pointer.md ]; then
             echo '' >> AGENTS.md
