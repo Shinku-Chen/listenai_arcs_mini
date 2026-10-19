@@ -37,4 +37,11 @@ int arcade_gb_machine_report(char *out, uint32_t out_len);
  */
 int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len);
 
+/**
+ * 调试：帧边界 PC / SP 直方图（按出现次数降序）。
+ * PC 集中在极少数地址 = CPU 卡在死循环；分布分散 = CPU 在正常跑。
+ * @return 写入的字符数，<0 没有运行中的 ROM
+ */
+int arcade_gb_hist_report(char *out, uint32_t out_len);
+
 #endif /* __ARCADE_GB_H__ */

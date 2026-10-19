@@ -83,6 +83,29 @@ static uint32_t s_err_count;
 static int s_err_last = -1;
 static uint16_t s_err_addr;
 
+/*
+ * 帧边界采样统计。
+ *
+ * 「画面不动」有两种完全不同的原因，必须分开：
+ *   - CPU 卡在某个循环里（游戏死锁）→ PC 直方图会集中在极少数地址上；
+ *   - CPU 在正常跑，只是画面本身是静止的 → PC 分布很散，而且 VRAM 校验和在变。
+ * 另外 wVBlankOccurred（0xCEEA）是 Pokemon 这类游戏 DelayFrame() 的等待标志，
+ * 它的清零只有 VBlank 中断处理能完成；统计它在帧边界为 0 的次数，就能判断
+ * VBlank 中断处理有没有跑完整。
+ */
+#define PC_HIST_SLOTS 32
+
+static struct {
+    uint16_t pc;
+    uint16_t sp;
+    uint32_t n;
+} s_hist[PC_HIST_SLOTS];
+static uint32_t s_frame_n;
+static uint32_t s_vblank_flag_clear; /* 帧边界上 wVBlankOccurred==0 的帧数 */
+static uint32_t s_vram_sig;
+static uint32_t s_vram_same;      /* 连续未变次数（每次隔 16 帧采样） */
+static uint32_t s_vram_same_max;
+
 /* ---------------- PSRAM 分配（带余量检查） ---------------- */
 
 static size_t psram_free_bytes(void)
@@ -492,6 +515,13 @@ int arcade_gb_start(const char *path)
     s_err_last = -1;
     s_err_addr = 0;
 
+    memset(s_hist, 0, sizeof(s_hist));
+    s_frame_n = 0;
+    s_vblank_flag_clear = 0;
+    s_vram_sig = 0;
+    s_vram_same = 0;
+    s_vram_same_max = 0;
+
     ret = gb_init(&s_priv->gb, &gb_rom_read, &gb_cart_ram_read, &gb_cart_ram_write,
                   &gb_error, s_priv);
     if (ret != GB_INIT_NO_ERROR) {
@@ -555,6 +585,49 @@ bool arcade_gb_running(void)
     return s_running;
 }
 
+static void hist_sample(uint16_t pc, uint16_t sp)
+{
+    uint32_t slot = ((uint32_t)pc * 2654435761u) >> 27; /* 32 槽直接映射 */
+
+    if (s_hist[slot].n != 0 && s_hist[slot].pc == pc) {
+        s_hist[slot].n++;
+        s_hist[slot].sp = sp;
+        return;
+    }
+
+    s_hist[slot].pc = pc;
+    s_hist[slot].sp = sp;
+    s_hist[slot].n = 1;
+}
+
+static void frame_stats_sample(struct gb_s *gb)
+{
+    s_frame_n++;
+    hist_sample(gb->cpu_reg.pc.reg, gb->cpu_reg.sp.reg);
+
+    if (gb->wram[(uint16_t)(0xCEEAu - 0xC000u)] == 0) {
+        s_vblank_flag_clear++;
+    }
+
+    /* VRAM 每 16 帧算一次签名：太频繁会白白吃掉帧预算 */
+    if ((s_frame_n & 0x0F) == 0) {
+        uint32_t sig = 0;
+
+        for (int i = 0; i < VRAM_SIZE; i++) {
+            sig = sig * 31u + gb->vram[i];
+        }
+
+        if (sig == s_vram_sig) {
+            if (++s_vram_same > s_vram_same_max) {
+                s_vram_same_max = s_vram_same;
+            }
+        } else {
+            s_vram_sig = sig;
+            s_vram_same = 0;
+        }
+    }
+}
+
 void arcade_gb_run_frame(void)
 {
     if (!s_running || s_priv == NULL) {
@@ -562,6 +635,7 @@ void arcade_gb_run_frame(void)
     }
 
     gb_run_frame(&s_priv->gb);
+    frame_stats_sample(&s_priv->gb);
 
     if (!s_priv->first_frame_logged) {
         s_priv->first_frame_logged = true;
@@ -702,12 +776,77 @@ int arcade_gb_machine_report(char *out, uint32_t out_len)
     }
 
     n += snprintf(out + n, out_len - (uint32_t)n,
-                  "logo=%s ramcode=%02X err=%u last=%d@%04X",
+                  "logo=%s ramcode=%02X err=%u last=%d@%04X\n",
                   logo_ok ? "ok" : "BAD",
                   (unsigned)gb_rom_read(gb, 0x0149u),
                   (unsigned)s_err_count, s_err_last, (unsigned)s_err_addr);
 
+    if (n < 0 || (uint32_t)n >= out_len) {
+        return n;
+    }
+
+    /* 帧边界统计：vblc 是「wVBlankOccurred 已被清零」的帧数，
+     * 它一直是 0 就说明 VBlank 中断处理没跑完整，游戏会卡在 DelayFrame。 */
+    n += snprintf(out + n, out_len - (uint32_t)n,
+                  "frames=%u vblc=%u vramsame=%ux16 if=%02X ie=%02X joy=%02X",
+                  (unsigned)s_frame_n, (unsigned)s_vblank_flag_clear,
+                  (unsigned)s_vram_same_max,
+                  (unsigned)gb->hram_io[IO_IF], (unsigned)gb->hram_io[IO_IE],
+                  (unsigned)gb->hram_io[0x00]);
+
     return n;
+}
+
+/*
+ * 帧边界 PC 直方图，按出现次数从多到少输出。
+ * 集中的一两个地址 = CPU 卡在死循环；分散 = CPU 在正常执行。
+ */
+int arcade_gb_hist_report(char *out, uint32_t out_len)
+{
+    uint32_t order[PC_HIST_SLOTS];
+    uint32_t total = 0;
+    int used = 0;
+    int off = 0;
+
+    if (s_priv == NULL || out == NULL || out_len < 64) {
+        return -1;
+    }
+
+    for (int i = 0; i < PC_HIST_SLOTS; i++) {
+        if (s_hist[i].n == 0) {
+            continue;
+        }
+        order[used++] = (uint32_t)i;
+        total += s_hist[i].n;
+    }
+
+    /* 按计数插入排序（槽位很少，不值得上 qsort） */
+    for (int i = 1; i < used; i++) {
+        uint32_t key = order[i];
+        int j = i - 1;
+
+        while (j >= 0 && s_hist[order[j]].n < s_hist[key].n) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+
+    off += snprintf(out + off, out_len - (uint32_t)off,
+                    "frames=%u slots=%d total=%u\n",
+                    (unsigned)s_frame_n, used, (unsigned)total);
+
+    for (int i = 0; i < used && i < 16 && off + 40 < (int)out_len; i++) {
+        uint32_t k = order[i];
+
+        off += snprintf(out + off, out_len - (uint32_t)off,
+                        "pc=%04X sp=%04X n=%-6u %u%%\n",
+                        (unsigned)s_hist[k].pc, (unsigned)s_hist[k].sp,
+                        (unsigned)s_hist[k].n,
+                        (unsigned)(total ? (s_hist[k].n * 100u) / total : 0));
+    }
+
+    return off;
 }
 
 int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len)

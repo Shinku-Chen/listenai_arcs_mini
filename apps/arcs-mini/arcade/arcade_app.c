@@ -1027,6 +1027,103 @@ static int cmd_peek(int argc, char **argv)
     return 0;
 }
 
+/*
+ * arcade shot：把当前帧缓冲打成 80x36 的 ASCII 图。
+ *
+ * 「屏幕看起来卡住」时，先看这一张图就能分清是黑屏、白屏、某个画面，
+ * 还是屏上已经不是游戏画面了。格宽 3px、高 6px 是按终端字符 1:2 的长宽比
+ * 挑的，刚好保持 GB 160x144 的比例。
+ */
+static int cmd_shot(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    lv_color_t *fb = arcade_video_get_fb();
+    static const char k_ch[4] = {' ', '.', ':', '#'};
+    uint16_t pal[4];
+    char line[96];
+
+    (void)argc;
+    (void)argv;
+
+    if (fb == NULL) {
+        shellPrint(shell, "fb=(null)\r\n");
+        return 0;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        pal[i] = arcade_video_palette_raw(i);
+    }
+
+    for (int row = 0; row < 36; row++) {
+        int off = 0;
+        int y0 = row * (ARCADE_FB_HEIGHT / 36);
+        int dy = ARCADE_FB_HEIGHT / 36;
+
+        for (int col = 0; col < 80; col++) {
+            int x0 = col * (ARCADE_FB_WIDTH / 80);
+            int dx = ARCADE_FB_WIDTH / 80;
+            int bright = 0;
+            int n = 0;
+
+            for (int y = y0; y < y0 + dy; y++) {
+                for (int x = x0; x < x0 + dx; x++) {
+                    uint16_t v = fb[y * ARCADE_FB_WIDTH + x].full;
+                    int idx = 3;
+
+                    for (int k = 0; k < 4; k++) {
+                        if (pal[k] == v) {
+                            idx = k;
+                            break;
+                        }
+                    }
+                    bright += 3 - idx; /* 0=最暗 3=最亮 */
+                    n++;
+                }
+            }
+
+            line[off++] = k_ch[n ? bright / n : 0];
+        }
+
+        line[off] = '\0';
+        shellPrint(shell, "%s\r\n", line);
+    }
+
+    return 0;
+}
+
+/* arcade pc：帧边界 PC 直方图 */
+static int cmd_pc(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    char line[1024];
+
+    (void)argc;
+    (void)argv;
+
+    if (!arcade_core_running()) {
+        shellPrint(shell, "当前没有运行中的 ROM\r\n");
+        return 0;
+    }
+
+    line[0] = '\0';
+    if (arcade_gb_hist_report(line, sizeof(line)) < 0) {
+        shellPrint(shell, "采样失败\r\n");
+        return 0;
+    }
+
+    for (char *p = line; p != NULL && *p != '\0';) {
+        char *nl = strchr(p, '\n');
+
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+        shellPrint(shell, "%s\r\n", p);
+        p = (nl != NULL) ? nl + 1 : NULL;
+    }
+
+    return 0;
+}
+
 static const struct listen_cmd_t g_arcade_cmds[] = {
     {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
@@ -1041,6 +1138,8 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"romsum", cmd_romsum, "打印 ROM 头部与整份校验和"},
     {"fb", cmd_fb, "帧缓冲/刷屏自检（fill <0-3> 填纯色, resume 恢复）"},
     {"cpu", cmd_cpu, "打印 CPU/LCDC 寄存器快照（连打两次看 PC 是否在走）"},
+    {"pc", cmd_pc, "帧边界 PC/SP 直方图（判断 CPU 卡在哪个循环）"},
+    {"shot", cmd_shot, "把当前帧缓冲打成 80x36 ASCII 图（看屏上到底是什么）"},
     {"peek", cmd_peek, "按 CPU 视角读内存：peek <hex地址> [长度]"},
 };
 
