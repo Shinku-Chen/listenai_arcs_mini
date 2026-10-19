@@ -28,6 +28,10 @@
 #include "miniapp.h"
 #include "app_ble_common.h"
 
+#ifdef CONFIG_APPLICATION_ARCADE
+#include "arcade_app.h"
+#endif
+
 /* 被动网络提示的单次触发状态。 */
 static bool s_netcfg_tone_latched = false;
 static bool s_cloud_ever_connected = false;
@@ -251,6 +255,16 @@ int main(int argc, char **argv)
 {
     extern int boot_watchdog_feed(void);
     boot_watchdog_feed();
+
+#ifdef CONFIG_APPLICATION_ARCADE
+    /*
+     * 复古模拟器固件：语音助手链路不启动，直接把主循环交给模拟器。
+     * 平台层（SYS_INIT）已完成显示、TF 卡、WiFi/BLE 初始化。
+     */
+    (void)argc;
+    (void)argv;
+    return arcade_app_main();
+#endif
 
     voice_msg_sub(VOICE_MSG_SYSTEM_NETWORK_PROBE_SUCCESS, voice_system_network_probe_success, NULL);
     voice_msg_sub(VOICE_MSG_SYSTEM_NETWORK_PROBE_FAIL, voice_wifi_provision_guard, NULL);

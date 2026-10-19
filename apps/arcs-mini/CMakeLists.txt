@@ -49,6 +49,10 @@ add_subdirectory(mcp-tools)
 add_subdirectory(voice_intent)
 add_subdirectory(voice_player)
 
+if(DEFINED CONFIG_APPLICATION_ARCADE)
+    add_subdirectory(arcade)
+endif()
+
 listenai_add_executable(${PROJECT_NAME})
 
 # res 目录命名约定：<app-name>[_variant]，BOARD 去掉 "arcs_mini" 前缀后即变体后缀。

@@ -1,0 +1,43 @@
+menu "Retro Arcade"
+
+config APPLICATION_ARCADE
+    bool "Retro game emulator (GB/GBC/NES)"
+    default n
+    help
+      Build the retro game emulator application.  When enabled, main.c hands
+      control to the arcade UI instead of the voice assistant.
+
+if APPLICATION_ARCADE
+
+config ARCADE_ROM_DIR
+    string "ROM directory on the SD card"
+    default "/SD:/roms"
+    help
+      Directory scanned for *.gb / *.gbc files.
+
+config ARCADE_ROM_MAX
+    int "Maximum number of ROMs listed"
+    range 4 128
+    default 32
+
+config ARCADE_FRAME_PERIOD_MS
+    int "Emulator frame period in milliseconds"
+    range 8 100
+    default 16
+    help
+      16 ms targets ~60 fps, 20 ms targets ~50 fps.  Raise it when the
+      emulator cannot keep up and frames start to pile up.
+
+config ARCADE_CART_RAM_MAX
+    int "Cartridge save RAM size (bytes)"
+    default 32768
+    help
+      Upper bound of the cartridge RAM buffer allocated for the loaded ROM.
+
+config ARCADE_LOG_FPS
+    bool "Log emulator fps to the shell"
+    default y
+
+endif
+
+endmenu

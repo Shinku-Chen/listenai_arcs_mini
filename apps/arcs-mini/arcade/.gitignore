@@ -1,0 +1,9 @@
+# 第三方模拟器内核与测试 ROM 由开发期下载，不进仓库：
+#   Peanut-GB      https://github.com/deltabeard/Peanut-GB   (MIT)
+#   gb-test-roms   https://github.com/retrio/gb-test-roms
+#   libretro-fceumm (NES 后端，下一阶段)
+third_party/*
+# 例外：Peanut-GB 的单头文件实现必须入库，保证全新克隆就能构建
+!third_party/Peanut-GB
+third_party/Peanut-GB/*
+!third_party/Peanut-GB/peanut_gb.h
