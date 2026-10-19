@@ -22,8 +22,12 @@
 
 #define ROM_DIR        CONFIG_ARCADE_ROM_DIR
 #define ROM_MAX        CONFIG_ARCADE_ROM_MAX
-#define ROM_NAME_LEN   48
-#define ROM_PATH_LEN   96
+#define ROM_NAME_LEN   64
+#define ROM_PATH_LEN   128
+
+/* 只展开一层子目录（ROM 目录下的第一级子目录），再多扫卡时间不可控 */
+#define ROM_SUBDIR_DEPTH 1
+#define ROM_SUBDIR_MAX   8
 
 /* 内置演示 ROM 的虚拟路径，arcade_gb.c 看到它就改用内嵌数据 */
 #define ROM_DEMO_PATH  "@demo"
@@ -130,11 +134,12 @@ static void rom_entries_free(void)
     s_count = -1;
 }
 
-static bool rom_collect(void)
+static bool rom_collect_dir(const char *dir_path, const char *prefix, int *count, int depth)
 {
     struct lsfs_dir_t dir;
     struct lsfs_dirent *entry;
-    int count = 0;
+    char subdirs[ROM_SUBDIR_MAX][ROM_NAME_LEN];
+    int subdir_count = 0;
 
     entry = (struct lsfs_dirent *)exram_malloc(4, sizeof(struct lsfs_dirent));
     if (entry == NULL) {
@@ -143,17 +148,27 @@ static bool rom_collect(void)
     }
 
     lsfs_dir_t_init(&dir);
-    if (lsfs_opendir(&dir, ROM_DIR) != 0) {
+    if (lsfs_opendir(&dir, dir_path) != 0) {
         exram_free(entry);
         return false;
     }
 
-    while (count < ROM_MAX && lsfs_readdir(&dir, entry) == 0) {
+    while (*count < ROM_MAX && lsfs_readdir(&dir, entry) == 0) {
         if (entry->name[0] == '\0' || entry->name[0] == (char)0xE5) {
             break;
         }
 
-        if (entry->type != LSFS_DIR_ENTRY_FILE) {
+        /* 跳过 FAT 里的隐藏/系统项和 macOS 留下的 ._xxx */
+        if (entry->name[0] == '.') {
+            continue;
+        }
+
+        if (entry->type == LSFS_DIR_ENTRY_DIR) {
+            if (depth < ROM_SUBDIR_DEPTH && subdir_count < ROM_SUBDIR_MAX) {
+                memset(subdirs[subdir_count], 0, ROM_NAME_LEN);
+                strncpy(subdirs[subdir_count], entry->name, ROM_NAME_LEN - 1);
+                subdir_count++;
+            }
             continue;
         }
 
@@ -161,16 +176,38 @@ static bool rom_collect(void)
             continue;
         }
 
-        struct arcade_rom_entry *slot = &s_roms[count];
+        struct arcade_rom_entry *slot = &s_roms[*count];
         memset(slot, 0, sizeof(*slot));
-        strncpy(slot->name, entry->name, ROM_NAME_LEN - 1);
-        snprintf(slot->path, ROM_PATH_LEN, "%s/%s", ROM_DIR, entry->name);
+        snprintf(slot->name, ROM_NAME_LEN, "%s%s", prefix, entry->name);
+        snprintf(slot->path, ROM_PATH_LEN, "%s/%s", dir_path, entry->name);
         slot->size = (uint32_t)entry->size;
-        count++;
+        (*count)++;
     }
 
     lsfs_closedir(&dir);
     exram_free(entry);
+
+    /* 子目录放到父目录的文件之后，保持「先根目录、后子目录」的直观顺序 */
+    for (int i = 0; i < subdir_count && *count < ROM_MAX; i++) {
+        char sub_path[ROM_PATH_LEN];
+        char sub_prefix[ROM_NAME_LEN];
+
+        snprintf(sub_path, sizeof(sub_path), "%s/%s", dir_path, subdirs[i]);
+        snprintf(sub_prefix, sizeof(sub_prefix), "%s%s/", prefix, subdirs[i]);
+
+        (void)rom_collect_dir(sub_path, sub_prefix, count, depth + 1);
+    }
+
+    return true;
+}
+
+static bool rom_collect(void)
+{
+    int count = 0;
+
+    if (!rom_collect_dir(ROM_DIR, "", &count, 0)) {
+        return false;
+    }
 
     /* 按文件名做一次插入排序，卡里的顺序通常不可控 */
     for (int i = 1; i < count; i++) {

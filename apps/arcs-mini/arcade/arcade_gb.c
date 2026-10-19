@@ -14,6 +14,7 @@
 #include "arcade_core.h"
 #include "arcade_demo_rom.h"
 #include "arcade_gb.h"
+#include "arcade_save.h"
 #include "arcade_video.h"
 
 #include "peanut_gb.h"
@@ -74,6 +75,9 @@ static void gb_cart_ram_write(struct gb_s *gb, const uint_fast32_t addr, const u
     }
 
     p->cart_ram[addr] = val;
+
+    /* 游戏真写了卡带存档区才标记，避免每帧都去动文件系统 */
+    arcade_save_mark_dirty();
 }
 
 static void gb_error(struct gb_s *gb, const enum gb_error_e err, const uint16_t addr)
@@ -194,6 +198,9 @@ int arcade_gb_start(const char *path)
         return -1;
     }
 
+    /* 先读回已有存档，再让 gb_init() 把 MBC 指向这块 RAM */
+    arcade_save_attach(path, s_priv->cart_ram, s_priv->cart_ram_size);
+
     s_error_logged = false;
 
     ret = gb_init(&s_priv->gb, &gb_rom_read, &gb_cart_ram_read, &gb_cart_ram_write,
@@ -224,6 +231,10 @@ void arcade_gb_stop(void)
     if (s_priv == NULL) {
         return;
     }
+
+    /* 退出、换 ROM、关机前都走这里：有改动才写盘 */
+    (void)arcade_save_flush();
+    arcade_save_detach();
 
     if (s_priv->rom != NULL) {
         exram_free(s_priv->rom);

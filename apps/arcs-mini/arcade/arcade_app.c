@@ -27,13 +27,24 @@
 #include "arcade_core.h"
 #include "arcade_input.h"
 #include "arcade_rom.h"
+#include "arcade_save.h"
 #include "arcade_ui.h"
 #include "arcade_video.h"
+
+#include "lsfs.h"
 
 #define TAG "arcade"
 
 #define ARCADE_TASK_STACK     4096
 #define ARCADE_TASK_PRIORITY  4
+
+/* fs 自检用的临时目录/文件（放在 ROM 目录下，确认卡真的可写） */
+#define ARCADE_FS_TEST_DIR    CONFIG_ARCADE_ROM_DIR "/.arcade-fs-test"
+#define ARCADE_FS_TEST_FILE   ARCADE_FS_TEST_DIR "/probe.bin"
+#define ARCADE_FS_PROBE_LEN   32
+
+/* saves 列表最多展开的子目录数 */
+#define ARCADE_SAVES_SUBDIR_MAX 4
 
 typedef enum {
     ARCADE_MODE_LIST = 0,
@@ -45,6 +56,7 @@ typedef enum {
     ARCADE_REQ_PLAY,
     ARCADE_REQ_EXIT,
     ARCADE_REQ_RESCAN,
+    ARCADE_REQ_SAVE,
 } arcade_req_t;
 
 static arcade_mode_t s_mode = ARCADE_MODE_LIST;
@@ -53,12 +65,15 @@ static uint8_t s_pending_action = 0xFF;
 
 static volatile arcade_req_t s_req;
 static volatile int s_req_arg;
+/* shell 的 arcade save 命令等这个结果 */
+static volatile int s_save_result;
 
 static uint32_t s_frames;
 static TickType_t s_fps_tick;
 static uint32_t s_fps_x10;
 
 extern int boot_watchdog_feed(void);
+extern struct lsfs_mount_t *platform_sd_mount_get(void);
 
 /*
  * 启动探针：平台的 voice_platform_init() 在 PRE_APPLICATION/60 才打印第一行日志，
@@ -243,6 +258,9 @@ static void arcade_handle_request(void)
     case ARCADE_REQ_RESCAN:
         arcade_rescan();
         break;
+    case ARCADE_REQ_SAVE:
+        s_save_result = arcade_save_flush();
+        break;
     default:
         break;
     }
@@ -301,6 +319,9 @@ static void arcade_task(void *arg)
         }
 
         arcade_handle_request();
+
+        /* 每 30 秒（有改动才写）把 cart RAM 落盘，写盘期间允许掉帧 */
+        arcade_save_tick();
 
         if (s_mode == ARCADE_MODE_PLAY) {
             bool kbd_exit = false;
@@ -421,6 +442,9 @@ static int cmd_stat(int argc, char **argv)
                (unsigned)arcade_input_mask());
     shellPrint(shell, "sys=%s scanned=%d dir=%s\r\n", arcade_core_sys_name(),
                arcade_rom_scanned() ? 1 : 0, CONFIG_ARCADE_ROM_DIR);
+    shellPrint(shell, "save=%s dirty=%d\r\n",
+               arcade_save_path() != NULL ? arcade_save_path() : "-",
+               arcade_save_pending() ? 1 : 0);
     return 0;
 }
 
@@ -515,8 +539,7 @@ static int cmd_key(int argc, char **argv)
     return 0;
 }
 
-static int cmd_press(int argc, char **argv)
-{
+static int cmd_press(int argc, char **argv){
     Shell *shell = shellGetCurrent();
     uint32_t key;
     bool pressed;
@@ -538,6 +561,231 @@ static int cmd_press(int argc, char **argv)
     return 0;
 }
 
+/*
+ * TF 卡文件系统读写自检。
+ *
+ * 只做最小的完整回路：开目录 -> 查容量 -> 建目录 -> 写文件 -> 读回比对 -> 删掉。
+ * 每一步都单独打印，卡只读 / 不挂载 / 写入失效时能直接看出断在哪一步。
+ */
+static int cmd_fs(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    struct lsfs_mount_t *mp = platform_sd_mount_get();
+    struct lsfs_dir_t dir;
+    struct lsfs_statvfs vfs;
+    struct lsfs_file_t file;
+    uint8_t out[ARCADE_FS_PROBE_LEN];
+    uint8_t in[ARCADE_FS_PROBE_LEN];
+    ssize_t got;
+    ssize_t wrote;
+    int rc;
+    int fails = 0;
+
+    (void)argc;
+    (void)argv;
+
+    shellPrint(shell, "挂载点: %s\r\n",
+               (mp != NULL && mp->mnt_point != NULL) ? mp->mnt_point : "(未知)");
+
+    /* 1. 目录能否打开 */
+    lsfs_dir_t_init(&dir);
+    rc = lsfs_opendir(&dir, CONFIG_ARCADE_ROM_DIR);
+    if (rc != 0) {
+        shellPrint(shell, "[FAIL] 打开目录 %s 失败 (%d)，TF 卡未挂载？\r\n",
+                   CONFIG_ARCADE_ROM_DIR, rc);
+        shellPrint(shell, "fs 自检结果: 中断\r\n");
+        return 0;
+    }
+    lsfs_closedir(&dir);
+    shellPrint(shell, "[ OK ] 目录可打开 %s\r\n", CONFIG_ARCADE_ROM_DIR);
+
+    /* 2. 容量 */
+    memset(&vfs, 0, sizeof(vfs));
+    if (lsfs_statvfs(CONFIG_ARCADE_ROM_DIR, &vfs) == 0 && vfs.f_frsize > 0) {
+        unsigned long long total = (unsigned long long)vfs.f_blocks * vfs.f_frsize;
+        unsigned long long avail = (unsigned long long)vfs.f_bfree * vfs.f_frsize;
+
+        shellPrint(shell, "[ OK ] 总容量 %u KB，剩余 %u KB\r\n",
+                   (unsigned)(total / 1024ULL), (unsigned)(avail / 1024ULL));
+    } else {
+        shellPrint(shell, "[WARN] 取容量失败（statvfs 不支持，不影响读写）\r\n");
+    }
+
+    /* 3. 建目录（已存在也算通过） */
+    rc = lsfs_mkdir(ARCADE_FS_TEST_DIR);
+    if (rc == 0) {
+        shellPrint(shell, "[ OK ] 创建目录 %s\r\n", ARCADE_FS_TEST_DIR);
+    } else {
+        lsfs_dir_t_init(&dir);
+        if (lsfs_opendir(&dir, ARCADE_FS_TEST_DIR) == 0) {
+            lsfs_closedir(&dir);
+            shellPrint(shell, "[ OK ] 目录已存在 %s\r\n", ARCADE_FS_TEST_DIR);
+        } else {
+            shellPrint(shell, "[FAIL] 创建目录失败 (%d)，卡可能是只读或已写满\r\n", rc);
+            fails++;
+        }
+    }
+
+    /* 4. 写测试文件 */
+    if (fails == 0) {
+        for (int i = 0; i < ARCADE_FS_PROBE_LEN; i++) {
+            out[i] = (uint8_t)(i * 7 + 3);
+        }
+
+        lsfs_file_t_init(&file);
+        rc = lsfs_open(&file, ARCADE_FS_TEST_FILE, LSFS_O_WRITE | LSFS_O_CREATE | LSFS_O_TRUNC);
+        if (rc != 0) {
+            shellPrint(shell, "[FAIL] 创建文件 %s 失败 (%d)\r\n", ARCADE_FS_TEST_FILE, rc);
+            fails++;
+        } else {
+            wrote = lsfs_write(&file, out, sizeof(out));
+            rc = lsfs_sync(&file);
+            lsfs_close(&file);
+
+            if (wrote == (ssize_t)sizeof(out)) {
+                shellPrint(shell, "[ OK ] 写入 %d 字节 %s（sync=%d）\r\n",
+                           (int)wrote, ARCADE_FS_TEST_FILE, rc);
+            } else {
+                shellPrint(shell, "[FAIL] 写入不足 %d/%d 字节\r\n",
+                           (int)wrote, (int)sizeof(out));
+                fails++;
+            }
+        }
+    }
+
+    /* 5. 读回比对 */
+    if (fails == 0) {
+        memset(in, 0, sizeof(in));
+        lsfs_file_t_init(&file);
+        rc = lsfs_open(&file, ARCADE_FS_TEST_FILE, LSFS_O_READ);
+        if (rc != 0) {
+            shellPrint(shell, "[FAIL] 读回打开失败 (%d)\r\n", rc);
+            fails++;
+        } else {
+            got = lsfs_read(&file, in, sizeof(in));
+            lsfs_close(&file);
+
+            if (got == (ssize_t)sizeof(out) && memcmp(in, out, sizeof(out)) == 0) {
+                shellPrint(shell, "[ OK ] 读回 %d 字节，内容一致\r\n", (int)got);
+            } else {
+                shellPrint(shell, "[FAIL] 读回不一致（%d 字节）\r\n", (int)got);
+                fails++;
+            }
+        }
+    }
+
+    /* 6. 清理 */
+    rc = lsfs_unlink(ARCADE_FS_TEST_FILE);
+    shellPrint(shell, "[%s] 删除测试文件 (%d)\r\n", rc == 0 ? " OK " : "WARN", rc);
+    rc = lsfs_unlink(ARCADE_FS_TEST_DIR);
+    shellPrint(shell, "[%s] 删除测试目录 (%d)\r\n", rc == 0 ? " OK " : "WARN", rc);
+
+    shellPrint(shell, "fs 自检结果: %s（%d 项失败）\r\n", fails == 0 ? "通过" : "失败", fails);
+    return 0;
+}
+
+static int cmd_save(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    const char *path;
+
+    (void)argc;
+    (void)argv;
+
+    if (!arcade_core_running()) {
+        shellPrint(shell, "当前没有运行中的 ROM\r\n");
+        return 0;
+    }
+
+    path = arcade_save_path();
+    if (path == NULL) {
+        shellPrint(shell, "当前 ROM 不支持存档（内置演示 ROM 或不在卡上）\r\n");
+        return 0;
+    }
+
+    s_save_result = 0;
+    if (arcade_request(ARCADE_REQ_SAVE, 0) != 0) {
+        shellPrint(shell, "请求超时\r\n");
+        return 0;
+    }
+
+    if (s_save_result > 0) {
+        shellPrint(shell, "已落盘 %d 字节 -> %s\r\n", s_save_result, path);
+    } else if (s_save_result == 0) {
+        shellPrint(shell, "没有改动，无需落盘（%s）\r\n", path);
+    } else {
+        shellPrint(shell, "落盘失败 (%d)，下个周期重试\r\n", s_save_result);
+    }
+
+    return 0;
+}
+
+static int saves_list_dir(Shell *shell, const char *dir_path, int depth)
+{
+    struct lsfs_dirent entry;
+    struct lsfs_dir_t dir;
+    char subdirs[ARCADE_SAVES_SUBDIR_MAX][48];
+    int sub_count = 0;
+    int found = 0;
+
+    lsfs_dir_t_init(&dir);
+    if (lsfs_opendir(&dir, dir_path) != 0) {
+        shellPrint(shell, "[WARN] 无法打开 %s\r\n", dir_path);
+        return 0;
+    }
+
+    while (lsfs_readdir(&dir, &entry) == 0) {
+        if (entry.name[0] == '\0' || entry.name[0] == (char)0xE5) {
+            break;
+        }
+        if (entry.name[0] == '.') {
+            continue;
+        }
+
+        if (entry.type == LSFS_DIR_ENTRY_DIR) {
+            if (depth == 0 && sub_count < ARCADE_SAVES_SUBDIR_MAX) {
+                memset(subdirs[sub_count], 0, sizeof(subdirs[sub_count]));
+                strncpy(subdirs[sub_count], entry.name, sizeof(subdirs[sub_count]) - 1);
+                sub_count++;
+            }
+            continue;
+        }
+
+        size_t len = strlen(entry.name);
+
+        if (len > 4 && strcasecmp(entry.name + len - 4, ".sav") == 0) {
+            shellPrint(shell, "%s/%s (%u bytes)\r\n", dir_path, entry.name,
+                       (unsigned)entry.size);
+            found++;
+        }
+    }
+
+    lsfs_closedir(&dir);
+
+    for (int i = 0; i < sub_count; i++) {
+        char sub_path[96];
+
+        snprintf(sub_path, sizeof(sub_path), "%s/%s", dir_path, subdirs[i]);
+        found += saves_list_dir(shell, sub_path, depth + 1);
+    }
+
+    return found;
+}
+
+static int cmd_saves(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    int found;
+
+    (void)argc;
+    (void)argv;
+
+    shellPrint(shell, "存档目录: %s（与 ROM 同目录，*.sav）\r\n", CONFIG_ARCADE_ROM_DIR);
+    found = saves_list_dir(shell, CONFIG_ARCADE_ROM_DIR, 0);
+    shellPrint(shell, "共 %d 个存档\r\n", found);
+    return 0;
+}
+
 static const struct listen_cmd_t g_arcade_cmds[] = {
     {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
@@ -546,6 +794,9 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"exit", cmd_exit, "退出游戏返回列表"},
     {"key", cmd_key, "注入一次按键"},
     {"press", cmd_press, "按住/松开某个按键"},
+    {"fs", cmd_fs, "TF 卡文件系统读写自检"},
+    {"save", cmd_save, "立即落盘当前存档"},
+    {"saves", cmd_saves, "列出 TF 卡上的 .sav 存档"},
 };
 
 static int cmd_arcade_help(Shell *shell)
