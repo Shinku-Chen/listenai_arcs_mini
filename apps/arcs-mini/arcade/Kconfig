@@ -44,6 +44,18 @@ config ARCADE_GB_CORE_PEANUT
 
 endchoice
 
+config ARCADE_GB_STATE_IN_SRAM
+    bool "Keep VRAM/WRAM (16KB) in internal SRAM"
+    default n
+    help
+      binjgb keeps its whole Emulator (~130KB) in PSRAM.  VRAM and WRAM (8KB
+      each) are the two hottest arrays in it; with the 32KB D-Cache being
+      flushed by the 92KB frame buffer writes and ROM fetches, nearly every
+      access misses (~300 cycles per emulated instruction measured).
+      Putting those two arrays in internal SRAM avoids that, but the SoC only
+      has 168KB of SRAM and it is already nearly full, so this needs the
+      WiFi/BLE drivers compiled out (see arcade-sram.conf).
+
 config ARCADE_FRAME_PERIOD_MS
     int "Emulator frame period in milliseconds"
     range 8 100

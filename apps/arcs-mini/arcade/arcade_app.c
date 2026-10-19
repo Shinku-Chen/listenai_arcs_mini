@@ -86,6 +86,8 @@ static uint32_t s_fps_x10;
 
 extern int boot_watchdog_feed(void);
 extern struct lsfs_mount_t *platform_sd_mount_get(void);
+/* 时钟频率（MHz 级即可），用来把耗时换算成 cycles 参考 */
+extern volatile uint32_t SystemCoreClock;
 
 /*
  * 启动探针：平台的 voice_platform_init() 在 PRE_APPLICATION/60 才打印第一行日志，
@@ -139,11 +141,20 @@ static void arcade_button_cb(void *unused, uint32_t msg_id, void *data, uint32_t
  */
 static void arcade_fb_report(void)
 {
-    static const int k_sx[3] = {0, ARCADE_FB_WIDTH / 2, ARCADE_FB_WIDTH - 1};
-    static const int k_sy[3] = {0, ARCADE_FB_HEIGHT / 2, ARCADE_FB_HEIGHT - 1};
+    int w = arcade_video_fb_width();
+    int h = arcade_video_fb_height();
+    int k_sx[3];
+    int k_sy[3];
     lv_color_t *fb = arcade_video_get_fb();
     int off = 0;
     int uniq[5] = {0};
+
+    k_sx[0] = 0;
+    k_sx[1] = w / 2;
+    k_sx[2] = w - 1;
+    k_sy[0] = 0;
+    k_sy[1] = h / 2;
+    k_sy[2] = h - 1;
     int uniq_n = 0;
 
     if (fb == NULL) {
@@ -151,7 +162,7 @@ static void arcade_fb_report(void)
         return;
     }
 
-    for (int i = 0; i < ARCADE_FB_WIDTH * ARCADE_FB_HEIGHT; i++) {
+    for (int i = 0; i < w * h; i++) {
         uint16_t v = fb[i].full;
         int j;
 
@@ -181,7 +192,7 @@ static void arcade_fb_report(void)
     for (int r = 0; r < 3 && off < (int)sizeof(s_fb_report) - 40; r++) {
         off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off, "y=%-3d", k_sy[r]);
         for (int c = 0; c < 3; c++) {
-            int idx = k_sy[r] * ARCADE_FB_WIDTH + k_sx[c];
+            int idx = k_sy[r] * w + k_sx[c];
             off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off, " %04X",
                             (unsigned)fb[idx].full);
         }
@@ -229,7 +240,6 @@ static void arcade_start_selected(void)
 
     arcade_ui_player_message(NULL);
     arcade_video_fill_black();
-    arcade_ui_player_invalidate();
     lv_task_handler();
 
     /* 进入游戏才开始出声（列表页保持静音） */
@@ -245,6 +255,8 @@ static void arcade_stop_game(void)
 {
     arcade_audio_set_active(false);
     arcade_core_stop();
+    /* 先把在途的游戏帧送完，否则最后一帧会盖掉 LVGL 刚画好的列表页 */
+    arcade_video_present_drain();
     arcade_show_list();
 }
 
@@ -358,14 +370,12 @@ static void arcade_handle_request(void)
     case ARCADE_REQ_FB_FILL:
         s_frozen = true;
         arcade_video_fill(arg);
-        arcade_ui_player_invalidate();
-        lv_task_handler();
+        arcade_video_present_now();
         break;
     case ARCADE_REQ_FB_RESUME:
         s_frozen = false;
         arcade_video_fill_black();
-        arcade_ui_player_invalidate();
-        lv_task_handler();
+        arcade_video_present_now();
         break;
     default:
         break;
@@ -446,7 +456,6 @@ static void arcade_task(void *arg)
             } else {
                 arcade_core_set_input(arcade_input_mask() | kbd);
                 arcade_core_run_frame();
-                arcade_ui_player_invalidate();
                 arcade_frame_tick();
             }
         }
@@ -1052,6 +1061,8 @@ static int cmd_shot(int argc, char **argv)
     lv_color_t *fb = arcade_video_get_fb();
     static const char k_ch[4] = {' ', '.', ':', '#'};
     char line[96];
+    int fb_w = arcade_video_fb_width();
+    int fb_h = arcade_video_fb_height();
 
     (void)argc;
     (void)argv;
@@ -1063,18 +1074,18 @@ static int cmd_shot(int argc, char **argv)
 
     for (int row = 0; row < 36; row++) {
         int off = 0;
-        int y0 = row * (ARCADE_FB_HEIGHT / 36);
-        int dy = ARCADE_FB_HEIGHT / 36;
+        int y0 = row * (fb_h / 36);
+        int dy = fb_h / 36;
 
         for (int col = 0; col < 80; col++) {
-            int x0 = col * (ARCADE_FB_WIDTH / 80);
-            int dx = ARCADE_FB_WIDTH / 80;
+            int x0 = col * (fb_w / 80);
+            int dx = fb_w / 80;
             int lum = 0;
             int n = 0;
 
             for (int y = y0; y < y0 + dy; y++) {
                 for (int x = x0; x < x0 + dx; x++) {
-                    uint16_t v = fb[y * ARCADE_FB_WIDTH + x].full;
+                    uint16_t v = fb[y * fb_w + x].full;
                     /*
                      * 不能只比对 DMG 四档颜色：CGB 游戏的配色全来自游戏自己，
                      * 匹配不上就会整屏空白（之前就这样）。直接算亮度。
@@ -1196,6 +1207,203 @@ static int cmd_vol(int argc, char **argv)
     return 0;
 }
 
+/* arcade perf [reset]：帧率与各段耗时（emu / blit / 等缓冲 / SPI 送屏） */
+static int cmd_perf(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    char line[512];
+
+    if (argc >= 1 && strcasecmp(argv[0], "reset") == 0) {
+        arcade_video_reset_perf();
+        shellPrint(shell, "计时已清零\r\n");
+        return 0;
+    }
+
+    line[0] = '\0';
+    arcade_video_perf(line, sizeof(line));
+    shellPrint(shell, "fps=%d.%d mode=%s sysclk=%u MHz\r\n",
+               (int)(s_fps_x10 / 10), (int)(s_fps_x10 % 10),
+               s_mode == ARCADE_MODE_LIST ? "list" : "play",
+               (unsigned)(SystemCoreClock / 1000000U));
+
+    for (char *p = line; p != NULL && *p != '\0';) {
+        char *nl = strchr(p, '\n');
+
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+        shellPrint(shell, "%s\r\n", p);
+        p = (nl != NULL) ? nl + 1 : NULL;
+    }
+
+    return 0;
+}
+
+/* arcade scale <1|15>：1 = 160x144 原尺寸，15 = 1.5 倍 240x216（默认） */
+static int cmd_scale(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (argc >= 1) {
+        int v = atoi(argv[0]);
+
+        arcade_video_set_scale(v == 1 ? 1 : 2);
+    }
+
+    shellPrint(shell, "缩放: %s (%dx%d)（arcade scale <1|15>）\r\n",
+               arcade_video_scale() == 1 ? "1x" : "1.5x",
+               arcade_video_fb_width(), arcade_video_fb_height());
+    return 0;
+}
+
+/* arcade apu <0|1>：开关模拟器 APU（用来量声音占多少时间） */
+static int cmd_apu(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (!arcade_core_running()) {
+        shellPrint(shell, "当前没有运行中的 ROM\r\n");
+        return 0;
+    }
+
+    if (argc < 1) {
+        shellPrint(shell, "用法: arcade apu <0|1>\r\n");
+        return 0;
+    }
+
+    arcade_gb_set_audio_enabled(atoi(argv[0]) != 0);
+    /* 计时清零，跑几秒再 arcade perf 看 emu 耗时变化 */
+    arcade_video_reset_perf();
+    shellPrint(shell, "APU %s（计时已清零，等几秒后 arcade perf）\r\n",
+               atoi(argv[0]) != 0 ? "on" : "off");
+    return 0;
+}
+
+/*
+ * arcade membench：量 PSRAM / 内部 SRAM 的访存带宽。
+ *
+ * 模拟器慢到底是「算得慢」还是「访存慢」，先看这两个数：
+ * 如果 PSRAM 顺序读只有几十 MB/s，那 Emulator（近 300KB 常驻 PSRAM）
+ * 的每个字段访问都在付这个代价，优化方向就是搬内存而不是改指令。
+ */
+/* 内部 SRAM 读的样本：1KB 足够看出「缓存命中时的纯执行速度」
+ * （内部 SRAM 只抢得到很少一点，不能为了调试占掉模拟器的口粮） */
+static uint8_t s_membench_sram[1024];
+
+static int cmd_membench(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    const size_t psram_size = 256 * 1024;
+    const int iter = 16;
+    volatile uint32_t sum = 0;
+    uint8_t *ps;
+    TickType_t t0;
+    TickType_t t1;
+    uint32_t ms;
+
+    (void)argc;
+    (void)argv;
+
+    ps = (uint8_t *)exram_malloc(4, psram_size);
+    if (ps == NULL) {
+        shellPrint(shell, "PSRAM 分配失败\r\n");
+        return 0;
+    }
+
+    memset(ps, 0x5A, psram_size);
+    memset(s_membench_sram, 0x5A, sizeof(s_membench_sram));
+
+    /* PSRAM 顺序读：步长 64B，每步一定 Cache 不命中 */
+    t0 = xTaskGetTickCount();
+    for (int k = 0; k < iter; k++) {
+        for (size_t i = 0; i < psram_size; i += 64) {
+            sum += ps[i];
+        }
+    }
+    t1 = xTaskGetTickCount();
+    ms = (uint32_t)(t1 - t0);
+    shellPrint(shell, "psram read : %u ms, %u MB/s\r\n",
+               (unsigned)ms,
+               (unsigned)(ms ? ((uint32_t)psram_size * iter / 1024) / ms : 0));
+
+    /* PSRAM 写 */
+    t0 = xTaskGetTickCount();
+    for (int k = 0; k < iter; k++) {
+        for (size_t i = 0; i < psram_size; i += 64) {
+            ps[i] = (uint8_t)(i + k);
+        }
+    }
+    t1 = xTaskGetTickCount();
+    ms = (uint32_t)(t1 - t0);
+    shellPrint(shell, "psram write: %u ms, %u MB/s\r\n",
+               (unsigned)ms,
+               (unsigned)(ms ? ((uint32_t)psram_size * iter / 1024) / ms : 0));
+
+    /* 内部 SRAM 读（8KB 装得下，基本是纯执行速度） */
+    t0 = xTaskGetTickCount();
+    for (int k = 0; k < iter * 32; k++) {
+        for (size_t i = 0; i < sizeof(s_membench_sram); i += 64) {
+            sum += s_membench_sram[i];
+        }
+    }
+    t1 = xTaskGetTickCount();
+    ms = (uint32_t)(t1 - t0);
+    shellPrint(shell, "sram read  : %u ms, %u MB/s\r\n",
+               (unsigned)ms,
+               (unsigned)(ms ? ((uint32_t)sizeof(s_membench_sram) * iter * 32 / 1024) / ms : 0));
+
+    shellPrint(shell, "sysclk=%u MHz sum=%u\r\n",
+               (unsigned)(SystemCoreClock / 1000000U), (unsigned)sum);
+
+    exram_free(ps);
+    return 0;
+}
+
+/*
+ * arcade pad：USB 手柄（HID 非 boot 设备）的原始输入报告与解析结果。
+ *
+ * 手柄没有统一的报告布局，所以先把原始字节打出来，按一下键再跑一次，
+ * 看哪一位变了就能定下映射（arcade_input.c 里的 pad_mask_*）。
+ */
+static int cmd_pad(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    uint8_t raw[24];
+    char hex[(sizeof(raw) * 3) + 1];
+    size_t off = 0;
+    int len = 0;
+    bool xinput = false;
+    uint32_t n;
+    uint32_t mask;
+
+    (void)argc;
+    (void)argv;
+
+    n = arcade_input_pad_info(raw, (int)sizeof(raw), &len, &xinput);
+    mask = arcade_input_mask();
+
+    hex[0] = '\0';
+    for (int i = 0; i < len && off < sizeof(hex); i++) {
+        off += (size_t)snprintf(&hex[off], sizeof(hex) - off, "%02X%s",
+                                raw[i], i + 1 == len ? "" : " ");
+    }
+
+    shellPrint(shell, "reports=%u len=%d layout=%s\r\n",
+               (unsigned)n, len, xinput ? "xinput" : "generic");
+    shellPrint(shell, "raw=%s\r\n", len > 0 ? hex : "(无，检查 USB 是否 host 模式/手柄是否已插入)");
+    shellPrint(shell, "mask=0x%02x%s%s%s%s%s%s%s%s\r\n", (unsigned)mask,
+               (mask & ARCADE_KEY_UP) ? " up" : "",
+               (mask & ARCADE_KEY_DOWN) ? " down" : "",
+               (mask & ARCADE_KEY_LEFT) ? " left" : "",
+               (mask & ARCADE_KEY_RIGHT) ? " right" : "",
+               (mask & ARCADE_KEY_A) ? " a" : "",
+               (mask & ARCADE_KEY_B) ? " b" : "",
+               (mask & ARCADE_KEY_START) ? " start" : "",
+               (mask & ARCADE_KEY_SELECT) ? " select" : "");
+
+    return 0;
+}
+
 static const struct listen_cmd_t g_arcade_cmds[] = {
     {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
@@ -1204,6 +1412,7 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"exit", cmd_exit, "退出游戏返回列表"},
     {"key", cmd_key, "注入一次按键"},
     {"press", cmd_press, "按住/松开某个按键"},
+    {"pad", cmd_pad, "USB 手柄状态与原始报告（定位按键位序）"},
     {"fs", cmd_fs, "TF 卡文件系统读写自检"},
     {"save", cmd_save, "立即落盘当前存档"},
     {"saves", cmd_saves, "列出 TF 卡上的 .sav 存档"},
@@ -1215,6 +1424,10 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"peek", cmd_peek, "按 CPU 视角读内存：peek <hex地址> [长度]"},
     {"audio", cmd_audio, "音频状态：audio [peak|reset]"},
     {"vol", cmd_vol, "音量：vol <0-100>"},
+    {"perf", cmd_perf, "帧率与各段耗时：perf [reset]"},
+    {"scale", cmd_scale, "缩放：scale <1|15>（15 = 1.5 倍）"},
+    {"apu", cmd_apu, "开关模拟器 APU：apu <0|1>（量声音耗时）"},
+    {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
 };
 
 static int cmd_arcade_help(Shell *shell)

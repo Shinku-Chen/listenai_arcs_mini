@@ -35,11 +35,14 @@ void arcade_ui_player_invalidate(void);
  */
 void arcade_ui_player_message(const char *text);
 
+/** 游戏页中间是否正在显示提示文字（显示时暂停直写送屏，别把它盖掉） */
+bool arcade_ui_player_message_visible(void);
+
 /** 返回 LVGL 建议的下一次 lv_timer_handler() 间隔（毫秒） */
 uint32_t arcade_ui_handler(void);
 
 /**
- * 调试用：把播放页 canvas 的挂载状态写进 buf。
+ * 调试用：把播放页的状态写进 buf。
  * 必须在 UI 任务里调用（会读 LVGL 对象）。
  */
 void arcade_ui_player_debug(char *buf, uint32_t len);

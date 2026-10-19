@@ -42,6 +42,19 @@ __attribute__((weak)) void app_usb_hid_keyboard_report(const uint8_t *keys)
 }
 
 /**
+ * 非键盘/非鼠标的 HID 输入报告（手柄、摇杆、方向盘等）原样交给应用层。
+ *
+ * 游戏手柄的 bInterfaceProtocol 是 0（非 boot 设备），无法像键鼠那样按
+ * 固定布局解析，所以这里只做“透传 + 长度”，布局交给应用层按实际设备决定。
+ * 未实现时链接到下面的弱符号，不影响键鼠。
+ */
+__attribute__((weak)) void app_usb_hid_generic_report(const uint8_t *report, int nbytes)
+{
+    (void)report;
+    (void)nbytes;
+}
+
+/**
  * 把任意长度的 HID 输入报告规范成 8 字节 boot keyboard 报告。
  *
  * 大部分键盘使用 [modifier, reserved, k1..k6]，带 Report ID 的键盘会多出
@@ -155,8 +168,11 @@ static void app_usb_hid_report_callback(void *arg, int nbytes)
         LISA_LOGD(TAG, "/dev/input%u report (%d): %s", minor, nbytes, report);
         if (hid->protocol == HID_PROTOCOL_KEYBOARD) {
             app_usb_hid_handle_keyboard_report(s_hid_report[minor], nbytes);
-        } else {
+        } else if (hid->protocol == HID_PROTOCOL_MOUSE) {
             app_usb_hid_handle_mouse_report(hid, nbytes);
+        } else {
+            /* 手柄等非 boot 设备：原始报告直接给应用层 */
+            app_usb_hid_generic_report(s_hid_report[minor], nbytes);
         }
     } else if (nbytes != -USB_ERR_NAK) {
         LISA_LOGE(TAG, "/dev/input%u transfer failed: %d", minor, nbytes);

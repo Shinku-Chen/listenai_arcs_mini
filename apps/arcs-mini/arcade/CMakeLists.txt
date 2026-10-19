@@ -47,6 +47,9 @@ else()
         third_party/binjgb/memory.c
         PROPERTIES COMPILE_OPTIONS "-w;-O3;-DNDEBUG;-fomit-frame-pointer"
     )
+
+    # VRAM/WRAM 是否搬进内部 SRAM 由 Kconfig（CONFIG_ARCADE_GB_STATE_IN_SRAM）
+    # 决定，emulator.c 里直接看 autoconf.h 的宏，不需要额外的编译选项。
 endif()
 
 # ---- 内置演示 ROM ----------------------------------------------------------

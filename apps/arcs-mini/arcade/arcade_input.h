@@ -36,4 +36,16 @@ const char *arcade_input_name(uint32_t key);
  */
 uint32_t arcade_input_take_keyboard(bool *exit_request);
 
+/**
+ * USB 手柄（HID 非 boot 设备）的原始报告快照，给 `arcade pad` 调试用。
+ * 手柄没有固定报告布局，只能靠看原始字节确定按键位序。
+ *
+ * @param raw      输出缓冲区（NULL 表示只要计数）
+ * @param raw_max  缓冲区长度
+ * @param raw_len  最近一份报告的实际长度
+ * @param is_xinput 是否识别为 XInput 布局（20 字节，头部 00 14）
+ * @return 收到的报告总数
+ */
+uint32_t arcade_input_pad_info(uint8_t *raw, int raw_max, int *raw_len, bool *is_xinput);
+
 #endif /* __ARCADE_INPUT_H__ */

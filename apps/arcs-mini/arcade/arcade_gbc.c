@@ -32,6 +32,7 @@
 #include "arcade_demo_rom.h"
 #include "arcade_gb.h"
 #include "arcade_save.h"
+#include "arcade_ui.h"
 #include "arcade_video.h"
 
 #include "emulator.h"
@@ -76,7 +77,6 @@ struct arcade_gbc_priv {
     uint32_t hist_n[PC_HIST_SLOTS];
     /* 帧耗时拆分（ms tick 累计）：emu=模拟器本体，blit=帧缓冲放大 */
     TickType_t perf_emu_ticks;
-    TickType_t perf_blit_ticks;
     uint32_t perf_frames;
 };
 
@@ -575,9 +575,12 @@ void arcade_gb_run_frame(void)
     }
 
     t1 = xTaskGetTickCount();
-    arcade_video_draw_frame_rgba((const uint32_t *)emulator_get_frame_buffer(p->emu));
+    /* 转换 + 送屏都在 video 模块里双缓冲并行，这里只记模拟器本体耗时。
+     * 屏上有 LVGL 提示文字时不送帧，否则会把提示盖掉。 */
+    if (!arcade_ui_player_message_visible()) {
+        arcade_video_present_frame((const uint32_t *)emulator_get_frame_buffer(p->emu));
+    }
     p->perf_emu_ticks += t1 - t0;
-    p->perf_blit_ticks += xTaskGetTickCount() - t1;
     p->perf_frames++;
 
     stats_sample(p);
@@ -700,18 +703,18 @@ int arcade_gb_machine_report(char *out, uint32_t out_len)
         return n;
     }
 
-    /* 帧耗时拆分：emu 慢就换编译选项/裁内核，blit 慢就换调色板查表 */
+    /* 帧耗时：emu 是模拟器本体（video 模块自己的 blit/送屏计时单独报） */
     {
         uint32_t f = s_priv->perf_frames ? s_priv->perf_frames : 1;
+        char video_perf[192];
+
+        arcade_video_perf(video_perf, sizeof(video_perf));
 
         n += snprintf(out + n, out_len - (uint32_t)n,
-                      "perf emu=%u.%ums blit=%u.%ums of %u.%ums",
+                      "perf emu=%u.%ums of %u frames\n%s",
                       (unsigned)(s_priv->perf_emu_ticks / f),
                       (unsigned)((s_priv->perf_emu_ticks * 10 / f) % 10),
-                      (unsigned)(s_priv->perf_blit_ticks / f),
-                      (unsigned)((s_priv->perf_blit_ticks * 10 / f) % 10),
-                      (unsigned)((s_priv->perf_emu_ticks + s_priv->perf_blit_ticks) / f),
-                      (unsigned)(((s_priv->perf_emu_ticks + s_priv->perf_blit_ticks) * 10 / f) % 10));
+                      (unsigned)f, video_perf);
     }
 
     return n;
@@ -765,8 +768,7 @@ int arcade_gb_hist_report(char *out, uint32_t out_len)
 }
 
 int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len)
-{
-    uint32_t off = 0;
+{    uint32_t off = 0;
 
     if (s_priv == NULL || s_priv->emu == NULL || out == NULL || out_len < 16) {
         return -1;
@@ -786,4 +788,28 @@ int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len)
     }
 
     return (int)off;
+}
+
+/*
+ * 调试：开关 APU 的 4 个声道。
+ *
+ * 用来量「声音占了 simulate 里多少时间」：关掉 APU 后 emu 耗时掉多少，
+ * 就是 APU 的成本。binjgb 的 APU 是按输出采样率逐个采样算的，48kHz 下
+ * 每帧 800 个采样 × 4 声道，是候选热点之一。
+ */
+int arcade_gb_set_audio_enabled(bool on)
+{
+    EmulatorConfig config;
+
+    if (s_priv == NULL || s_priv->emu == NULL) {
+        return -1;
+    }
+
+    config = emulator_get_config(s_priv->emu);
+    for (int i = 0; i < APU_CHANNEL_COUNT; i++) {
+        config.disable_sound[i] = on ? FALSE : TRUE;
+    }
+    emulator_set_config(s_priv->emu, &config);
+
+    return 0;
 }

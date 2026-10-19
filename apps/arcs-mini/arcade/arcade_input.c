@@ -59,13 +59,26 @@ static const struct {
 static volatile uint32_t s_kbd_mask;
 static volatile uint8_t s_kbd_exit_request;
 
+/*
+ * USB 手柄（HID 非 boot 设备）。
+ * 报告回调在 USB host 线程，这里只保存整份状态，不调 malloc/LVGL。
+ * 手柄发的是“全量状态”（而不是键鼠那种增量），所以直接覆盖。
+ */
+#define ARCADE_PAD_RAW_MAX 24
+
+static volatile uint32_t s_pad_mask;
+static volatile uint32_t s_pad_reports;
+static volatile uint8_t s_pad_raw[ARCADE_PAD_RAW_MAX];
+static volatile uint8_t s_pad_raw_len;
+static volatile uint8_t s_pad_xinput;
+
 uint32_t arcade_input_mask(void)
 {
     if (s_pulse != 0 && xTaskGetTickCount() >= s_pulse_deadline) {
         s_pulse = 0;
     }
 
-    return s_hold | s_pulse;
+    return s_hold | s_pulse | s_pad_mask;
 }
 
 void arcade_input_hold(uint32_t keys, bool pressed)
@@ -87,6 +100,8 @@ void arcade_input_release_all(void)
 {
     s_hold = 0;
     s_pulse = 0;
+    s_pad_mask = 0;
+    s_kbd_mask = 0;
 }
 
 uint32_t arcade_input_key_from_name(const char *name)
@@ -160,4 +175,182 @@ uint32_t arcade_input_take_keyboard(bool *exit_request)
     s_kbd_exit_request = 0;
 
     return s_kbd_mask;
+}
+
+/* ---------------- USB 手柄 ---------------- */
+
+/* 摇杆当作方向键的阈值（int16 量程的 1/2） */
+#define ARCADE_PAD_DEADZONE 16384
+
+static int16_t pad_axis(const uint8_t *r, int off)
+{
+    return (int16_t)(uint16_t)(r[off] | (r[off + 1] << 8));
+}
+
+/**
+ * XInput 报告（Xbox 360 有线 / 8BitDo 等兼容手柄），20 字节：
+ *   [0]=0x00 [1]=0x14 [2..3]=按键 LE [4]=LT [5]=RT
+ *   [6..7]=LX [8..9]=LY [10..11]=RX [12..13]=RY
+ * 按键位：bit0 Up, bit1 Down, bit2 Left, bit3 Right, bit4 Start,
+ *         bit5 Back, bit12 A, bit13 B, bit14 X, bit15 Y
+ * 注意 LY 是反的：0x0000 = 上，0xFFFF = 下。
+ */
+static uint32_t pad_mask_xinput(const uint8_t *r, int nbytes)
+{
+    uint16_t btn;
+    int16_t lx;
+    int16_t ly;
+    uint32_t mask = 0;
+
+    if (nbytes < 14) {
+        return 0;
+    }
+
+    btn = (uint16_t)(r[2] | (r[3] << 8));
+
+    if (btn & 0x0001) {
+        mask |= ARCADE_KEY_UP;
+    }
+    if (btn & 0x0002) {
+        mask |= ARCADE_KEY_DOWN;
+    }
+    if (btn & 0x0004) {
+        mask |= ARCADE_KEY_LEFT;
+    }
+    if (btn & 0x0008) {
+        mask |= ARCADE_KEY_RIGHT;
+    }
+    if (btn & 0x0010) {
+        mask |= ARCADE_KEY_START;
+    }
+    if (btn & 0x0020) {
+        mask |= ARCADE_KEY_SELECT;
+    }
+    if (btn & 0x1000) { /* A */
+        mask |= ARCADE_KEY_A;
+    }
+    if (btn & 0x2000) { /* B */
+        mask |= ARCADE_KEY_B;
+    }
+    if (btn & 0x4000) { /* X：别名到 A */
+        mask |= ARCADE_KEY_A;
+    }
+    if (btn & 0x8000) { /* Y：别名到 B */
+        mask |= ARCADE_KEY_B;
+    }
+
+    /* 左摇杆也能当方向键 */
+    if (nbytes >= 10) {
+        lx = pad_axis(r, 6);
+        ly = pad_axis(r, 8);
+
+        if (lx <= -ARCADE_PAD_DEADZONE) {
+            mask |= ARCADE_KEY_LEFT;
+        } else if (lx >= ARCADE_PAD_DEADZONE) {
+            mask |= ARCADE_KEY_RIGHT;
+        }
+        if (ly <= -ARCADE_PAD_DEADZONE) {
+            mask |= ARCADE_KEY_UP;
+        } else if (ly >= ARCADE_PAD_DEADZONE) {
+            mask |= ARCADE_KEY_DOWN;
+        }
+    }
+
+    return mask;
+}
+
+/**
+ * 通用 HID 手柄：没有固定布局，这里用最常见的 8 字节约定：
+ *   [0] bit0 Up, bit1 Down, bit2 Left, bit3 Right,
+ *       bit4 A, bit5 B, bit6 Select, bit7 Start
+ * 布局对不上时用 `arcade pad` 看原始报告，再改这里。
+ */
+static uint32_t pad_mask_generic(const uint8_t *r, int nbytes)
+{
+    uint8_t btn;
+    uint32_t mask = 0;
+
+    if (nbytes < 1) {
+        return 0;
+    }
+
+    btn = r[0];
+
+    if (btn & 0x01) {
+        mask |= ARCADE_KEY_UP;
+    }
+    if (btn & 0x02) {
+        mask |= ARCADE_KEY_DOWN;
+    }
+    if (btn & 0x04) {
+        mask |= ARCADE_KEY_LEFT;
+    }
+    if (btn & 0x08) {
+        mask |= ARCADE_KEY_RIGHT;
+    }
+    if (btn & 0x10) {
+        mask |= ARCADE_KEY_A;
+    }
+    if (btn & 0x20) {
+        mask |= ARCADE_KEY_B;
+    }
+    if (btn & 0x40) {
+        mask |= ARCADE_KEY_SELECT;
+    }
+    if (btn & 0x80) {
+        mask |= ARCADE_KEY_START;
+    }
+
+    return mask;
+}
+
+/*
+ * src/middleware/usb/app_usb_cherry_hid.c 的弱符号：非键鼠的 HID 输入报告
+ * （手柄）原样送到这里，跑在 USB host 线程上下文。
+ */
+void app_usb_hid_generic_report(const uint8_t *report, int nbytes)
+{
+    int copy;
+
+    if (report == NULL || nbytes <= 0) {
+        s_pad_mask = 0;
+        return;
+    }
+
+    copy = nbytes < ARCADE_PAD_RAW_MAX ? nbytes : ARCADE_PAD_RAW_MAX;
+    for (int i = 0; i < copy; i++) {
+        s_pad_raw[i] = report[i];
+    }
+    s_pad_raw_len = (uint8_t)copy;
+    s_pad_reports++;
+
+    /* XInput：20 字节报告，头部 00 14（type=0x00, len=0x14） */
+    if (nbytes >= 14 && report[0] == 0x00 && report[1] == 0x14) {
+        s_pad_xinput = 1;
+        s_pad_mask = pad_mask_xinput(report, nbytes);
+    } else {
+        s_pad_xinput = 0;
+        s_pad_mask = pad_mask_generic(report, nbytes);
+    }
+}
+
+uint32_t arcade_input_pad_info(uint8_t *raw, int raw_max, int *raw_len, bool *is_xinput)
+{
+    uint8_t len = s_pad_raw_len;
+    int copy;
+
+    if (raw_len != NULL) {
+        *raw_len = (int)len;
+    }
+    if (is_xinput != NULL) {
+        *is_xinput = s_pad_xinput != 0;
+    }
+    if (raw != NULL && raw_max > 0) {
+        copy = len < raw_max ? (int)len : raw_max;
+        for (int i = 0; i < copy; i++) {
+            raw[i] = s_pad_raw[i];
+        }
+    }
+
+    return s_pad_reports;
 }

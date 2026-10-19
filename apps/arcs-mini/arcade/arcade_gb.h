@@ -44,4 +44,11 @@ int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len);
  */
 int arcade_gb_hist_report(char *out, uint32_t out_len);
 
+/**
+ * 调试：开/关 APU（对比开时与关时的 emu 耗时，就能量出声音占了 simulate
+ * 里多少时间）。
+ * @return 0 成功
+ */
+int arcade_gb_set_audio_enabled(bool on);
+
 #endif /* __ARCADE_GB_H__ */

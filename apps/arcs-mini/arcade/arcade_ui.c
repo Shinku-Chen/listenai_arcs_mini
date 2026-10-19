@@ -35,7 +35,6 @@ static lv_obj_t *s_player_box;
 static lv_obj_t *s_list_rows[LIST_ROWS];
 static lv_obj_t *s_list_hint;
 static lv_obj_t *s_list_title;
-static lv_obj_t *s_canvas;
 static lv_obj_t *s_center_label;
 
 static int s_scroll;      /* 列表可见窗口的第一个元素下标 */
@@ -87,17 +86,16 @@ static void build_list_page(lv_obj_t *root)
 
 static void build_player_page(lv_obj_t *root)
 {
-    lv_color_t *fb = arcade_video_get_fb();
-
+    /*
+     * 播放页刻意不放 canvas：游戏画面由 arcade_video 的送屏任务直接写面板。
+     * 走 LVGL 的话每帧要多做一次 103KB 的 PSRAM 拷贝（实测 8ms/帧），
+     * 那是从模拟器帧率里硬抢出来的时间。这里只留一块黑底做占位/消息层。
+     */
     s_player_box = lv_obj_create(root);
     lv_obj_set_pos(s_player_box, 0, 0);
     lv_obj_set_size(s_player_box, SCREEN_W, SCREEN_H);
     screen_style(s_player_box);
     lv_obj_add_flag(s_player_box, LV_OBJ_FLAG_HIDDEN);
-
-    s_canvas = lv_canvas_create(s_player_box);
-    lv_canvas_set_buffer(s_canvas, fb, ARCADE_FB_WIDTH, ARCADE_FB_HEIGHT, LV_IMG_CF_TRUE_COLOR);
-    lv_obj_set_pos(s_canvas, 0, (SCREEN_H - ARCADE_FB_HEIGHT) / 2);
 
     /* 覆盖在画面之上的提示（加载失败等），平时隐藏 */
     s_center_label = make_label(s_player_box, C_ACCENT, 16, SCREEN_H / 2 - 12,
@@ -225,11 +223,17 @@ void arcade_ui_list_refresh(int selected)
 
 void arcade_ui_player_invalidate(void)
 {
-    if (s_canvas == NULL) {
-        return;
+    /* 播放页不再由 LVGL 绘制（见 build_player_page 的注释），这里保留空实现
+     * 给旧调用点用。 */
+}
+
+bool arcade_ui_player_message_visible(void)
+{
+    if (s_center_label == NULL) {
+        return false;
     }
 
-    lv_obj_invalidate(s_canvas);
+    return !lv_obj_has_flag(s_center_label, LV_OBJ_FLAG_HIDDEN);
 }
 
 uint32_t arcade_ui_handler(void)
@@ -247,31 +251,15 @@ uint32_t arcade_ui_handler(void)
 
 void arcade_ui_player_debug(char *buf, uint32_t len)
 {
-    int n;
-
     if (buf == NULL || len == 0) {
         return;
     }
 
-    if (s_canvas == NULL || s_player_box == NULL) {
-        snprintf(buf, len, "canvas=(null)");
-        return;
-    }
-
-    n = snprintf(buf, len,
-                 "scr=%p box=%p box_hidden=%d canvas=%p pos=%d,%d size=%dx%d hidden=%d",
-                 (void *)lv_scr_act(), (void *)s_player_box,
-                 lv_obj_has_flag(s_player_box, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
-                 (void *)s_canvas,
-                 (int)lv_obj_get_x(s_canvas), (int)lv_obj_get_y(s_canvas),
-                 (int)lv_obj_get_width(s_canvas), (int)lv_obj_get_height(s_canvas),
-                 lv_obj_has_flag(s_canvas, LV_OBJ_FLAG_HIDDEN) ? 1 : 0);
-
-    if (n < 0 || (uint32_t)n >= len) {
-        return;
-    }
-
-    snprintf(buf + n, len - (uint32_t)n, " fb=%p", (void *)arcade_video_get_fb());
+    snprintf(buf, len, "scr=%p box=%p box_hidden=%d msg=%d fb=%p",
+             (void *)lv_scr_act(), (void *)s_player_box,
+             (s_player_box != NULL && lv_obj_has_flag(s_player_box, LV_OBJ_FLAG_HIDDEN)) ? 1 : 0,
+             arcade_ui_player_message_visible() ? 1 : 0,
+             (void *)arcade_video_get_fb());
 }
 
 void arcade_ui_player_message(const char *text)
