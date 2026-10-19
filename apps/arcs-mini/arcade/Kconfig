@@ -14,11 +14,12 @@ config ARCADE_ROM_DIR
     default "/SD:/roms"
     help
       Preferred directory for ROM files.  The VFS directory walk on this
-      board is not reliable (lsfs_readdir can wedge on the card root), so
-      arcade_rom.c does not scan directories: it probes a fixed candidate
-      list instead, looking in /SD:/roms/ and then /SD:/ for names such as
-      pock.gbc / game.gb / rom.gbc.  This option is only used by the
-      `arcade fs` self-test and the status line.
+      board is not reliable (lsfs_readdir can wedge on the card root and
+      freeze the whole device), so arcade_rom.c does not scan directories:
+      it probes a fixed candidate list instead, looking in /SD:/roms/ and
+      then /SD:/ for a small set of names (pock.gbc, game.gb, ...).
+      This option is only used by the `arcade fs` self-test and the status
+      line.
 
 config ARCADE_ROM_MAX
     int "Maximum number of ROMs listed"
@@ -38,8 +39,9 @@ config ARCADE_CART_RAM_MAX
     default 32768
     help
       Upper bound of the cartridge RAM buffer allocated for the loaded ROM.
-      The ROM itself is streamed from the SD card in 16 KB banks, so it does
-      not need a PSRAM buffer of its own.
+      The ROM itself is loaded into PSRAM as a whole when it fits (no SD card
+      access during emulation); it only falls back to streaming 16 KB banks
+      from the card when PSRAM is too tight.
 
 config ARCADE_LOG_FPS
     bool "Log emulator fps to the shell"

@@ -32,6 +32,19 @@
 #define TAG "platform"
 #include "lisa_log.h"
 
+/*
+ * 纯模拟器固件（CONFIG_APPLICATION_ARCADE=y）：整机只保留
+ *   显示 / TF 卡（LSFS）/ USB（adb+shell 调试）/ KV / 按键 / 模拟器。
+ * WiFi、BLE 配网、语音助手全链路、云端、音频、TONE、MCP、UI 动画一律不初始化。
+ * 这些模块的代码仍然留在仓库里（方便继续 merge 上游），
+ * 但模拟器固件不会拉起任何相关线程，也不会占用 PSRAM。
+ */
+#if CONFIG_APPLICATION_ARCADE
+#define PLATFORM_ASSISTANT 0
+#else
+#define PLATFORM_ASSISTANT 1
+#endif
+
 #ifdef CONFIG_BOARD_ARCS_MINI
 #define TONE_BIN_ADDR       (CMN_FLASH_REGION + 0x00100000)
 #define TONE_BIN_SIZE       (1024 * 1024)
@@ -195,6 +208,7 @@ static int voice_platform_init(void)
         }
     }
     arcs_nvs_init();
+#if PLATFORM_ASSISTANT
     #if CONFIG_SAL_USING_POSIX
      /* Initialize network device subsystem */
     netdev_init();
@@ -214,8 +228,11 @@ static int voice_platform_init(void)
     } else {
         LISA_LOGW(TAG, "IPC not ready, skip WiFi and BLE init");
     }
+#else
+    LISA_LOGI(TAG, "arcade build: skip netdev/SAL/WiFi/BLE/cloud init");
+#endif /* PLATFORM_ASSISTANT */
 
-#if CONFIG_ACOMP
+#if CONFIG_ACOMP && PLATFORM_ASSISTANT
     acomp_init();
 #if CONFIG_ACOMP_LOGGER
     acomp_logger_init();
@@ -308,6 +325,7 @@ static int voice_platform_init(void)
 #endif
 	evs_utils_init();
 
+#if PLATFORM_ASSISTANT
 #ifdef CONFIG_BOARD_ARCS_MINI
     app_tone_init(TONE_BIN_ADDR, TONE_BIN_SIZE);
 #else // !CONFIG_BOARD_ARCS_MINI
@@ -347,8 +365,15 @@ static int voice_platform_init(void)
 #endif
 
     mcp_init();
+#else
+    LISA_LOGI(TAG, "arcade build: skip tone/audio/network-manager/MCP/UI anim init");
+#endif /* PLATFORM_ASSISTANT */
 
+#if PLATFORM_ASSISTANT
+    /* 语音助手组合根靠这条消息拉起播放器/意图管理；模拟器固件不发布它，
+     * 否则 voice_player 会去初始化音频与播放线程。 */
     voice_msg_pub(VOICE_MSG_PLATFORM_READY, NULL, 0);
+#endif
 
     // app_ble_adv_start(0, BLE_ADV_GEN);
     LISA_LOGI(TAG, "==== Application Ready!!!=====\n");

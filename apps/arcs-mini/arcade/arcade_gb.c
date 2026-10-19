@@ -4,15 +4,19 @@
  * peanut_gb.h 是单头文件实现，只在这一个编译单元里 include，
  * 避免重复定义 gb_init()/gb_run_frame()。
  *
- * ROM 不整份读进 PSRAM：CP 侧 PSRAM 堆放不下 2MB 的商业 ROM，而本平台的
- * exram_malloc() 一旦失败会走 sysheap.c 里的 CRASH_ON_ALLOC_FAIL 路径直接
- * trap（整机死机，屏幕冻结、adb shell 也挂住）。所以改成「按 16KB 银行从
- * TF 卡按需读 + LRU 缓存」：Peanut-GB 只通过 gb_rom_read() 回调取 ROM，且
- * 传进来的是文件内绝对偏移，天然适合流式实现；RAM 占用固定几十 KB，
- * 卡上 2MB / 4MB / 8MB 的 ROM 都能跑。
+ * ROM 载入策略（按优先级）：
+ *   1. 整份读进 PSRAM —— 默认路径。PSRAM 够的时候永远选它：模拟过程中
+ *      不再碰文件系统和 TF 卡，gb_rom_read() 就是一次数组访问，帧率稳定。
+ *   2. PSRAM 放不下时退回「按 16KB 银行从 TF 卡读 + LRU 缓存」。RAM 占用
+ *      固定在几十 KB，卡上 8MB 以内的 ROM 也能跑（但银行切换会读卡，慢）。
+ *
+ * 注意：本平台的 exram_malloc() 一旦失败会走 sysheap.c 里的
+ * CRASH_ON_ALLOC_FAIL 路径直接 trap（整机死机，屏幕冻结、adb shell 也挂住），
+ * 所以每次分配前都必须先查 heap_caps_get_free_size(MALLOC_CAP_SPIRAM)。
  */
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "esp_heap_caps.h"
 #include "sysheap.h"
@@ -50,16 +54,17 @@ struct rom_cache {
 };
 
 struct arcade_gb_priv {
-    /* 卡上的 ROM：文件一直开着，按银行读 */
+    /* 卡上的 ROM：文件一直开着，整份载入失败时按银行读 */
     uint32_t rom_file_size;
     /* ROM 大小向上取整到 2 的幂，越界读的掩码回卷才安全 */
     uint32_t rom_size;
-    /* 内置演示 ROM：从 flash 拷一份到 PSRAM（只有几十 KB） */
+    /* ROM 在 PSRAM 里的副本：整份载入成功时非 NULL，也用于内置演示 ROM */
     uint8_t *rom_mem;
     struct rom_cache cache;
     uint8_t *cart_ram;
     uint32_t cart_ram_size;
     bool read_err_logged;
+    bool first_frame_logged;
     struct gb_s gb;
 };
 
@@ -360,12 +365,67 @@ static bool rom_open_file(struct arcade_gb_priv *p, const char *path)
     return true;
 }
 
+/*
+ * 整份读进 PSRAM。成功返回 true，失败（内存不够 / 读文件出错）返回 false，
+ * 调用方再退回银行缓存。读不满的部分保持 0xFF，和真机未接线的表现接近。
+ */
+static bool rom_load_image(struct arcade_gb_priv *p, const char *path)
+{
+    uint8_t *buf;
+    uint32_t len = p->rom_size;
+    uint32_t done = 0;
+
+    if (path == NULL) {
+        return false;
+    }
+
+    buf = (uint8_t *)psram_alloc(len, "rom image");
+    if (buf == NULL) {
+        LISA_LOGW(TAG, "rom image %u B does not fit, falling back to bank cache",
+                  (unsigned)len);
+        return false;
+    }
+
+    memset(buf, 0xFF, len);
+
+    if (lsfs_seek(&s_rom_file, 0, LSFS_SEEK_SET) != 0) {
+        LISA_LOGW(TAG, "seek 0 failed, ROM reads would return 0xFF");
+        exram_free(buf);
+        return false;
+    }
+
+    while (done < p->rom_file_size) {
+        ssize_t got = lsfs_read(&s_rom_file, buf + done, p->rom_file_size - done);
+
+        if (got <= 0) {
+            LISA_LOGW(TAG, "short ROM read at %u/%u, rest filled with 0xFF",
+                      (unsigned)done, (unsigned)p->rom_file_size);
+            break;
+        }
+
+        done += (uint32_t)got;
+    }
+
+    if (done == 0) {
+        LISA_LOGE(TAG, "read 0 bytes from %s", path);
+        exram_free(buf);
+        return false;
+    }
+
+    p->rom_mem = buf;
+    LISA_LOGI(TAG, "rom image in psram: %u B (read %u B), psram free %u KB",
+              (unsigned)len, (unsigned)done,
+              (unsigned)(psram_free_bytes() / 1024));
+    return true;
+}
+
 /* ---------------- 对外接口 ---------------- */
 
 int arcade_gb_start(const char *path)
 {
     enum gb_init_error_e ret;
     size_t free_bytes;
+    bool whole_rom;
 
     arcade_gb_stop();
 
@@ -387,16 +447,22 @@ int arcade_gb_start(const char *path)
             arcade_gb_stop();
             return -1;
         }
+        whole_rom = true;
     } else {
         if (!rom_open_file(s_priv, path)) {
             arcade_gb_stop();
             return -1;
         }
-    }
 
-    if (!rom_cache_init(&s_priv->cache)) {
-        arcade_gb_stop();
-        return -1;
+        whole_rom = rom_load_image(s_priv, path);
+        if (whole_rom) {
+            /* 整份 ROM 已在 PSRAM 里，文件句柄不用再占着，
+             * 避免模拟过程中一直持有一个 FATFS 句柄 */
+            rom_close();
+        } else if (!rom_cache_init(&s_priv->cache)) {
+            arcade_gb_stop();
+            return -1;
+        }
     }
 
     s_priv->cart_ram_size = CONFIG_ARCADE_CART_RAM_MAX;
@@ -429,10 +495,12 @@ int arcade_gb_start(const char *path)
     s_priv->gb.direct.joypad = 0;
 
     s_running = true;
-    LISA_LOGI(TAG, "GB started: %s, rom %u bytes (%u B on card), mbc %d, save %u bytes",
+    LISA_LOGI(TAG, "GB started: %s, rom %u bytes (%u B on card), rom_in_ram=%d, mbc %d, save %u bytes",
               path, (unsigned)s_priv->rom_size,
               (unsigned)(s_priv->rom_mem != NULL ? 0 : s_priv->rom_file_size),
+              s_priv->rom_mem != NULL ? 1 : 0,
               (int)s_priv->gb.mbc, (unsigned)s_priv->cart_ram_size);
+    LISA_LOGI(TAG, "psram free after load: %u KB", (unsigned)(psram_free_bytes() / 1024));
 
     return 0;
 }
@@ -481,6 +549,12 @@ void arcade_gb_run_frame(void)
     }
 
     gb_run_frame(&s_priv->gb);
+
+    if (!s_priv->first_frame_logged) {
+        s_priv->first_frame_logged = true;
+        LISA_LOGI(TAG, "first frame done, psram free %u KB",
+                  (unsigned)(psram_free_bytes() / 1024));
+    }
 }
 
 void arcade_gb_set_input(uint32_t mask)
@@ -490,4 +564,44 @@ void arcade_gb_set_input(uint32_t mask)
     }
 
     s_priv->gb.direct.joypad = (uint8_t)(mask & 0xFF);
+}
+
+uint32_t arcade_gb_rom_checksum(void)
+{
+    uint32_t hash = 2166136261u;
+
+    if (s_priv == NULL || s_priv->rom_size == 0) {
+        return 0;
+    }
+
+    for (uint32_t addr = 0; addr < s_priv->rom_size; addr++) {
+        hash ^= gb_rom_read(&s_priv->gb, addr);
+        hash *= 16777619u;
+    }
+
+    return hash;
+}
+
+int arcade_gb_rom_header(char *out, uint32_t out_len)
+{
+    char title[17];
+    int n;
+
+    if (s_priv == NULL || out == NULL || out_len < 32) {
+        return -1;
+    }
+
+    for (int i = 0; i < 16; i++) {
+        uint8_t c = gb_rom_read(&s_priv->gb, 0x0134u + (uint16_t)i);
+
+        title[i] = (c >= 0x20 && c < 0x7F) ? (char)c : ' ';
+    }
+    title[16] = '\0';
+
+    n = snprintf(out, out_len, "title=[%s] cart=0x%02X rom_size=0x%02X",
+                 title,
+                 (unsigned)gb_rom_read(&s_priv->gb, 0x0147u),
+                 (unsigned)gb_rom_read(&s_priv->gb, 0x0148u));
+
+    return n;
 }

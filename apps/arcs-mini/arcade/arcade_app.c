@@ -25,6 +25,7 @@
 
 #include "arcade_app.h"
 #include "arcade_core.h"
+#include "arcade_gb.h"
 #include "arcade_input.h"
 #include "arcade_rom.h"
 #include "arcade_save.h"
@@ -44,8 +45,8 @@
 #define ARCADE_FS_TEST_FILE   ARCADE_FS_TEST_DIR "/probe.bin"
 #define ARCADE_FS_PROBE_LEN   32
 
-/* saves 列表最多展开的子目录数 */
-#define ARCADE_SAVES_SUBDIR_MAX 4
+/* saves 列表最多打印的存档数 */
+#define ARCADE_SAVES_MAX 32
 
 typedef enum {
     ARCADE_MODE_LIST = 0,
@@ -62,7 +63,8 @@ typedef enum {
 
 static arcade_mode_t s_mode = ARCADE_MODE_LIST;
 static int s_sel;
-static uint8_t s_pending_action = 0xFF;
+/* 按键任务写、模拟器任务读，必须 volatile，否则可能被优化成只读一次的循环 */
+static volatile uint8_t s_pending_action = 0xFF;
 
 static volatile arcade_req_t s_req;
 static volatile int s_req_arg;
@@ -138,8 +140,11 @@ static void arcade_start_selected(void)
 
     LISA_LOGI(TAG, "loading %s", path);
 
-    arcade_ui_player_message(NULL);
+    /* 2MB 的 ROM 从 TF 卡读进 PSRAM 需要一两秒，先给个可见提示，
+     * 否则这段时间屏幕一片黑，看起来像卡死。 */
     arcade_ui_show_player();
+    arcade_ui_player_message("载入中…");
+    lv_task_handler();
 
     if (arcade_core_start(path) != 0) {
         arcade_show_list();
@@ -147,8 +152,10 @@ static void arcade_start_selected(void)
         return;
     }
 
+    arcade_ui_player_message(NULL);
     arcade_video_fill_black();
     arcade_ui_player_invalidate();
+    lv_task_handler();
 
     s_mode = ARCADE_MODE_PLAY;
     s_frames = 0;
@@ -185,6 +192,9 @@ static void arcade_rescan(void)
 static void arcade_handle_action(uint8_t action)
 {
     int count = arcade_rom_count();
+
+    LISA_LOGI(TAG, "action=%d mode=%s", (int)action,
+              s_mode == ARCADE_MODE_LIST ? "list" : "play");
 
     if (s_mode == ARCADE_MODE_LIST) {
         switch (action) {
@@ -723,68 +733,77 @@ static int cmd_save(int argc, char **argv)
     return 0;
 }
 
-static int saves_list_dir(Shell *shell, const char *dir_path, int depth)
-{
-    struct lsfs_dirent entry;
-    struct lsfs_dir_t dir;
-    char subdirs[ARCADE_SAVES_SUBDIR_MAX][48];
-    int sub_count = 0;
-    int found = 0;
-
-    lsfs_dir_t_init(&dir);
-    if (lsfs_opendir(&dir, dir_path) != 0) {
-        shellPrint(shell, "[WARN] 无法打开 %s\r\n", dir_path);
-        return 0;
-    }
-
-    while (lsfs_readdir(&dir, &entry) == 0) {
-        if (entry.name[0] == '\0' || entry.name[0] == (char)0xE5) {
-            break;
-        }
-        if (entry.name[0] == '.') {
-            continue;
-        }
-
-        if (entry.type == LSFS_DIR_ENTRY_DIR) {
-            if (depth == 0 && sub_count < ARCADE_SAVES_SUBDIR_MAX) {
-                memset(subdirs[sub_count], 0, sizeof(subdirs[sub_count]));
-                strncpy(subdirs[sub_count], entry.name, sizeof(subdirs[sub_count]) - 1);
-                sub_count++;
-            }
-            continue;
-        }
-
-        size_t len = strlen(entry.name);
-
-        if (len > 4 && strcasecmp(entry.name + len - 4, ".sav") == 0) {
-            shellPrint(shell, "%s/%s (%u bytes)\r\n", dir_path, entry.name,
-                       (unsigned)entry.size);
-            found++;
-        }
-    }
-
-    lsfs_closedir(&dir);
-
-    for (int i = 0; i < sub_count; i++) {
-        char sub_path[96];
-
-        snprintf(sub_path, sizeof(sub_path), "%s/%s", dir_path, subdirs[i]);
-        found += saves_list_dir(shell, sub_path, depth + 1);
-    }
-
-    return found;
-}
-
-static int cmd_saves(int argc, char **argv)
+static int cmd_romsum(int argc, char **argv)
 {
     Shell *shell = shellGetCurrent();
-    int found;
+    char header[96];
 
     (void)argc;
     (void)argv;
 
-    shellPrint(shell, "存档目录: %s（与 ROM 同目录，*.sav）\r\n", CONFIG_ARCADE_ROM_DIR);
-    found = saves_list_dir(shell, CONFIG_ARCADE_ROM_DIR, 0);
+    if (!arcade_core_running()) {
+        shellPrint(shell, "当前没有运行中的 ROM\r\n");
+        return 0;
+    }
+
+    /* 走和模拟器完全相同的读路径算一遍哈希，用来确认 ROM 数据是完整的 */
+    if (arcade_gb_rom_header(header, sizeof(header)) >= 0) {
+        shellPrint(shell, "%s\r\n", header);
+    }
+
+    shellPrint(shell, "rom fnv1a=0x%08X\r\n", (unsigned)arcade_gb_rom_checksum());
+    return 0;
+}
+
+/*
+ * 列出存档：不做目录遍历（本平台 lsfs_readdir 在卡根目录会死锁），
+ * 只对已知 ROM 逐个 lsfs_open 探测同名 .sav。
+ */
+static int cmd_saves(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    int found = 0;
+    int count;
+
+    (void)argc;
+    (void)argv;
+
+    shellPrint(shell, "存档与 ROM 同目录（*.sav）\r\n");
+    count = arcade_rom_count();
+    if (count > ARCADE_SAVES_MAX) {
+        count = ARCADE_SAVES_MAX;
+    }
+
+    for (int i = 0; i < count; i++) {
+        const char *rom = arcade_rom_path(i);
+        struct lsfs_file_t file;
+        char path[128];
+        const char *dot;
+        off_t size;
+        int n;
+
+        if (rom == NULL || rom[0] != '/') {
+            continue;
+        }
+
+        dot = strrchr(rom, '.');
+        n = snprintf(path, sizeof(path), "%.*s.sav",
+                     (int)(dot != NULL ? (size_t)(dot - rom) : strlen(rom)), rom);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            continue;
+        }
+
+        lsfs_file_t_init(&file);
+        if (lsfs_open(&file, path, LSFS_O_READ) != 0) {
+            continue;
+        }
+        size = lsfs_lsize(&file);
+        lsfs_close(&file);
+
+        shellPrint(shell, "%s (%d bytes)\r\n", path, (int)size);
+        found++;
+    }
+
     shellPrint(shell, "共 %d 个存档\r\n", found);
     return 0;
 }
@@ -800,6 +819,7 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"fs", cmd_fs, "TF 卡文件系统读写自检"},
     {"save", cmd_save, "立即落盘当前存档"},
     {"saves", cmd_saves, "列出 TF 卡上的 .sav 存档"},
+    {"romsum", cmd_romsum, "打印 ROM 头部与整份校验和"},
 };
 
 static int cmd_arcade_help(Shell *shell)
