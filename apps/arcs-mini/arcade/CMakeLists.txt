@@ -3,7 +3,6 @@ listenai_library_named(app-arcade)
 listenai_library_sources(
     arcade_app.c
     arcade_core.c
-    arcade_gb.c
     arcade_input.c
     arcade_rom.c
     arcade_save.c
@@ -15,9 +14,35 @@ listenai_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-listenai_include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/Peanut-GB
-)
+# ---- GB/GBC 内核 ----------------------------------------------------------
+# CONFIG_ARCADE_GB_CORE_PEANUT=y 时用 Peanut-GB（只有 DMG，体积小）；
+# 默认用 binjgb（纯 C99 + MIT，CGB 完整：VRAM/WRAM 分 bank、CGB 调色板、
+# GDMA/HDMA、双速模式），GBC 游戏才能真正跑起来。
+#
+# 两个后端实现同一套 arcade_gb.h 接口，上层 arcade_app.c 不需要区分。
+if(CONFIG_ARCADE_GB_CORE_PEANUT)
+    listenai_library_sources(arcade_gb.c)
+    listenai_include_directories(
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/Peanut-GB
+    )
+else()
+    listenai_library_sources(
+        arcade_gbc.c
+        third_party/binjgb/emulator.c
+        third_party/binjgb/common.c
+        third_party/binjgb/memory.c
+    )
+    listenai_include_directories(
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/binjgb
+    )
+    # third_party 是 vendored 原版代码，不参与本分支的告警策略
+    set_source_files_properties(
+        third_party/binjgb/emulator.c
+        third_party/binjgb/common.c
+        third_party/binjgb/memory.c
+        PROPERTIES COMPILE_OPTIONS "-w"
+    )
+endif()
 
 # ---- 内置演示 ROM ----------------------------------------------------------
 # third_party/gb-test-roms 是开发期下载的第三方测试 ROM，不进仓库。

@@ -1,9 +1,23 @@
 # 第三方模拟器内核与测试 ROM 由开发期下载，不进仓库：
 #   Peanut-GB      https://github.com/deltabeard/Peanut-GB   (MIT)
+#   binjgb         https://github.com/binji/binjgb           (MIT)
 #   gb-test-roms   https://github.com/retrio/gb-test-roms
 #   libretro-fceumm (NES 后端，下一阶段)
 third_party/*
-# 例外：Peanut-GB 的单头文件实现必须入库，保证全新克隆就能构建
+# 例外一：Peanut-GB 的单头文件实现必须入库，保证全新克隆就能构建
 !third_party/Peanut-GB
 third_party/Peanut-GB/*
 !third_party/Peanut-GB/peanut_gb.h
+# 例外二：binjgb（GB+GBC 内核）只保留裁掉的 8 个源文件，同样必须入库；
+# 搬运动作和改动清单见 third_party/binjgb/PORTING.md
+!third_party/binjgb
+third_party/binjgb/*
+!third_party/binjgb/emulator.c
+!third_party/binjgb/emulator.h
+!third_party/binjgb/common.c
+!third_party/binjgb/common.h
+!third_party/binjgb/memory.c
+!third_party/binjgb/memory.h
+!third_party/binjgb/builtin-palettes.def
+!third_party/binjgb/LICENSE
+!third_party/binjgb/PORTING.md

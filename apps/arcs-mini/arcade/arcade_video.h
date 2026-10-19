@@ -38,4 +38,13 @@ void arcade_video_fill(int shade);
 /** 调色板第 shade 档的 RGB565 原始值（调试用） */
 uint16_t arcade_video_palette_raw(int shade);
 
+/** 4 档 DMG 绿盘原始 RGB（模拟器内核要给 binjgb 设 DMG 调色板时用） */
+const uint8_t (*arcade_video_dmg_palette_rgb(void))[3];
+
+/**
+ * binjgb 帧输出：160x144 的 RGBA（0xAABBGGRR）按 1.5 倍最近邻放大到
+ * 240x216 帧缓冲。每帧调一次。
+ */
+void arcade_video_draw_frame_rgba(const uint32_t *rgba);
+
 #endif /* __ARCADE_VIDEO_H__ */

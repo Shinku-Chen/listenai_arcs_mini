@@ -107,6 +107,50 @@ uint16_t arcade_video_palette_raw(int shade)
     return c.full;
 }
 
+const uint8_t (*arcade_video_dmg_palette_rgb(void))[3]
+{
+    return s_palette_rgb;
+}
+
+/*
+ * 一帧 RGBA（binjgb 输出格式：低字节 R、然后 G、B、A）直接缩放成 240x216。
+ *
+ * 和 arcade_video_draw_line() 的区别：那条路是 Peanut-GB 的 DMG 灰度
+ * （每像素 2 bit 写进 4 档绿盘），这里已经把调色板算好了（CGB 是游戏自己
+ * 的 15bit 色），所以只需要最近邻放大 + RGB565 打包。
+ */
+void arcade_video_draw_frame_rgba(const uint32_t *rgba)
+{
+    static uint16_t s_xmap[ARCADE_FB_WIDTH];
+    static uint8_t s_ymap[ARCADE_FB_HEIGHT];
+    static bool s_map_ready;
+
+    if (s_fb == NULL || rgba == NULL) {
+        return;
+    }
+
+    if (!s_map_ready) {
+        for (int x = 0; x < ARCADE_FB_WIDTH; x++) {
+            s_xmap[x] = (uint16_t)((x * SCALE_DEN) / SCALE_NUM);
+        }
+        for (int y = 0; y < ARCADE_FB_HEIGHT; y++) {
+            s_ymap[y] = (uint8_t)((y * SCALE_DEN) / SCALE_NUM);
+        }
+        s_map_ready = true;
+    }
+
+    for (int y = 0; y < ARCADE_FB_HEIGHT; y++) {
+        const uint32_t *src = rgba + (size_t)s_ymap[y] * SRC_WIDTH;
+        lv_color_t *row = s_fb + (size_t)y * ARCADE_FB_WIDTH;
+
+        for (int x = 0; x < ARCADE_FB_WIDTH; x++) {
+            uint32_t c = src[s_xmap[x]];
+
+            row[x] = lv_color_make((uint8_t)c, (uint8_t)(c >> 8), (uint8_t)(c >> 16));
+        }
+    }
+}
+
 void arcade_video_draw_line(int src_line, const uint8_t *shades)
 {
     if (s_fb == NULL || shades == NULL) {

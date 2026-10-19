@@ -26,6 +26,24 @@ config ARCADE_ROM_MAX
     range 4 128
     default 32
 
+choice ARCADE_GB_CORE
+    prompt "GB/GBC emulator core"
+    default ARCADE_GB_CORE_BINJGB
+    help
+      Peanut-GB is a single-header DMG-only core: it has no CGB support at all
+      (no SVBK / VBK / HDMA), so GBC titles such as Pokemon Crystal animate the
+      intro and then hang forever inside DelayFrame() once they touch CGB banks.
+      binjgb is pure C99, MIT licensed, and implements the full CGB feature set
+      (VRAM/WRAM banking, CGB palettes, GDMA/HDMA, double speed).
+
+config ARCADE_GB_CORE_BINJGB
+    bool "binjgb (full GB + GBC)"
+
+config ARCADE_GB_CORE_PEANUT
+    bool "Peanut-GB (DMG only, smaller)"
+
+endchoice
+
 config ARCADE_FRAME_PERIOD_MS
     int "Emulator frame period in milliseconds"
     range 8 100
