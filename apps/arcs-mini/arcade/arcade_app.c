@@ -59,6 +59,9 @@ typedef enum {
     ARCADE_REQ_EXIT,
     ARCADE_REQ_RESCAN,
     ARCADE_REQ_SAVE,
+    ARCADE_REQ_FB_REPORT,
+    ARCADE_REQ_FB_FILL,
+    ARCADE_REQ_FB_RESUME,
 } arcade_req_t;
 
 static arcade_mode_t s_mode = ARCADE_MODE_LIST;
@@ -70,6 +73,11 @@ static volatile arcade_req_t s_req;
 static volatile int s_req_arg;
 /* shell 的 arcade save 命令等这个结果 */
 static volatile int s_save_result;
+
+/* arcade fb：冻结画面并把帧缓冲/刷屏链路的状态回报给 shell */
+static volatile bool s_frozen;
+static volatile bool s_fb_ready;
+static char s_fb_report[1024];
 
 static uint32_t s_frames;
 static TickType_t s_fps_tick;
@@ -115,6 +123,72 @@ static void arcade_button_cb(void *unused, uint32_t msg_id, void *data, uint32_t
         break;
     default:
         break;
+    }
+}
+
+/* ------------- 帧缓冲自检（只在 arcade 任务里跑） ------------- */
+
+/*
+ * 区分「数据错」还是「刷屏错」：
+ *   - 采样帧缓冲若干点的 RGB565，如果采样值全是调色板里的值，
+ *     说明 Peanut-GB 的扫描线回调确实写进去了；
+ *   - 再配合 `arcade fb fill <n>` 把整块填成纯色并刷一帧：
+ *     如果屏上变成该颜色 → 刷屏链路 OK，问题在数据；
+ *     如果屏上没变 → canvas / flush 链路有问题。
+ */
+static void arcade_fb_report(void)
+{
+    static const int k_sx[3] = {0, ARCADE_FB_WIDTH / 2, ARCADE_FB_WIDTH - 1};
+    static const int k_sy[3] = {0, ARCADE_FB_HEIGHT / 2, ARCADE_FB_HEIGHT - 1};
+    lv_color_t *fb = arcade_video_get_fb();
+    int off = 0;
+    int uniq[5] = {0};
+    int uniq_n = 0;
+
+    if (fb == NULL) {
+        snprintf(s_fb_report, sizeof(s_fb_report), "fb=(null)");
+        return;
+    }
+
+    for (int i = 0; i < ARCADE_FB_WIDTH * ARCADE_FB_HEIGHT; i++) {
+        uint16_t v = fb[i].full;
+        int j;
+
+        for (j = 0; j < uniq_n; j++) {
+            if (uniq[j] == (int)v) {
+                break;
+            }
+        }
+        if (j == uniq_n && uniq_n < 5) {
+            uniq[uniq_n++] = (int)v;
+        }
+    }
+
+    off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off,
+                    "pal=%04X,%04X,%04X,%04X uniq=%d(",
+                    (unsigned)arcade_video_palette_raw(0),
+                    (unsigned)arcade_video_palette_raw(1),
+                    (unsigned)arcade_video_palette_raw(2),
+                    (unsigned)arcade_video_palette_raw(3),
+                    uniq_n);
+    for (int i = 0; i < uniq_n && off < (int)sizeof(s_fb_report) - 8; i++) {
+        off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off, "%s%04X",
+                        i ? "," : "", (unsigned)uniq[i]);
+    }
+    off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off, ")\n");
+
+    for (int r = 0; r < 3 && off < (int)sizeof(s_fb_report) - 40; r++) {
+        off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off, "y=%-3d", k_sy[r]);
+        for (int c = 0; c < 3; c++) {
+            int idx = k_sy[r] * ARCADE_FB_WIDTH + k_sx[c];
+            off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off, " %04X",
+                            (unsigned)fb[idx].full);
+        }
+        off += snprintf(s_fb_report + off, sizeof(s_fb_report) - off, "\n");
+    }
+
+    if (off < (int)sizeof(s_fb_report) - 200) {
+        arcade_ui_player_debug(s_fb_report + off, (uint32_t)(sizeof(s_fb_report) - off));
     }
 }
 
@@ -272,6 +346,22 @@ static void arcade_handle_request(void)
     case ARCADE_REQ_SAVE:
         s_save_result = arcade_save_flush();
         break;
+    case ARCADE_REQ_FB_REPORT:
+        arcade_fb_report();
+        s_fb_ready = true;
+        break;
+    case ARCADE_REQ_FB_FILL:
+        s_frozen = true;
+        arcade_video_fill(arg);
+        arcade_ui_player_invalidate();
+        lv_task_handler();
+        break;
+    case ARCADE_REQ_FB_RESUME:
+        s_frozen = false;
+        arcade_video_fill_black();
+        arcade_ui_player_invalidate();
+        lv_task_handler();
+        break;
     default:
         break;
     }
@@ -334,7 +424,7 @@ static void arcade_task(void *arg)
         /* 每 30 秒（有改动才写）把 cart RAM 落盘，写盘期间允许掉帧 */
         arcade_save_tick();
 
-        if (s_mode == ARCADE_MODE_PLAY) {
+        if (s_mode == ARCADE_MODE_PLAY && !s_frozen) {
             bool kbd_exit = false;
             uint32_t kbd = arcade_input_take_keyboard(&kbd_exit);
 
@@ -808,6 +898,135 @@ static int cmd_saves(int argc, char **argv)
     return 0;
 }
 
+/*
+ * arcade fb            帧缓冲 / canvas / 刷屏链路状态
+ * arcade fb fill <0-3> 冻结画面并把帧缓冲填成调色板第 n 档（直接看屏变没变）
+ * arcade fb resume     恢复模拟
+ */
+static int cmd_fb(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (argc >= 1 && strcasecmp(argv[0], "fill") == 0) {
+        int shade = (argc >= 2) ? atoi(argv[1]) : 0;
+
+        if (shade < 0 || shade > 3) {
+            shade = 0;
+        }
+        if (arcade_request(ARCADE_REQ_FB_FILL, shade) != 0) {
+            shellPrint(shell, "请求超时（arcade 任务无响应）\r\n");
+            return 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+        shellPrint(shell, "已冻结并填充调色板 %d 档（期望屏幕整体变成 %04X），恢复用 arcade fb resume\r\n",
+                   shade, (unsigned)arcade_video_palette_raw(shade));
+        return 0;
+    }
+
+    if (argc >= 1 && strcasecmp(argv[0], "resume") == 0) {
+        if (arcade_request(ARCADE_REQ_FB_RESUME, 0) != 0) {
+            shellPrint(shell, "请求超时（arcade 任务无响应）\r\n");
+            return 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+        shellPrint(shell, "已恢复模拟\r\n");
+        return 0;
+    }
+
+    s_fb_ready = false;
+    if (arcade_request(ARCADE_REQ_FB_REPORT, 0) != 0) {
+        shellPrint(shell, "请求超时（arcade 任务无响应）\r\n");
+        return 0;
+    }
+
+    /* arcade_request 只能保证请求被取走，报告还要等主循环写完 */
+    for (int waited = 0; !s_fb_ready && waited < 300; waited += 10) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    shellPrint(shell, "frozen=%d mode=%s\r\n%s\r\n",
+               s_frozen ? 1 : 0,
+               s_mode == ARCADE_MODE_LIST ? "list" : "play",
+               s_fb_report);
+    return 0;
+}
+
+static int cmd_cpu(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    char line[512];
+
+    (void)argc;
+    (void)argv;
+
+    if (!arcade_core_running()) {
+        shellPrint(shell, "当前没有运行中的 ROM\r\n");
+        return 0;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        line[0] = '\0';
+        if (arcade_gb_machine_report(line, sizeof(line)) < 0) {
+            shellPrint(shell, "采样失败\r\n");
+            return 0;
+        }
+
+        /* shell 的单次打印缓冲很有限，逐行输出才不会把后半截切断 */
+        for (char *p = line; p != NULL && *p != '\0';) {
+            char *nl = strchr(p, '\n');
+
+            if (nl != NULL) {
+                *nl = '\0';
+            }
+            shellPrint(shell, "%s\r\n", p);
+            p = (nl != NULL) ? nl + 1 : NULL;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    return 0;
+}
+
+static int cmd_peek(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    char line[1024];
+    uint32_t addr;
+    uint32_t len;
+
+    if (argc < 1) {
+        shellPrint(shell, "用法: arcade peek <addr(hex)> [len]\r\n");
+        return 0;
+    }
+
+    addr = (uint32_t)strtoul(argv[0], NULL, 16);
+    len = (argc >= 2) ? (uint32_t)strtoul(argv[1], NULL, 10) : 64;
+
+    if (!arcade_core_running()) {
+        shellPrint(shell, "当前没有运行中的 ROM\r\n");
+        return 0;
+    }
+
+    line[0] = '\0';
+    if (arcade_gb_peek(line, sizeof(line), addr, len) < 0) {
+        shellPrint(shell, "读取失败\r\n");
+        return 0;
+    }
+
+    for (char *p = line; p != NULL && *p != '\0';) {
+        char *nl = strchr(p, '\n');
+
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+        shellPrint(shell, "%s\r\n", p);
+        p = (nl != NULL) ? nl + 1 : NULL;
+    }
+
+    return 0;
+}
+
 static const struct listen_cmd_t g_arcade_cmds[] = {
     {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
@@ -820,6 +1039,9 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"save", cmd_save, "立即落盘当前存档"},
     {"saves", cmd_saves, "列出 TF 卡上的 .sav 存档"},
     {"romsum", cmd_romsum, "打印 ROM 头部与整份校验和"},
+    {"fb", cmd_fb, "帧缓冲/刷屏自检（fill <0-3> 填纯色, resume 恢复）"},
+    {"cpu", cmd_cpu, "打印 CPU/LCDC 寄存器快照（连打两次看 PC 是否在走）"},
+    {"peek", cmd_peek, "按 CPU 视角读内存：peek <hex地址> [长度]"},
 };
 
 static int cmd_arcade_help(Shell *shell)

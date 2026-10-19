@@ -38,4 +38,10 @@ void arcade_ui_player_message(const char *text);
 /** 返回 LVGL 建议的下一次 lv_timer_handler() 间隔（毫秒） */
 uint32_t arcade_ui_handler(void);
 
+/**
+ * 调试用：把播放页 canvas 的挂载状态写进 buf。
+ * 必须在 UI 任务里调用（会读 LVGL 对象）。
+ */
+void arcade_ui_player_debug(char *buf, uint32_t len);
+
 #endif /* __ARCADE_UI_H__ */

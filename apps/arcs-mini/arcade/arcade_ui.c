@@ -245,6 +245,35 @@ uint32_t arcade_ui_handler(void)
     return idle;
 }
 
+void arcade_ui_player_debug(char *buf, uint32_t len)
+{
+    int n;
+
+    if (buf == NULL || len == 0) {
+        return;
+    }
+
+    if (s_canvas == NULL || s_player_box == NULL) {
+        snprintf(buf, len, "canvas=(null)");
+        return;
+    }
+
+    n = snprintf(buf, len,
+                 "scr=%p box=%p box_hidden=%d canvas=%p pos=%d,%d size=%dx%d hidden=%d",
+                 (void *)lv_scr_act(), (void *)s_player_box,
+                 lv_obj_has_flag(s_player_box, LV_OBJ_FLAG_HIDDEN) ? 1 : 0,
+                 (void *)s_canvas,
+                 (int)lv_obj_get_x(s_canvas), (int)lv_obj_get_y(s_canvas),
+                 (int)lv_obj_get_width(s_canvas), (int)lv_obj_get_height(s_canvas),
+                 lv_obj_has_flag(s_canvas, LV_OBJ_FLAG_HIDDEN) ? 1 : 0);
+
+    if (n < 0 || (uint32_t)n >= len) {
+        return;
+    }
+
+    snprintf(buf + n, len - (uint32_t)n, " fb=%p", (void *)arcade_video_get_fb());
+}
+
 void arcade_ui_player_message(const char *text)
 {
     if (s_center_label == NULL) {

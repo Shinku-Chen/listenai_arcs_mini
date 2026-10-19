@@ -29,4 +29,13 @@ void arcade_video_draw_line(int src_line, const uint8_t *shades);
 /** 把整块帧缓冲刷成黑 */
 void arcade_video_fill_black(void);
 
+/**
+ * 调试用：把整块帧缓冲填成调色板第 shade 档（0 最亮 / 3 最暗）。
+ * 用来区分「帧缓冲数据错」和「没刷到屏上」。
+ */
+void arcade_video_fill(int shade);
+
+/** 调色板第 shade 档的 RGB565 原始值（调试用） */
+uint16_t arcade_video_palette_raw(int shade);
+
 #endif /* __ARCADE_VIDEO_H__ */

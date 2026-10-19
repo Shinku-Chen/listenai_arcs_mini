@@ -23,4 +23,18 @@ uint32_t arcade_gb_rom_checksum(void);
  */
 int arcade_gb_rom_header(char *out, uint32_t out_len);
 
+/**
+ * 调试：把 CPU / LCD 控制器的关键寄存器打成一行。
+ * 连续调两次对比 PC 就能看出 CPU 到底在不在跑。
+ * @return 写入的字符数，<0 没有运行中的 ROM
+ */
+int arcade_gb_machine_report(char *out, uint32_t out_len);
+
+/**
+ * 调试：按 CPU 视角读内存并格式化成十六进制（走 __gb_read，所以能看
+ * ROM / VRAM / WRAM / IO 任意区域）。
+ * @return 写入的字符数，<0 没有运行中的 ROM
+ */
+int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len);
+
 #endif /* __ARCADE_GB_H__ */

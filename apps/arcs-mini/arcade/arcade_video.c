@@ -78,13 +78,33 @@ lv_color_t *arcade_video_get_fb(void)
 
 void arcade_video_fill_black(void)
 {
+    arcade_video_fill(3);
+}
+
+void arcade_video_fill(int shade)
+{
     if (s_fb == NULL) {
         return;
     }
 
-    for (int i = 0; i < ARCADE_FB_WIDTH * ARCADE_FB_HEIGHT; i++) {
-        s_fb[i] = s_palette[3];
+    if (shade < 0 || shade > 3) {
+        shade = 3;
     }
+
+    for (int i = 0; i < ARCADE_FB_WIDTH * ARCADE_FB_HEIGHT; i++) {
+        s_fb[i] = s_palette[shade];
+    }
+}
+
+uint16_t arcade_video_palette_raw(int shade)
+{
+    lv_color_t c;
+
+    palette_prepare();
+
+    c = s_palette[shade & 0x03];
+
+    return c.full;
 }
 
 void arcade_video_draw_line(int src_line, const uint8_t *shades)

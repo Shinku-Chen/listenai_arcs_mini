@@ -78,6 +78,10 @@ static bool s_rom_file_open;
 static struct arcade_gb_priv *s_priv;
 static bool s_running;
 static bool s_error_logged;
+/* 模拟器报错计数：CPU 跑飞（非法指令 / 非法读写）时会累加 */
+static uint32_t s_err_count;
+static int s_err_last = -1;
+static uint16_t s_err_addr;
 
 /* ---------------- PSRAM 分配（带余量检查） ---------------- */
 
@@ -280,6 +284,10 @@ static void gb_error(struct gb_s *gb, const enum gb_error_e err, const uint16_t 
 {
     (void)gb;
 
+    s_err_count++;
+    s_err_last = (int)err;
+    s_err_addr = addr;
+
     if (!s_error_logged) {
         LISA_LOGW(TAG, "GB error %d at 0x%04X, emulation keeps running", (int)err, (unsigned)addr);
         s_error_logged = true;
@@ -480,6 +488,9 @@ int arcade_gb_start(const char *path)
     arcade_save_attach(path, s_priv->cart_ram, s_priv->cart_ram_size);
 
     s_error_logged = false;
+    s_err_count = 0;
+    s_err_last = -1;
+    s_err_addr = 0;
 
     ret = gb_init(&s_priv->gb, &gb_rom_read, &gb_cart_ram_read, &gb_cart_ram_write,
                   &gb_error, s_priv);
@@ -492,7 +503,9 @@ int arcade_gb_start(const char *path)
     }
 
     gb_init_lcd(&s_priv->gb, &gb_lcd_line);
-    s_priv->gb.direct.joypad = 0;
+    /* direct.joypad 是低电平有效：1=松开、0=按下。复位后必须全部松开，
+     * 否则游戏一开机就看到八个键全被按住（Pokemon 会卡在初始化）。 */
+    s_priv->gb.direct.joypad = 0xFF;
 
     s_running = true;
     LISA_LOGI(TAG, "GB started: %s, rom %u bytes (%u B on card), rom_in_ram=%d, mbc %d, save %u bytes",
@@ -563,7 +576,12 @@ void arcade_gb_set_input(uint32_t mask)
         return;
     }
 
-    s_priv->gb.direct.joypad = (uint8_t)(mask & 0xFF);
+    /*
+     * ARCADE_KEY_* / JOYPAD_* 位为 1 表示「按下」，但 Peanut-GB 的
+     * direct.joypad 是低电平有效（和 JOYP 寄存器一样：1=松开、0=按下），
+     * 所以这里要反过来写。官方 sdl2 示例也是 released 时 |= 、pressed 时 &= ~。
+     */
+    s_priv->gb.direct.joypad = (uint8_t)(~(mask & 0xFF));
 }
 
 uint32_t arcade_gb_rom_checksum(void)
@@ -604,4 +622,116 @@ int arcade_gb_rom_header(char *out, uint32_t out_len)
                  (unsigned)gb_rom_read(&s_priv->gb, 0x0148u));
 
     return n;
+}
+
+/*
+ * CPU / LCD 状态快照。
+ *
+ * 全白屏的黑是最多的：ROM 读错、CPU 跑飞、LCDC 没开都会表现为全白。
+ * 连续调两次对比 PC / LY，就能区分「CPU 在跑」和「CPU 卡死」，再结合
+ * LCDC / BGP / vram 就知道屏上的白是大是小。
+ */
+int arcade_gb_machine_report(char *out, uint32_t out_len)
+{
+    static const uint8_t kNintendoLogo[48] = {
+        0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83,
+        0x00, 0x0C, 0x00, 0x0D, 0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E,
+        0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99, 0xBB, 0xBB, 0x67, 0x63,
+        0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+    };
+    struct gb_s *gb;
+    uint32_t vram_sum = 0;
+    int nonzero = 0;
+    int logo_ok = 1;
+    int n;
+
+    if (s_priv == NULL || out == NULL || out_len < 128) {
+        return -1;
+    }
+
+    gb = &s_priv->gb;
+
+    for (int i = 0; i < VRAM_SIZE; i++) {
+        vram_sum += gb->vram[i];
+        if (gb->vram[i] != 0) {
+            nonzero++;
+        }
+    }
+
+    /* 任天堂 logo 是卡带上固定的 48 字节，对不上就说明 ROM 读取/载入坏了 */
+    for (int i = 0; i < 48; i++) {
+        if (gb_rom_read(gb, 0x0104u + (uint16_t)i) != kNintendoLogo[i]) {
+            logo_ok = 0;
+            break;
+        }
+    }
+
+    n = snprintf(out, out_len, "pc=%04X sp=%04X af=%02X%02X bc=%04X de=%04X hl=%04X\n",
+                 (unsigned)gb->cpu_reg.pc.reg, (unsigned)gb->cpu_reg.sp.reg,
+                 (unsigned)gb->cpu_reg.a, (unsigned)gb->cpu_reg.f.reg,
+                 (unsigned)gb->cpu_reg.bc.reg, (unsigned)gb->cpu_reg.de.reg,
+                 (unsigned)gb->cpu_reg.hl.reg);
+
+    if (n < 0 || (uint32_t)n >= out_len) {
+        return n;
+    }
+
+    n += snprintf(out + n, out_len - (uint32_t)n,
+                  "lcdc=%02X ly=%02X bgp=%u,%u,%u,%u halt=%d ime=%d blank=%d\n",
+                  (unsigned)gb->hram_io[IO_LCDC], (unsigned)gb->hram_io[IO_LY],
+                  (unsigned)gb->display.bg_palette[0],
+                  (unsigned)gb->display.bg_palette[1],
+                  (unsigned)gb->display.bg_palette[2],
+                  (unsigned)gb->display.bg_palette[3],
+                  gb->gb_halt ? 1 : 0, gb->gb_ime ? 1 : 0,
+                  gb->lcd_blank ? 1 : 0);
+
+    if (n < 0 || (uint32_t)n >= out_len) {
+        return n;
+    }
+
+    n += snprintf(out + n, out_len - (uint32_t)n,
+                  "vram=%d/%d sum=%u mbc=%d bank=%u rambank=%u ramblk=%u mbc3O=%d\n",
+                  nonzero, (int)VRAM_SIZE, (unsigned)vram_sum,
+                  (int)gb->mbc, (unsigned)gb->selected_rom_bank,
+                  (unsigned)gb->cart_ram_bank, (unsigned)gb->num_ram_banks,
+                  gb->cart_is_mbc3O ? 1 : 0);
+
+    if (n < 0 || (uint32_t)n >= out_len) {
+        return n;
+    }
+
+    n += snprintf(out + n, out_len - (uint32_t)n,
+                  "logo=%s ramcode=%02X err=%u last=%d@%04X",
+                  logo_ok ? "ok" : "BAD",
+                  (unsigned)gb_rom_read(gb, 0x0149u),
+                  (unsigned)s_err_count, s_err_last, (unsigned)s_err_addr);
+
+    return n;
+}
+
+int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len)
+{
+    struct gb_s *gb;
+    uint32_t off = 0;
+
+    if (s_priv == NULL || out == NULL || out_len < 16) {
+        return -1;
+    }
+
+    if (len == 0 || len > 256) {
+        len = 64;
+    }
+
+    gb = &s_priv->gb;
+
+    for (uint32_t i = 0; i < len && off + 4 < out_len; i++) {
+        off += (uint32_t)snprintf(out + off, out_len - off, "%02X ",
+                                  (unsigned)__gb_read(gb, (uint16_t)((addr + i) & 0xFFFF)));
+        if (((addr + i) & 0x0F) == 0x0F && off + 12 < out_len) {
+            off += (uint32_t)snprintf(out + off, out_len - off, "\n");
+        }
+    }
+
+    return (int)off;
 }
