@@ -110,6 +110,7 @@ int arcade_ui_init(void)
 {
     lisa_device_t *display;
 
+    LISA_LOGI(TAG, "lv_init");
     lv_init();
 
     display = lisa_device_get("display");
@@ -118,9 +119,14 @@ int arcade_ui_init(void)
         return -1;
     }
 
-    lisa_display_blanking_on(display);
-
+    /* 必须先 lv_port_disp_init() 再 blanking_on()：面板是在 port init 里才
+     * attach 上的，提前调用 blanking_on() 会解引用空的 priv->panel 直接 Load
+     * access fault（与 apps-ui/portable/arcs/lisa_ui_lvgl.c 里顺序一致）。 */
+    LISA_LOGI(TAG, "lv_port_disp_init");
     lv_port_disp_init(display);
+    LISA_LOGI(TAG, "lv_port_disp_init done");
+
+    lisa_display_blanking_on(display);
 
     lv_obj_t *root = lv_obj_create(NULL);
     screen_style(root);

@@ -17,6 +17,7 @@
 #include "lisa_log.h"
 #include "shell.h"
 #include "cmd/cmd.h"
+#include "sys_init.h"
 
 #include "voice_msg.h"
 #include "service_button.h"
@@ -57,6 +58,18 @@ static TickType_t s_fps_tick;
 static uint32_t s_fps_x10;
 
 extern int boot_watchdog_feed(void);
+
+/*
+ * 启动探针：平台的 voice_platform_init() 在 PRE_APPLICATION/60 才打印第一行日志，
+ * 如果在这之前就死了，串口是完全没有输出的。这里在 PRE_APPLICATION/1 打一条，
+ * 把“死在设备驱动层”和“死在应用层”区分开。
+ */
+static int arcade_boot_probe(void)
+{
+    LISA_LOGI(TAG, "boot probe: pre-application reached");
+    return 0;
+}
+SYS_INIT(arcade_boot_probe, SYS_INIT_LEVEL_PRE_APPLICATION, 1);
 
 /* ------------- 按键 ------------- */
 
@@ -254,21 +267,27 @@ static void arcade_task(void *arg)
 {
     (void)arg;
 
+    LISA_LOGI(TAG, "task started");
+
     if (arcade_video_init() != 0) {
         LISA_LOGE(TAG, "video init failed");
     }
+    LISA_LOGI(TAG, "video ready");
 
     if (arcade_ui_init() != 0) {
         LISA_LOGE(TAG, "ui init failed");
     }
+    LISA_LOGI(TAG, "ui ready");
 
     arcade_ui_show_list();
     arcade_ui_list_set_hint("正在读取 TF 卡…");
     arcade_ui_list_refresh(0);
     lv_task_handler();
 
+    LISA_LOGI(TAG, "scanning ROMs");
     arcade_rom_scan();
     arcade_ui_list_refresh(s_sel);
+    LISA_LOGI(TAG, "list ready, %d ROM(s)", arcade_rom_count());
 
     for (;;) {
         TickType_t start = xTaskGetTickCount();
@@ -320,22 +339,34 @@ int arcade_app_main(void)
 {
     BaseType_t ret;
 
+    LISA_LOGI(TAG, "app main entered");
+
     /* main.c 提前返回，语音助手的初始化链路不会跑，按键需要自己拉起 */
     if (service_button_init() != 0) {
         LISA_LOGW(TAG, "button init failed");
     }
+    LISA_LOGI(TAG, "button ready");
 
     voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, arcade_button_cb, NULL);
 
     ret = xTaskCreate(arcade_task, "arcade", ARCADE_TASK_STACK, NULL, ARCADE_TASK_PRIORITY, NULL);
     if (ret != pdPASS) {
         LISA_LOGE(TAG, "create arcade task failed");
-        return -1;
+        /* 任务起不来也不能直接 return：返回会让 main 任务退出，系统静默变砖。
+         * 这里保持看守狗并继续报活，至少串口能看出卡在哪一步。 */
+    } else {
+        LISA_LOGI(TAG, "arcade task created");
     }
+
+    uint32_t ticks = 0;
 
     for (;;) {
         boot_watchdog_feed();
         vTaskDelay(pdMS_TO_TICKS(200));
+
+        if (++ticks % 25 == 0) {
+            LISA_LOGI(TAG, "alive (main loop), mode=%d roms=%d", (int)s_mode, arcade_rom_count());
+        }
     }
 
     return 0;

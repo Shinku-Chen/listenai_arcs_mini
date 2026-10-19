@@ -261,6 +261,7 @@ int main(int argc, char **argv)
      * 复古模拟器固件：语音助手链路不启动，直接把主循环交给模拟器。
      * 平台层（SYS_INIT）已完成显示、TF 卡、WiFi/BLE 初始化。
      */
+    LISA_LOGI(TAG, "arcade: main() entered");
     (void)argc;
     (void)argv;
     return arcade_app_main();
