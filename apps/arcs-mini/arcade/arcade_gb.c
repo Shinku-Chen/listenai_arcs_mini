@@ -3,10 +3,18 @@
  *
  * peanut_gb.h 是单头文件实现，只在这一个编译单元里 include，
  * 避免重复定义 gb_init()/gb_run_frame()。
+ *
+ * ROM 不整份读进 PSRAM：CP 侧 PSRAM 堆放不下 2MB 的商业 ROM，而本平台的
+ * exram_malloc() 一旦失败会走 sysheap.c 里的 CRASH_ON_ALLOC_FAIL 路径直接
+ * trap（整机死机，屏幕冻结、adb shell 也挂住）。所以改成「按 16KB 银行从
+ * TF 卡按需读 + LRU 缓存」：Peanut-GB 只通过 gb_rom_read() 回调取 ROM，且
+ * 传进来的是文件内绝对偏移，天然适合流式实现；RAM 占用固定几十 KB，
+ * 卡上 2MB / 4MB / 8MB 的 ROM 都能跑。
  */
 #include <string.h>
 #include <stdlib.h>
 
+#include "esp_heap_caps.h"
 #include "sysheap.h"
 #include "lisa_log.h"
 #include "lsfs.h"
@@ -21,38 +29,221 @@
 
 #define TAG "arcade-gb"
 
-/* GB ROM 上限：PSRAM 足够容纳常见商业 ROM，超过就拒绝加载 */
-#define ARCADE_ROM_MAX_BYTES (8U * 1024U * 1024U)
+/* GB/GBC 卡带按 16KB 分银行，Peanut-GB 的 gb_rom_read() 收到的是绝对偏移 */
+#define ROM_BANK_BYTES        (16U * 1024U)
+#define ROM_CACHE_SLOTS_MAX  8
+#define ROM_SIZE_LIMIT       (8U * 1024U * 1024U)
+#define ROM_BANK_INVALID     0xFFFFFFFFU
+
 #define ARCADE_CART_RAM_DEFAULT (32U * 1024U)
 
+/* PSRAM 分配失败会被系统直接 trap，所以每次分配前先确认余量：
+ * 宁可让模拟器优雅报错，也不能把整机打死。 */
+#define PSRAM_ALLOC_MARGIN (96U * 1024U)
+
+struct rom_cache {
+    uint8_t *data;
+    int slots;
+    uint32_t bank[ROM_CACHE_SLOTS_MAX];
+    uint32_t stamp[ROM_CACHE_SLOTS_MAX];
+    uint32_t tick;
+};
+
 struct arcade_gb_priv {
-    uint8_t *rom;
+    /* 卡上的 ROM：文件一直开着，按银行读 */
+    uint32_t rom_file_size;
+    /* ROM 大小向上取整到 2 的幂，越界读的掩码回卷才安全 */
     uint32_t rom_size;
+    /* 内置演示 ROM：从 flash 拷一份到 PSRAM（只有几十 KB） */
+    uint8_t *rom_mem;
+    struct rom_cache cache;
     uint8_t *cart_ram;
     uint32_t cart_ram_size;
+    bool read_err_logged;
     struct gb_s gb;
 };
+
+/*
+ * FATFS/VFS 的结构体不放 PSRAM（本平台上 lsfs 的元数据必须落在内部 SRAM），
+ * 而且同一时刻只会开一个 ROM，所以文件句柄用静态变量。
+ */
+static struct lsfs_file_t s_rom_file;
+static bool s_rom_file_open;
 
 static struct arcade_gb_priv *s_priv;
 static bool s_running;
 static bool s_error_logged;
 
+/* ---------------- PSRAM 分配（带余量检查） ---------------- */
+
+static size_t psram_free_bytes(void)
+{
+    return heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+}
+
+static void *psram_alloc(size_t size, const char *what)
+{
+    size_t free_bytes = psram_free_bytes();
+    void *ptr;
+
+    if (free_bytes < size + PSRAM_ALLOC_MARGIN) {
+        LISA_LOGE(TAG, "%s: need %u B, psram free only %u B",
+                  what, (unsigned)size, (unsigned)free_bytes);
+        return NULL;
+    }
+
+    ptr = exram_malloc(4, size);
+
+    if (ptr == NULL) {
+        LISA_LOGE(TAG, "%s: alloc %u B failed", what, (unsigned)size);
+    }
+
+    return ptr;
+}
+
+/* ---------------- ROM 银行缓存 ---------------- */
+
+static void rom_cache_reset(struct rom_cache *c)
+{
+    for (int i = 0; i < ROM_CACHE_SLOTS_MAX; i++) {
+        c->bank[i] = ROM_BANK_INVALID;
+        c->stamp[i] = 0;
+    }
+    c->tick = 0;
+}
+
+static bool rom_cache_init(struct rom_cache *c)
+{
+    static const int k_slots[] = {ROM_CACHE_SLOTS_MAX, 4, 2, 1};
+
+    c->data = NULL;
+    c->slots = 0;
+    rom_cache_reset(c);
+
+    for (size_t i = 0; i < sizeof(k_slots) / sizeof(k_slots[0]); i++) {
+        size_t size = (size_t)k_slots[i] * ROM_BANK_BYTES;
+        uint8_t *buf = (uint8_t *)psram_alloc(size, "rom bank cache");
+
+        if (buf != NULL) {
+            c->data = buf;
+            c->slots = k_slots[i];
+            LISA_LOGI(TAG, "rom bank cache: %d x %u B", c->slots, (unsigned)ROM_BANK_BYTES);
+            return true;
+        }
+    }
+
+    LISA_LOGE(TAG, "no psram left for rom bank cache");
+    return false;
+}
+
+static void rom_bank_fill(struct arcade_gb_priv *p, uint8_t *dst, uint32_t bank_index)
+{
+    uint32_t off = bank_index * ROM_BANK_BYTES;
+    uint32_t len;
+    uint32_t done = 0;
+
+    /* 读不到的部分保持 0xFF，和真机未接线的表现接近，不打断模拟器 */
+    memset(dst, 0xFF, ROM_BANK_BYTES);
+
+    if (!s_rom_file_open || off >= p->rom_file_size) {
+        return;
+    }
+
+    len = p->rom_file_size - off;
+    if (len > ROM_BANK_BYTES) {
+        len = ROM_BANK_BYTES;
+    }
+
+    if (lsfs_seek(&s_rom_file, (off_t)off, LSFS_SEEK_SET) != 0) {
+        if (!p->read_err_logged) {
+            LISA_LOGW(TAG, "seek %u failed, ROM reads return 0xFF", (unsigned)off);
+            p->read_err_logged = true;
+        }
+        return;
+    }
+
+    while (done < len) {
+        ssize_t got = lsfs_read(&s_rom_file, dst + done, len - done);
+
+        if (got <= 0) {
+            if (!p->read_err_logged) {
+                LISA_LOGW(TAG, "short ROM read at %u (%u/%u), rest filled with 0xFF",
+                          (unsigned)off, (unsigned)done, (unsigned)len);
+                p->read_err_logged = true;
+            }
+            break;
+        }
+
+        done += (uint32_t)got;
+    }
+}
+
+/* 取 bank_index 对应的 16KB 缓冲（未命中就从卡上读进来） */
+static uint8_t *rom_cache_bank(struct arcade_gb_priv *p, uint32_t bank_index)
+{
+    struct rom_cache *c = &p->cache;
+    int slot = -1;
+    uint8_t *buf;
+
+    for (int i = 0; i < c->slots; i++) {
+        if (c->bank[i] == bank_index) {
+            c->stamp[i] = ++c->tick;
+            return c->data + (size_t)i * ROM_BANK_BYTES;
+        }
+    }
+
+    /* 先找空槽，没有就按 LRU 淘汰 */
+    for (int i = 0; i < c->slots; i++) {
+        if (c->bank[i] == ROM_BANK_INVALID) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < c->slots; i++) {
+            if (c->stamp[i] < c->stamp[slot]) {
+                slot = i;
+            }
+        }
+    }
+
+    buf = c->data + (size_t)slot * ROM_BANK_BYTES;
+    rom_bank_fill(p, buf, bank_index);
+    c->bank[slot] = bank_index;
+    c->stamp[slot] = ++c->tick;
+
+    return buf;
+}
+
 /* ---------------- Peanut-GB 前端回调 ---------------- */
 
 static uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr)
 {
-    const struct arcade_gb_priv *p = (const struct arcade_gb_priv *)gb->direct.priv;
+    struct arcade_gb_priv *p = (struct arcade_gb_priv *)gb->direct.priv;
+    uint32_t a = (uint32_t)addr;
+    const uint8_t *bank;
 
-    if (p->rom == NULL || p->rom_size == 0) {
+    if (p == NULL || p->rom_size == 0) {
         return 0xFF;
     }
 
-    if (addr < p->rom_size) {
-        return p->rom[addr];
+    /* 越界读按 ROM 大小回卷，和真机未接线的数据线表现接近 */
+    if (a >= p->rom_size) {
+        a &= (p->rom_size - 1);
     }
 
-    /* 越界读按 16KB 银行回卷，和真机未接线的数据线表现接近 */
-    return p->rom[addr & (p->rom_size - 1)];
+    if (p->rom_mem != NULL) {
+        return p->rom_mem[a];
+    }
+
+    bank = rom_cache_bank(p, a / ROM_BANK_BYTES);
+    if (bank == NULL) {
+        return 0xFF;
+    }
+
+    return bank[a & (ROM_BANK_BYTES - 1)];
 }
 
 static uint8_t gb_cart_ram_read(struct gb_s *gb, const uint_fast32_t addr)
@@ -96,93 +287,114 @@ static void gb_lcd_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8
     arcade_video_draw_line((int)line, pixels);
 }
 
-/* ---------------- 对外接口 ---------------- */
+/* ---------------- ROM 打开 / 关闭 ---------------- */
 
-static uint8_t *rom_load(const char *path, uint32_t *size_out)
+static void rom_close(void)
 {
-    struct lsfs_file_t file;
-    uint8_t *buf = NULL;
-    off_t size;
-
-    if (strcmp(path, "@demo") == 0) {
-        /* 内置演示 ROM：直接从 flash 拷贝到 PSRAM */
-        uint32_t padded = 32U * 1024U;
-
-        if (arcade_demo_rom_size == 0) {
-            LISA_LOGE(TAG, "built-in demo ROM is empty");
-            return NULL;
-        }
-
-        while (padded < arcade_demo_rom_size && padded < ARCADE_ROM_MAX_BYTES) {
-            padded <<= 1;
-        }
-
-        buf = (uint8_t *)exram_malloc(4, padded);
-        if (buf == NULL) {
-            LISA_LOGE(TAG, "demo ROM alloc %u failed", (unsigned)padded);
-            return NULL;
-        }
-
-        memset(buf, 0xFF, padded);
-        memcpy(buf, arcade_demo_rom, arcade_demo_rom_size);
-        *size_out = padded;
-        return buf;
+    if (s_rom_file_open) {
+        lsfs_close(&s_rom_file);
+        lsfs_file_t_init(&s_rom_file);
+        s_rom_file_open = false;
     }
+}
 
-    lsfs_file_t_init(&file);
-    if (lsfs_open(&file, path, LSFS_O_READ) != 0) {
-        LISA_LOGE(TAG, "open %s failed", path);
-        return NULL;
-    }
-
-    size = lsfs_lsize(&file);
-    if (size <= 0 || (uint32_t)size > ARCADE_ROM_MAX_BYTES) {
-        LISA_LOGE(TAG, "%s size %ld out of range", path, (long)size);
-        lsfs_close(&file);
-        return NULL;
-    }
-
-    /* ROM 大小取到下一个 2 的幂，gb_rom_read() 的掩码回卷才安全 */
+/* ROM 大小向上取整到 2 的幂（最小 32KB），gb_rom_read() 的掩码回卷才安全 */
+static uint32_t rom_padded_size(uint32_t size)
+{
     uint32_t padded = 32U * 1024U;
-    while (padded < (uint32_t)size && padded < ARCADE_ROM_MAX_BYTES) {
+
+    while (padded < size && padded < ROM_SIZE_LIMIT) {
         padded <<= 1;
     }
 
-    buf = (uint8_t *)exram_malloc(4, padded);
-    if (buf == NULL) {
-        LISA_LOGE(TAG, "ROM alloc %u failed", (unsigned)padded);
-        lsfs_close(&file);
-        return NULL;
-    }
-    memset(buf, 0xFF, padded);
-
-    ssize_t got = lsfs_read(&file, buf, (size_t)size);
-    lsfs_close(&file);
-
-    if (got != (ssize_t)size) {
-        LISA_LOGE(TAG, "short read %d/%u", (int)got, (unsigned)size);
-        exram_free(buf);
-        return NULL;
-    }
-
-    *size_out = padded;
-    return buf;
+    return padded;
 }
+
+static bool rom_open_demo(struct arcade_gb_priv *p)
+{
+    uint32_t padded;
+    uint8_t *buf;
+
+    if (arcade_demo_rom_size == 0) {
+        LISA_LOGE(TAG, "built-in demo ROM is empty");
+        return false;
+    }
+
+    padded = rom_padded_size(arcade_demo_rom_size);
+    buf = (uint8_t *)psram_alloc(padded, "demo rom");
+    if (buf == NULL) {
+        return false;
+    }
+
+    memset(buf, 0xFF, padded);
+    memcpy(buf, arcade_demo_rom, arcade_demo_rom_size);
+
+    p->rom_mem = buf;
+    p->rom_size = padded;
+    return true;
+}
+
+static bool rom_open_file(struct arcade_gb_priv *p, const char *path)
+{
+    off_t size;
+
+    lsfs_file_t_init(&s_rom_file);
+
+    if (lsfs_open(&s_rom_file, path, LSFS_O_READ) != 0) {
+        LISA_LOGE(TAG, "open %s failed", path);
+        return false;
+    }
+
+    s_rom_file_open = true;
+
+    size = lsfs_lsize(&s_rom_file);
+    if (size <= 0 || (uint32_t)size > ROM_SIZE_LIMIT) {
+        LISA_LOGE(TAG, "%s size %ld out of range (max %u)", path, (long)size,
+                  (unsigned)ROM_SIZE_LIMIT);
+        rom_close();
+        return false;
+    }
+
+    p->rom_file_size = (uint32_t)size;
+    p->rom_size = rom_padded_size(p->rom_file_size);
+    return true;
+}
+
+/* ---------------- 对外接口 ---------------- */
 
 int arcade_gb_start(const char *path)
 {
     enum gb_init_error_e ret;
+    size_t free_bytes;
 
     arcade_gb_stop();
 
-    s_priv = (struct arcade_gb_priv *)exram_calloc(4, 1, sizeof(struct arcade_gb_priv));
-    if (s_priv == NULL) {
-        LISA_LOGE(TAG, "priv alloc %u failed", (unsigned)sizeof(struct arcade_gb_priv));
+    if (path == NULL) {
         return -1;
     }
 
-    s_priv->rom = rom_load(path, &s_priv->rom_size);
-    if (s_priv->rom == NULL) {
+    free_bytes = psram_free_bytes();
+    LISA_LOGI(TAG, "loading %s, psram free %u KB", path, (unsigned)(free_bytes / 1024));
+
+    s_priv = (struct arcade_gb_priv *)psram_alloc(sizeof(struct arcade_gb_priv), "gb priv");
+    if (s_priv == NULL) {
+        return -1;
+    }
+    memset(s_priv, 0, sizeof(*s_priv));
+
+    if (strcmp(path, "@demo") == 0) {
+        if (!rom_open_demo(s_priv)) {
+            arcade_gb_stop();
+            return -1;
+        }
+    } else {
+        if (!rom_open_file(s_priv, path)) {
+            arcade_gb_stop();
+            return -1;
+        }
+    }
+
+    if (!rom_cache_init(&s_priv->cache)) {
         arcade_gb_stop();
         return -1;
     }
@@ -191,12 +403,12 @@ int arcade_gb_start(const char *path)
     if (s_priv->cart_ram_size < ARCADE_CART_RAM_DEFAULT) {
         s_priv->cart_ram_size = ARCADE_CART_RAM_DEFAULT;
     }
-    s_priv->cart_ram = (uint8_t *)exram_calloc(4, 1, s_priv->cart_ram_size);
+    s_priv->cart_ram = (uint8_t *)psram_alloc(s_priv->cart_ram_size, "cart ram");
     if (s_priv->cart_ram == NULL) {
-        LISA_LOGE(TAG, "cart ram alloc %u failed", (unsigned)s_priv->cart_ram_size);
         arcade_gb_stop();
         return -1;
     }
+    memset(s_priv->cart_ram, 0, s_priv->cart_ram_size);
 
     /* 先读回已有存档，再让 gb_init() 把 MBC 指向这块 RAM */
     arcade_save_attach(path, s_priv->cart_ram, s_priv->cart_ram_size);
@@ -217,9 +429,10 @@ int arcade_gb_start(const char *path)
     s_priv->gb.direct.joypad = 0;
 
     s_running = true;
-    LISA_LOGI(TAG, "GB started: %s, rom %u bytes, mbc %d, save %u bytes",
-              path, (unsigned)s_priv->rom_size, (int)s_priv->gb.mbc,
-              (unsigned)s_priv->cart_ram_size);
+    LISA_LOGI(TAG, "GB started: %s, rom %u bytes (%u B on card), mbc %d, save %u bytes",
+              path, (unsigned)s_priv->rom_size,
+              (unsigned)(s_priv->rom_mem != NULL ? 0 : s_priv->rom_file_size),
+              (int)s_priv->gb.mbc, (unsigned)s_priv->cart_ram_size);
 
     return 0;
 }
@@ -229,6 +442,7 @@ void arcade_gb_stop(void)
     s_running = false;
 
     if (s_priv == NULL) {
+        rom_close();
         return;
     }
 
@@ -236,12 +450,21 @@ void arcade_gb_stop(void)
     (void)arcade_save_flush();
     arcade_save_detach();
 
-    if (s_priv->rom != NULL) {
-        exram_free(s_priv->rom);
+    rom_close();
+
+    if (s_priv->cache.data != NULL) {
+        exram_free(s_priv->cache.data);
+        s_priv->cache.data = NULL;
+    }
+    if (s_priv->rom_mem != NULL) {
+        exram_free(s_priv->rom_mem);
+        s_priv->rom_mem = NULL;
     }
     if (s_priv->cart_ram != NULL) {
         exram_free(s_priv->cart_ram);
+        s_priv->cart_ram = NULL;
     }
+
     exram_free(s_priv);
     s_priv = NULL;
 }

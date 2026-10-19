@@ -32,6 +32,7 @@
 #include "arcade_video.h"
 
 #include "lsfs.h"
+#include "esp_heap_caps.h"
 
 #define TAG "arcade"
 
@@ -445,6 +446,8 @@ static int cmd_stat(int argc, char **argv)
     shellPrint(shell, "save=%s dirty=%d\r\n",
                arcade_save_path() != NULL ? arcade_save_path() : "-",
                arcade_save_pending() ? 1 : 0);
+    shellPrint(shell, "psram_free=%u KB\r\n",
+               (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     return 0;
 }
 

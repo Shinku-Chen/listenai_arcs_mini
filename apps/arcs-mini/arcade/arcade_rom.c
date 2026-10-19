@@ -1,18 +1,24 @@
 /*
- * TF 卡 ROM 目录扫描。
+ * TF 卡 ROM 列表。
  *
- * 挂载由 platform.c 在启动时完成；如果启动时没插卡，这里会重新探测并挂载。
+ * 注意：本平台 VFS 的目录遍历（lsfs_opendir + lsfs_readdir）在卡根目录上
+ * 并不可靠（会卡死在 readdir 上，整机冻结），所以这里不做目录遍历，改成
+ * 「按固定候选路径逐个 fopen 探测」：只要文件放在下面任一候选目录、且文件名
+ * 在候选名单里，就能出现在列表里。
+ *
+ *   目录：/SD:/roms/ 、/SD:/
+ *   名单：pock.gbc / pock.gb / pokemon.gbc / pokemon.gb
+ *         game.gbc / game.gb / rom.gbc / rom.gb
+ *
+ * 探测只用 lsfs_open + lsfs_lsize（这条链路已被 `arcade fs` 自检证明稳定）。
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <ctype.h>
 
 #include "sysheap.h"
 #include "lisa_log.h"
-#include "lisa_device.h"
-#include "lisa_sdmmc.h"
 #include "lsfs.h"
 
 #include "arcade_rom.h"
@@ -25,9 +31,8 @@
 #define ROM_NAME_LEN   64
 #define ROM_PATH_LEN   128
 
-/* 只展开一层子目录（ROM 目录下的第一级子目录），再多扫卡时间不可控 */
-#define ROM_SUBDIR_DEPTH 1
-#define ROM_SUBDIR_MAX   8
+/* GB/GBC 卡带最大 8MB，超过这个尺寸肯定不是 ROM，当作探测失败 */
+#define ROM_SIZE_LIMIT (8U * 1024U * 1024U)
 
 /* 内置演示 ROM 的虚拟路径，arcade_gb.c 看到它就改用内嵌数据 */
 #define ROM_DEMO_PATH  "@demo"
@@ -38,91 +43,79 @@ struct arcade_rom_entry {
     uint32_t size;
 };
 
-extern struct lsfs_mount_t *platform_sd_mount_get(void);
-
 static struct arcade_rom_entry *s_roms;
 static int s_count = -1; /* -1 表示还没扫描过 */
-static bool s_dir_missing_logged;
 
-static void sdmmc_reset(void)
+/* 候选目录（顺序即列表顺序） */
+static const char *const k_rom_dirs[] = {
+    "/SD:/roms/",
+    "/SD:/",
+};
+
+/* 候选文件名 */
+static const char *const k_rom_names[] = {
+    "pock.gbc",
+    "pock.gb",
+    "pokemon.gbc",
+    "pokemon.gb",
+    "game.gbc",
+    "game.gb",
+    "rom.gbc",
+    "rom.gb",
+};
+
+static bool rom_probe_path(const char *path, uint32_t *size_out)
 {
-    lisa_device_t *dev = lisa_device_get("sdmmc0");
+    struct lsfs_file_t file;
+    off_t size;
 
-    if (dev == NULL || dev->priv_data == NULL) {
-        return;
-    }
-
-    /* lisa_sdmmc_probe() 有 initialized 快速路径，卡拔出重插时必须清零才能重新初始化 */
-    struct sdmmc_priv_layout {
-        void *mutex;
-        bool initialized;
-    };
-    struct sdmmc_priv_layout *priv = (struct sdmmc_priv_layout *)dev->priv_data;
-    priv->initialized = false;
-}
-
-static bool rom_dir_accessible(void)
-{
-    struct lsfs_dir_t dir;
-
-    lsfs_dir_t_init(&dir);
-    if (lsfs_opendir(&dir, ROM_DIR) != 0) {
+    lsfs_file_t_init(&file);
+    if (lsfs_open(&file, path, LSFS_O_READ) != 0) {
         return false;
     }
 
-    lsfs_closedir(&dir);
+    size = lsfs_lsize(&file);
+    lsfs_close(&file);
+
+    if (size <= 0 || (uint32_t)size > ROM_SIZE_LIMIT) {
+        return false;
+    }
+
+    *size_out = (uint32_t)size;
     return true;
 }
 
-static bool rom_dir_mount(void)
+static bool rom_collect(void)
 {
-    lisa_device_t *dev;
-    struct lsfs_mount_t *mp;
+    int count = 0;
 
-    if (rom_dir_accessible()) {
-        return true;
+    for (size_t d = 0; d < sizeof(k_rom_dirs) / sizeof(k_rom_dirs[0]); d++) {
+        for (size_t n = 0; n < sizeof(k_rom_names) / sizeof(k_rom_names[0]); n++) {
+            char path[ROM_PATH_LEN];
+            uint32_t size = 0;
+
+            if (count >= ROM_MAX) {
+                break;
+            }
+
+            snprintf(path, sizeof(path), "%s%s", k_rom_dirs[d], k_rom_names[n]);
+
+            if (!rom_probe_path(path, &size)) {
+                continue;
+            }
+
+            struct arcade_rom_entry *slot = &s_roms[count];
+
+            memset(slot, 0, sizeof(*slot));
+            snprintf(slot->name, ROM_NAME_LEN, "%s", k_rom_names[n]);
+            snprintf(slot->path, ROM_PATH_LEN, "%s", path);
+            slot->size = size;
+            count++;
+        }
     }
 
-    sdmmc_reset();
-
-    dev = lisa_device_get("sdmmc0");
-    if (dev == NULL) {
-        LISA_LOGE(TAG, "sdmmc0 device not found");
-        return false;
-    }
-
-    if (lisa_sdmmc_probe(dev) != 0) {
-        LISA_LOGW(TAG, "sdmmc probe failed, TF card missing?");
-        return false;
-    }
-
-    mp = platform_sd_mount_get();
-    if (mp == NULL) {
-        LISA_LOGE(TAG, "no SD mount point");
-        return false;
-    }
-
-    if (lsfs_mount(mp) != 0) {
-        LISA_LOGW(TAG, "mount %s failed", mp->mnt_point);
-        return false;
-    }
-
-    return rom_dir_accessible();
-}
-
-static bool rom_extension_supported(const char *name)
-{
-    const char *dot = strrchr(name, '.');
-
-    if (dot == NULL) {
-        return false;
-    }
-
-    if (strcasecmp(dot, ".gb") == 0 || strcasecmp(dot, ".gbc") == 0) {
-        return true;
-    }
-
-    return false;
+    s_count = count;
+    return true;
 }
 
 static void rom_entries_free(void)
@@ -132,96 +125,6 @@ static void rom_entries_free(void)
         s_roms = NULL;
     }
     s_count = -1;
-}
-
-static bool rom_collect_dir(const char *dir_path, const char *prefix, int *count, int depth)
-{
-    struct lsfs_dir_t dir;
-    struct lsfs_dirent *entry;
-    char subdirs[ROM_SUBDIR_MAX][ROM_NAME_LEN];
-    int subdir_count = 0;
-
-    entry = (struct lsfs_dirent *)exram_malloc(4, sizeof(struct lsfs_dirent));
-    if (entry == NULL) {
-        LISA_LOGE(TAG, "dirent alloc failed");
-        return false;
-    }
-
-    lsfs_dir_t_init(&dir);
-    if (lsfs_opendir(&dir, dir_path) != 0) {
-        exram_free(entry);
-        return false;
-    }
-
-    while (*count < ROM_MAX && lsfs_readdir(&dir, entry) == 0) {
-        if (entry->name[0] == '\0' || entry->name[0] == (char)0xE5) {
-            break;
-        }
-
-        /* 跳过 FAT 里的隐藏/系统项和 macOS 留下的 ._xxx */
-        if (entry->name[0] == '.') {
-            continue;
-        }
-
-        if (entry->type == LSFS_DIR_ENTRY_DIR) {
-            if (depth < ROM_SUBDIR_DEPTH && subdir_count < ROM_SUBDIR_MAX) {
-                memset(subdirs[subdir_count], 0, ROM_NAME_LEN);
-                strncpy(subdirs[subdir_count], entry->name, ROM_NAME_LEN - 1);
-                subdir_count++;
-            }
-            continue;
-        }
-
-        if (!rom_extension_supported(entry->name)) {
-            continue;
-        }
-
-        struct arcade_rom_entry *slot = &s_roms[*count];
-        memset(slot, 0, sizeof(*slot));
-        snprintf(slot->name, ROM_NAME_LEN, "%s%s", prefix, entry->name);
-        snprintf(slot->path, ROM_PATH_LEN, "%s/%s", dir_path, entry->name);
-        slot->size = (uint32_t)entry->size;
-        (*count)++;
-    }
-
-    lsfs_closedir(&dir);
-    exram_free(entry);
-
-    /* 子目录放到父目录的文件之后，保持「先根目录、后子目录」的直观顺序 */
-    for (int i = 0; i < subdir_count && *count < ROM_MAX; i++) {
-        char sub_path[ROM_PATH_LEN];
-        char sub_prefix[ROM_NAME_LEN];
-
-        snprintf(sub_path, sizeof(sub_path), "%s/%s", dir_path, subdirs[i]);
-        snprintf(sub_prefix, sizeof(sub_prefix), "%s%s/", prefix, subdirs[i]);
-
-        (void)rom_collect_dir(sub_path, sub_prefix, count, depth + 1);
-    }
-
-    return true;
-}
-
-static bool rom_collect(void)
-{
-    int count = 0;
-
-    if (!rom_collect_dir(ROM_DIR, "", &count, 0)) {
-        return false;
-    }
-
-    /* 按文件名做一次插入排序，卡里的顺序通常不可控 */
-    for (int i = 1; i < count; i++) {
-        struct arcade_rom_entry key = s_roms[i];
-        int j = i - 1;
-        while (j >= 0 && strcasecmp(s_roms[j].name, key.name) > 0) {
-            s_roms[j + 1] = s_roms[j];
-            j--;
-        }
-        s_roms[j + 1] = key;
-    }
-
-    s_count = count;
-    return true;
 }
 
 static bool rom_ensure_table(void)
@@ -271,13 +174,8 @@ int arcade_rom_scan(void)
         return s_count;
     }
 
-    if (!rom_dir_mount()) {
-        if (!s_dir_missing_logged) {
-            LISA_LOGW(TAG, "%s not accessible (no TF card or empty card)", ROM_DIR);
-            s_dir_missing_logged = true;
-        }
+    if (!rom_ensure_table()) {
         s_count = 0;
-        rom_add_demo_if_empty();
         return s_count;
     }
 
@@ -289,9 +187,10 @@ int arcade_rom_scan(void)
 
     rom_add_demo_if_empty();
 
-    LISA_LOGI(TAG, "found %d ROM(s) in %s", s_count, ROM_DIR);
+    LISA_LOGI(TAG, "found %d ROM(s) (probe dirs %s, %s)", s_count,
+              k_rom_dirs[0], k_rom_dirs[1]);
     for (int i = 0; i < s_count; i++) {
-        LISA_LOGI(TAG, "  [%02d] %s (%u bytes)", i, s_roms[i].name, (unsigned)s_roms[i].size);
+        LISA_LOGI(TAG, "  [%02d] %s (%u bytes)", i, s_roms[i].path, (unsigned)s_roms[i].size);
     }
 
     return s_count;
@@ -337,5 +236,4 @@ bool arcade_rom_scanned(void)
 void arcade_rom_invalidate(void)
 {
     rom_entries_free();
-    s_dir_missing_logged = false;
 }
