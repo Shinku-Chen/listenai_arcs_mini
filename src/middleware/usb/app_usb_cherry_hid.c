@@ -32,6 +32,37 @@ __attribute__((weak)) void app_usb_hid_mouse_left_click_from_isr(void)
 {
 }
 
+/**
+ * 标准 boot keyboard 报告（8 字节：修饰键位图 + 保留 + 6 个按键码）已解析好，
+ * 由应用层实现。未实现时链接到下面的弱符号，不影响鼠标功能。
+ */
+__attribute__((weak)) void app_usb_hid_keyboard_report(const uint8_t *keys)
+{
+    (void)keys;
+}
+
+/**
+ * 把任意长度的 HID 输入报告规范成 8 字节 boot keyboard 报告。
+ *
+ * 大部分键盘使用 [modifier, reserved, k1..k6]，带 Report ID 的键盘会多出
+ * 一个前导字节，这里用长度判断跳过它。
+ */
+static void app_usb_hid_handle_keyboard_report(const uint8_t *report, int nbytes)
+{
+    static const uint8_t empty[8] = {0};
+
+    if (nbytes < 8) {
+        app_usb_hid_keyboard_report(empty);
+        return;
+    }
+
+    if (nbytes > 8) {
+        report += (nbytes - 8);
+    }
+
+    app_usb_hid_keyboard_report(report);
+}
+
 static const char *app_usb_hid_protocol_name(uint8_t protocol)
 {
     switch (protocol) {
@@ -122,7 +153,11 @@ static void app_usb_hid_report_callback(void *arg, int nbytes)
                                        i + 1 == nbytes ? "" : " ");
         }
         LISA_LOGD(TAG, "/dev/input%u report (%d): %s", minor, nbytes, report);
-        app_usb_hid_handle_mouse_report(hid, nbytes);
+        if (hid->protocol == HID_PROTOCOL_KEYBOARD) {
+            app_usb_hid_handle_keyboard_report(s_hid_report[minor], nbytes);
+        } else {
+            app_usb_hid_handle_mouse_report(hid, nbytes);
+        }
     } else if (nbytes != -USB_ERR_NAK) {
         LISA_LOGE(TAG, "/dev/input%u transfer failed: %d", minor, nbytes);
         s_hid_active[minor] = false;
