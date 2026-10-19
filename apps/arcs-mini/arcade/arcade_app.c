@@ -21,6 +21,7 @@
 
 #include "voice_msg.h"
 #include "service_button.h"
+#include "service_brightness.h"
 
 #include "arcade_app.h"
 #include "arcade_core.h"
@@ -346,6 +347,17 @@ int arcade_app_main(void)
         LISA_LOGW(TAG, "button init failed");
     }
     LISA_LOGI(TAG, "button ready");
+
+    /*
+     * 必须自己拉起显示服务：面板（st7789p3）的 bus 是在
+     * service_brightness_init() 里 attach 的，不跑这一步 display 的 priv->panel
+     * 一直是 NULL，后面的 lv_port_disp_init() / blanking_on() 会直接解引用空
+     * 指针（Load access fault, MTVAL = NULL + offset）。
+     * 语音助手固件里这一步在 main.c 的 service_brightness_init()，模拟器分支
+     * 提前 return 了，所以得在这里补上。
+     */
+    service_brightness_init();
+    LISA_LOGI(TAG, "display service ready");
 
     voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, arcade_button_cb, NULL);
 
