@@ -24,6 +24,7 @@
 #include "service_brightness.h"
 
 #include "arcade_app.h"
+#include "arcade_audio.h"
 #include "arcade_core.h"
 #include "arcade_gb.h"
 #include "arcade_input.h"
@@ -231,6 +232,9 @@ static void arcade_start_selected(void)
     arcade_ui_player_invalidate();
     lv_task_handler();
 
+    /* 进入游戏才开始出声（列表页保持静音） */
+    arcade_audio_set_active(true);
+
     s_mode = ARCADE_MODE_PLAY;
     s_frames = 0;
     s_fps_tick = xTaskGetTickCount();
@@ -239,6 +243,7 @@ static void arcade_start_selected(void)
 
 static void arcade_stop_game(void)
 {
+    arcade_audio_set_active(false);
     arcade_core_stop();
     arcade_show_list();
 }
@@ -398,6 +403,13 @@ static void arcade_task(void *arg)
         LISA_LOGE(TAG, "ui init failed");
     }
     LISA_LOGI(TAG, "ui ready");
+
+    /* 音频链路（binjgb APU → DAC）：失败也只降级成静音，不影响玩游戏 */
+    if (arcade_audio_init() != 0) {
+        LISA_LOGW(TAG, "audio init failed, running silent");
+    } else {
+        LISA_LOGI(TAG, "audio ready");
+    }
 
     arcade_ui_show_list();
     arcade_ui_list_set_hint("正在读取 TF 卡…");
@@ -1039,7 +1051,6 @@ static int cmd_shot(int argc, char **argv)
     Shell *shell = shellGetCurrent();
     lv_color_t *fb = arcade_video_get_fb();
     static const char k_ch[4] = {' ', '.', ':', '#'};
-    uint16_t pal[4];
     char line[96];
 
     (void)argc;
@@ -1050,10 +1061,6 @@ static int cmd_shot(int argc, char **argv)
         return 0;
     }
 
-    for (int i = 0; i < 4; i++) {
-        pal[i] = arcade_video_palette_raw(i);
-    }
-
     for (int row = 0; row < 36; row++) {
         int off = 0;
         int y0 = row * (ARCADE_FB_HEIGHT / 36);
@@ -1062,26 +1069,29 @@ static int cmd_shot(int argc, char **argv)
         for (int col = 0; col < 80; col++) {
             int x0 = col * (ARCADE_FB_WIDTH / 80);
             int dx = ARCADE_FB_WIDTH / 80;
-            int bright = 0;
+            int lum = 0;
             int n = 0;
 
             for (int y = y0; y < y0 + dy; y++) {
                 for (int x = x0; x < x0 + dx; x++) {
                     uint16_t v = fb[y * ARCADE_FB_WIDTH + x].full;
-                    int idx = 3;
+                    /*
+                     * 不能只比对 DMG 四档颜色：CGB 游戏的配色全来自游戏自己，
+                     * 匹配不上就会整屏空白（之前就这样）。直接算亮度。
+                     */
+                    int r = (v >> 11) & 0x1F;
+                    int g = (v >> 5) & 0x3F;
+                    int b = v & 0x1F;
 
-                    for (int k = 0; k < 4; k++) {
-                        if (pal[k] == v) {
-                            idx = k;
-                            break;
-                        }
-                    }
-                    bright += 3 - idx; /* 0=最暗 3=最亮 */
+                    lum += (r * 30 + g * 59 + b * 11) / 100;
                     n++;
                 }
             }
 
-            line[off++] = k_ch[n ? bright / n : 0];
+            if (n > 0) {
+                lum /= n;   /* 0..63 */
+            }
+            line[off++] = k_ch[lum / 16];
         }
 
         line[off] = '\0';
@@ -1124,6 +1134,68 @@ static int cmd_pc(int argc, char **argv)
     return 0;
 }
 
+/* arcade audio：音频输出状态（peak 看波形，reset 清计数） */
+static int cmd_audio(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    char line[512];
+
+    (void)argc;
+
+    if (argc >= 1 && strcasecmp(argv[0], "reset") == 0) {
+        arcade_audio_reset_stats();
+        shellPrint(shell, "音频统计已清零\r\n");
+        return 0;
+    }
+
+    line[0] = '\0';
+    if (argc >= 1 && strcasecmp(argv[0], "peak") == 0) {
+        if (arcade_audio_peak_report(line, sizeof(line)) < 0) {
+            shellPrint(shell, "音频未初始化\r\n");
+            return 0;
+        }
+    } else if (arcade_audio_report(line, sizeof(line)) < 0) {
+        shellPrint(shell, "音频未初始化\r\n");
+        return 0;
+    }
+
+    for (char *p = line; p != NULL && *p != '\0';) {
+        char *nl = strchr(p, '\n');
+
+        if (nl != NULL) {
+            *nl = '\0';
+        }
+        shellPrint(shell, "%s\r\n", p);
+        p = (nl != NULL) ? nl + 1 : NULL;
+    }
+
+    return 0;
+}
+
+/* arcade vol <0-100>：调音量并保存到 KV */
+static int cmd_vol(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    int vol;
+
+    if (argc < 1) {
+        shellPrint(shell, "当前音量: %u%%（用法: arcade vol <0-100>）\r\n",
+                   (unsigned)arcade_audio_volume());
+        return 0;
+    }
+
+    vol = atoi(argv[0]);
+    if (vol < 0) {
+        vol = 0;
+    } else if (vol > 100) {
+        vol = 100;
+    }
+
+    arcade_audio_set_volume((uint32_t)vol);
+    shellPrint(shell, "音量: %d%%\r\n", vol);
+    return 0;
+}
+
 static const struct listen_cmd_t g_arcade_cmds[] = {
     {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
@@ -1141,6 +1213,8 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"pc", cmd_pc, "帧边界 PC/SP 直方图（判断 CPU 卡在哪个循环）"},
     {"shot", cmd_shot, "把当前帧缓冲打成 80x36 ASCII 图（看屏上到底是什么）"},
     {"peek", cmd_peek, "按 CPU 视角读内存：peek <hex地址> [长度]"},
+    {"audio", cmd_audio, "音频状态：audio [peak|reset]"},
+    {"vol", cmd_vol, "音量：vol <0-100>"},
 };
 
 static int cmd_arcade_help(Shell *shell)

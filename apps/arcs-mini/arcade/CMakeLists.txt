@@ -2,6 +2,7 @@ listenai_library_named(app-arcade)
 
 listenai_library_sources(
     arcade_app.c
+    arcade_audio.c
     arcade_core.c
     arcade_input.c
     arcade_rom.c
@@ -35,12 +36,16 @@ else()
     listenai_include_directories(
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/binjgb
     )
-    # third_party 是 vendored 原版代码，不参与本分支的告警策略
+    # third_party 是 vendored 原版代码，不参与本分支的告警策略。
+    # 编译选项：
+    #   -O3            全局是 -Os，binjgb 是纯解释器，内联程度直接决定帧率
+    #   -DNDEBUG       去掉所有 assert（binjgb 热路径上也有 assert）
+    #   -fomit-frame-pointer  全局是 -fno-omit-frame-pointer，解释器少一个寄存器差别很大
     set_source_files_properties(
         third_party/binjgb/emulator.c
         third_party/binjgb/common.c
         third_party/binjgb/memory.c
-        PROPERTIES COMPILE_OPTIONS "-w"
+        PROPERTIES COMPILE_OPTIONS "-w;-O3;-DNDEBUG;-fomit-frame-pointer"
     )
 endif()
 

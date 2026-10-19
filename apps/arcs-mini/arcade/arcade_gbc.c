@@ -19,12 +19,16 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "FreeRTOS.h"
+#include "task.h"
+
 #include "esp_heap_caps.h"
 #include "sysheap.h"
 #include "lisa_log.h"
 #include "lsfs.h"
 
 #include "arcade_core.h"
+#include "arcade_audio.h"
 #include "arcade_demo_rom.h"
 #include "arcade_gb.h"
 #include "arcade_save.h"
@@ -38,11 +42,12 @@
 #define ROM_BANK_BYTES          (32U * 1024U)   /* binjgb 要求 ROM 是 32KB 的整数倍 */
 #define PSRAM_ALLOC_MARGIN      (96U * 1024U)
 
-/* 音频：本固件不输出声音（喇叭走的是被裁掉的音频链路），但 binjgb 的
- * emulator_run_until() 会用 audio_buffer.frequency 做除法，0 会除零 trap。
- * 给一个很小的缓冲区就够：满了会返回 AUDIO_BUFFER_FULL，我们继续跑到帧边界。 */
-#define ARCADE_AUDIO_FREQUENCY  44100
-#define ARCADE_AUDIO_FRAMES     4410    /* 100ms */
+/* 音频：binjgb 的 APU 按 ARCADE_AUDIO_RATE 重采样输出（u8 立体声），
+ * 每帧由 arcade_audio_push() 推进喇叭链路。缓冲区要装得下一帧的量
+ * （48kHz / 59.7fps ≈ 803 样本），留一点余量避免中途 AUDIO_BUFFER_FULL
+ * 导致 emulator_run_until() 把没被取走的采样直接丢掉。 */
+#define ARCADE_AUDIO_FREQUENCY  ARCADE_AUDIO_RATE
+#define ARCADE_AUDIO_FRAMES     1280    /* 26ms */
 
 #define ARCADE_BIN_MAGIC        0x424A4742U     /* "BJGB" */
 
@@ -69,6 +74,10 @@ struct arcade_gbc_priv {
     uint16_t hist_pc[PC_HIST_SLOTS];
     uint16_t hist_sp[PC_HIST_SLOTS];
     uint32_t hist_n[PC_HIST_SLOTS];
+    /* 帧耗时拆分（ms tick 累计）：emu=模拟器本体，blit=帧缓冲放大 */
+    TickType_t perf_emu_ticks;
+    TickType_t perf_blit_ticks;
+    uint32_t perf_frames;
 };
 
 static struct arcade_gbc_priv *s_priv;
@@ -433,10 +442,10 @@ int arcade_gb_start(const char *path)
     p->rom_size = rom_size;
     p->rom_alloc_size = rom_alloc;
 
-    /* 关掉声音：本固件没有音频输出链路，跳过混音能省不少 CPU */
+    /* 打开 APU 的全部 4 个声道（binjgb 默认是开的，这里显式确认一次） */
     EmulatorConfig config = emulator_get_config(emu);
     for (int i = 0; i < APU_CHANNEL_COUNT; i++) {
-        config.disable_sound[i] = TRUE;
+        config.disable_sound[i] = FALSE;
     }
     emulator_set_config(emu, &config);
 
@@ -516,10 +525,14 @@ void arcade_gb_run_frame(void)
     Ticks until;
     EmulatorEvent ev;
     int guard = 0;
+    TickType_t t0;
+    TickType_t t1;
 
     if (p == NULL || p->emu == NULL) {
         return;
     }
+
+    t0 = xTaskGetTickCount();
 
     /*
      * 跑到「当前 tick + 一帧」为止。返回 AUDIO_BUFFER_FULL 之类的事件时
@@ -540,12 +553,33 @@ void arcade_gb_run_frame(void)
         }
     }
 
+    /*
+     * 把这一帧的 APU 输出推给喇叭，然后把 binjgb 的写游标复位。
+     * 必须每帧取走：AudioBuffer 满了以后，下一次 emulator_run_until()
+     * 会直接把 position 拨回 data（那几个采样就丢了）；我们自己复位
+     * 才能保证「产出的每个采样都被送到音频链路」。
+     */
+    {
+        AudioBuffer *ab = emulator_get_audio_buffer(p->emu);
+        uint32_t aframes = audio_buffer_get_frames(ab);
+
+        if (aframes > 0) {
+            arcade_audio_push(ab->data, aframes);
+            ab->position = ab->data;
+        }
+    }
+
     /* 游戏真写了卡带存档区才同步 + 标脏，避免每帧 memcpy 32KB */
     if (emulator_was_ext_ram_updated(p->emu)) {
         cart_ram_sync_from_emu(p);
     }
 
+    t1 = xTaskGetTickCount();
     arcade_video_draw_frame_rgba((const uint32_t *)emulator_get_frame_buffer(p->emu));
+    p->perf_emu_ticks += t1 - t0;
+    p->perf_blit_ticks += xTaskGetTickCount() - t1;
+    p->perf_frames++;
+
     stats_sample(p);
 
     if (!p->first_frame_logged) {
@@ -657,10 +691,28 @@ int arcade_gb_machine_report(char *out, uint32_t out_len)
 
     /* binjgb 是 tick 驱动的，PC 分布 + ppu_frame 增长就能判断「在跑 / 卡死」 */
     n += snprintf(out + n, out_len - (uint32_t)n,
-                  "frames=%u ppuframe=%u ticks=%u save=%s",
+                  "frames=%u ppuframe=%u ticks=%u save=%s\n",
                   (unsigned)s_priv->frame_n, (unsigned)s.ppu_frame,
                   (unsigned)(s.ticks >> 10),
                   arcade_save_pending() ? "pending" : "clean");
+
+    if (n < 0 || (uint32_t)n >= out_len) {
+        return n;
+    }
+
+    /* 帧耗时拆分：emu 慢就换编译选项/裁内核，blit 慢就换调色板查表 */
+    {
+        uint32_t f = s_priv->perf_frames ? s_priv->perf_frames : 1;
+
+        n += snprintf(out + n, out_len - (uint32_t)n,
+                      "perf emu=%u.%ums blit=%u.%ums of %u.%ums",
+                      (unsigned)(s_priv->perf_emu_ticks / f),
+                      (unsigned)((s_priv->perf_emu_ticks * 10 / f) % 10),
+                      (unsigned)(s_priv->perf_blit_ticks / f),
+                      (unsigned)((s_priv->perf_blit_ticks * 10 / f) % 10),
+                      (unsigned)((s_priv->perf_emu_ticks + s_priv->perf_blit_ticks) / f),
+                      (unsigned)(((s_priv->perf_emu_ticks + s_priv->perf_blit_ticks) * 10 / f) % 10));
+    }
 
     return n;
 }
