@@ -12,6 +12,7 @@
 #include "lisa_pwm.h"
 #include <stddef.h>
 #include <stdint.h>
+#include "esp_heap_caps.h"
 
 #define LOG_TAG "lisa_display_panel"
 #include <lisa_log.h>
@@ -273,6 +274,9 @@ void panel_set_mem_area(lisa_display_panel_t *panel, lisa_display_panel_mem_area
 #include "sysutils.h"
 #endif
 
+/* 软件旋转中转缓冲区的像素总数（Ping/Pong 各一份）。*/
+#define ROTATE_BUF_PIXELS ((uint32_t)ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH)
+
 typedef struct {
 #if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
     lisa_semaphore_t *cpdma_done_sem;  /**< CPDMA 完成信号量 */
@@ -280,9 +284,48 @@ typedef struct {
     uint8_t dma_channel;               /**< 分配的 DMA 通道号 */
 #endif
     lisa_mutex_t *rotate_mutex;        /**< 旋转缓冲区互斥锁（保护旋转资源）*/
-    uint16_t rotate_buf_ping[ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH];  /**< Ping 缓冲区 */
-    uint16_t rotate_buf_pong[ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH];  /**< Pong 缓冲区 */
+    /*
+     * 软件旋转中转缓冲区，按需分配（见 rotate_buf_ensure）。
+     *
+     * 原本是内联的静态数组：2 x 240 x 16 x 2B = 15KB，常驻内部 SRAM。
+     * 但支持 MADCTL 硬件翻转的面板（如 ST7789P3）走不到这条路径
+     * （见 panel_st7789p3.c 的 set_orientation 与 panel_send_data 的分支），
+     * 静态占用等于白占。软件旋转本身是慢路径，缓冲区放 PSRAM 完全够用。
+     */
+    uint16_t *rotate_buf_ping;         /**< Ping 缓冲区 */
+    uint16_t *rotate_buf_pong;         /**< Pong 缓冲区 */
 } panel_rotate_ctx_t;
+
+/*
+ * 按需分配软件旋转中转缓冲区。调用者必须持有 ctx->rotate_mutex。
+ * 返回 0 表示缓冲区已经就绪。
+ */
+static int rotate_buf_ensure(panel_rotate_ctx_t *ctx)
+{
+    if (ctx->rotate_buf_ping != NULL && ctx->rotate_buf_pong != NULL) {
+        return 0;
+    }
+
+    size_t bytes = sizeof(uint16_t) * (size_t)ROTATE_BUF_PIXELS;
+    uint16_t *ping = (uint16_t *)heap_caps_aligned_alloc(32, bytes,
+                                                         MALLOC_CAP_DEFAULT | MALLOC_CAP_SPIRAM);
+    uint16_t *pong = (uint16_t *)heap_caps_aligned_alloc(32, bytes,
+                                                        MALLOC_CAP_DEFAULT | MALLOC_CAP_SPIRAM);
+    if (ping == NULL || pong == NULL) {
+        LISA_LOGE(LOG_TAG, "Failed to allocate rotate buffer (%u bytes x2)", (unsigned)bytes);
+        if (ping != NULL) {
+            heap_caps_free(ping);
+        }
+        if (pong != NULL) {
+            heap_caps_free(pong);
+        }
+        return -1;
+    }
+
+    ctx->rotate_buf_ping = ping;
+    ctx->rotate_buf_pong = pong;
+    return 0;
+}
 
 #if CONFIG_LISA_DISPLAY_DUAL_INDEPENDENT_ROTATE
 static panel_rotate_ctx_t g_rotate_ctx[2];
@@ -519,6 +562,13 @@ static int panel_send_data_with_sram_rotate_180(lisa_display_panel_t *panel, uin
         lisa_mutex_lock(ctx->rotate_mutex, -1);
     }
 
+    if (rotate_buf_ensure(ctx) != 0) {
+        if (ctx->rotate_mutex) {
+            lisa_mutex_unlock(ctx->rotate_mutex);
+        }
+        return LISA_DEVICE_ERR_NO_MEM;
+    }
+
     for (uint16_t row = 0; row < h; row += rows_per_chunk) {
         uint16_t chunk_h = h - row;
         if (chunk_h > rows_per_chunk) {
@@ -526,6 +576,11 @@ static int panel_send_data_with_sram_rotate_180(lisa_display_panel_t *panel, uin
         }
 
         panel_buf_rotate_180_rows(src_buf, ctx->rotate_buf_ping, w, h, row, chunk_h);
+#if CONFIG_DCACHE_ENABLE
+        /* 缓冲区在 PSRAM：DMA 绕过 D-Cache，落笔后必须写回 */
+        dcache_clean_range((size_t)ctx->rotate_buf_ping,
+                           (size_t)ctx->rotate_buf_ping + (size_t)w * chunk_h * sizeof(uint16_t));
+#endif
 
         int ret = bus_api->write_pixels(panel->bus_dev, ctx->rotate_buf_ping,
                                         (size_t)w * chunk_h * sizeof(uint16_t));
@@ -570,6 +625,13 @@ static int panel_send_data_with_sram_rotate(lisa_display_panel_t *panel, uint16_
         lisa_mutex_lock(ctx->rotate_mutex, -1);
     }
 
+    if (rotate_buf_ensure(ctx) != 0) {
+        if (ctx->rotate_mutex) {
+            lisa_mutex_unlock(ctx->rotate_mutex);
+        }
+        return LISA_DEVICE_ERR_NO_MEM;
+    }
+
     uint32_t data_offset = 0;
     uint16_t *curr_buf = ctx->rotate_buf_ping;
     uint16_t *next_buf = ctx->rotate_buf_pong;
@@ -593,6 +655,11 @@ static int panel_send_data_with_sram_rotate(lisa_display_panel_t *panel, uint16_
 
     for (uint16_t i = 0; i < w; i += ROTATE_BUF_WIDTH) {
         size_t chunk_size = (size_t)ROTATE_BUF_WIDTH * h * sizeof(uint16_t);
+
+#if CONFIG_DCACHE_ENABLE
+        /* 缓冲区在 PSRAM：DMA 绕过 D-Cache，送屏前必须写回 */
+        dcache_clean_range((size_t)curr_buf, (size_t)curr_buf + chunk_size);
+#endif
 
         int ret = bus_api->write_pixels(panel->bus_dev, curr_buf, chunk_size);
         if (ret != LISA_DEVICE_OK) {
