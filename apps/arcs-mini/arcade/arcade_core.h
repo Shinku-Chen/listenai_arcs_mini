@@ -32,6 +32,31 @@ typedef enum {
     ARCADE_SYS_MAX,
 } arcade_sys_t;
 
+/*
+ * 高精度计时。
+ *
+ * 原来所有耗时都按 FreeRTOS 的 1ms tick 统计，量化误差 1ms——比我们要优化的
+ * 目标（把每帧从 19ms 压到 16.5ms 以下）还大，根本看不出改动的效果。
+ * CP 核 300MHz，rdcycle 直接给出 cycle，÷300 就是微秒。
+ */
+#define ARCADE_CYC_PER_US   300U
+
+extern volatile uint32_t SystemCoreClock;
+
+static inline uint32_t arcade_cycles(void)
+{
+    uint32_t v;
+
+    __asm__ volatile("rdcycle %0" : "=r"(v));
+    return v;
+}
+
+/** cycle 差值 → 微秒 */
+static inline uint32_t arcade_cyc_to_us(uint64_t cyc)
+{
+    return (uint32_t)(cyc / ARCADE_CYC_PER_US);
+}
+
 /**
  * 挂载并扫描 ROM 目录，返回可用 ROM 数量。
  */

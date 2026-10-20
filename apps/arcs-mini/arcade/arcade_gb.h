@@ -51,4 +51,14 @@ int arcade_gb_hist_report(char *out, uint32_t out_len);
  */
 int arcade_gb_set_audio_enabled(bool on);
 
+/**
+ * 调试：开/关 PPU 像素渲染（BG / window / OBJ）。
+ * 关掉以后游戏逻辑照跑、画面不动，用来量「画像素」本身占了多少 emu 时间。
+ * @return 0 成功
+ */
+int arcade_gb_set_render_enabled(bool on);
+
+/** 清零帧耗时统计 */
+void arcade_gb_reset_perf(void);
+
 #endif /* __ARCADE_GB_H__ */

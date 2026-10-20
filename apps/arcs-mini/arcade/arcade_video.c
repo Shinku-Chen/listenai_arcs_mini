@@ -93,10 +93,10 @@ static TaskHandle_t s_blit_task;
 
 static void blit_task(void *arg);
 
-/* 计时（ms tick 累计，按帧平均） */
-static volatile TickType_t s_perf_blit;
-static volatile TickType_t s_perf_wait;
-static volatile TickType_t s_perf_tx;
+/* 计时（cycle 累计，按帧平均；rdcycle 精度 1/300µs，tick 只有 1ms 差太多） */
+static volatile uint64_t s_perf_blit;
+static volatile uint64_t s_perf_wait;
+static volatile uint64_t s_perf_tx;
 static volatile uint32_t s_perf_frames;      /* 模拟器提交的帧数 */
 static volatile uint32_t s_perf_blit_frames;
 static volatile uint32_t s_perf_tx_frames;
@@ -140,7 +140,7 @@ static void present_task(void *arg)
     for (;;) {
         int idx;
         lisa_display_buffer_desc_t desc;
-        TickType_t t0;
+        uint32_t t0;
 
         if (xQueueReceive(s_tx_q, &idx, portMAX_DELAY) != pdTRUE) {
             continue;
@@ -152,7 +152,7 @@ static void present_task(void *arg)
         desc.pitch = (uint16_t)(s_fb_w * (int)sizeof(uint16_t));
         desc.buf_size = (uint32_t)s_fb_w * (uint32_t)s_fb_h * sizeof(uint16_t);
 
-        t0 = xTaskGetTickCount();
+        t0 = arcade_cycles();
         if (s_disp != NULL) {
             int ret = lisa_display_write(s_disp, (uint16_t)s_rect_x, (uint16_t)s_rect_y,
                                          &desc, s_buf[idx]);
@@ -161,7 +161,7 @@ static void present_task(void *arg)
                 LISA_LOGW(TAG, "display write failed: %d", ret);
             }
         }
-        s_perf_tx += xTaskGetTickCount() - t0;
+        s_perf_tx += (uint32_t)(arcade_cycles() - t0);
         s_perf_tx_frames++;
 
         xQueueSend(s_free_q, &idx, portMAX_DELAY);
@@ -455,9 +455,13 @@ uint32_t arcade_video_spi_freq(void)
 
 /*
  * 1 倍：160x144 原样，一条源行对一条目标行。
- * 1.5 倍：水平方向 2 个源像素铺 3 个目标像素（偶数列复制一份），
+ * 1.5 倍：水平方向 2 个源像素铺 3 个目标像素，
  *         垂直方向偶数源行铺 1 行、奇数源行铺 2 行 —— 144 条源行正好铺满 216 行。
- * 两个循环都是「按源顺序读、按目标顺序写」，没有随机跳读，也没有逐像素查表。
+ *
+ * 水平放大按「4 个源像素 → 6 个目标像素」一组做：
+ *   src a,b,c,d  →  dst a,a,b,c,c,d
+ * 6 个 u16 = 12 字节，每轮刚好 3 个 4 字节对齐的 32 位写，
+ * 比原来每对源像素写 3 次 16 位少一半 store，而且不用拼非对齐的 32 位写。
  *
  * ARCADE_FB_RGB565=1 时源已经是 RGB565，这里只做缩放，不做色彩转换。
  */
@@ -485,19 +489,25 @@ static void blit_frame(uint16_t *dst, const arcade_fbpixel_t *src)
         uint16_t *d = dst + (size_t)dy * ARCADE_FB_WIDTH;
         const arcade_fbpixel_t *s = src + (size_t)y * SRC_WIDTH;
 
-        for (int x = 0; x < SRC_WIDTH; x += 2) {
+        for (int x = 0; x < SRC_WIDTH; x += 4) {
 #if ARCADE_FB_RGB565
-            uint16_t a = (uint16_t)s[x];
-            uint16_t b = (uint16_t)s[x + 1];
+            uint32_t a = (uint16_t)s[x];
+            uint32_t b = (uint16_t)s[x + 1];
+            uint32_t c = (uint16_t)s[x + 2];
+            uint32_t e = (uint16_t)s[x + 3];
 #else
-            uint16_t a = RGBA_TO_565(s[x]);
-            uint16_t b = RGBA_TO_565(s[x + 1]);
+            uint32_t a = RGBA_TO_565(s[x]);
+            uint32_t b = RGBA_TO_565(s[x + 1]);
+            uint32_t c = RGBA_TO_565(s[x + 2]);
+            uint32_t e = RGBA_TO_565(s[x + 3]);
 #endif
+            uint32_t *p32 = (uint32_t *)d;
 
-            d[0] = a;
-            d[1] = a;
-            d[2] = b;
-            d += 3;
+            /* dst: a,a,b,c,c,d */
+            p32[0] = a | (a << 16);
+            p32[1] = b | (c << 16);
+            p32[2] = c | (e << 16);
+            d += 6;
         }
 
         dy++;
@@ -519,28 +529,28 @@ static void blit_task(void *arg)
     for (;;) {
         int src_idx;
         int dst_idx;
-        TickType_t t0;
-        TickType_t t1;
+        uint32_t t0;
+        uint32_t t1;
 
         if (xQueueReceive(s_src_q, &src_idx, portMAX_DELAY) != pdTRUE) {
             continue;
         }
 
-        t0 = xTaskGetTickCount();
+        t0 = arcade_cycles();
         if (xQueueReceive(s_free_q, &dst_idx, pdMS_TO_TICKS(200)) != pdTRUE) {
             /* 两块目标缓冲都还在 SPI 上：这一帧丢掉，但源缓冲必须还回去，
              * 否则模拟器任务会卡死在这一帧 */
-            s_perf_wait += xTaskGetTickCount() - t0;
+            s_perf_wait += (uint32_t)(arcade_cycles() - t0);
             xQueueSend(s_src_free_q, &src_idx, 0);
             continue;
         }
-        t1 = xTaskGetTickCount();
-        s_perf_wait += t1 - t0;
+        t1 = arcade_cycles();
+        s_perf_wait += (uint32_t)(t1 - t0);
 
         blit_frame((uint16_t *)s_buf[dst_idx], s_src[src_idx]);
 
         s_last = s_buf[dst_idx];
-        s_perf_blit += xTaskGetTickCount() - t1;
+        s_perf_blit += (uint32_t)(arcade_cycles() - t1);
         s_perf_blit_frames++;
 
         xQueueSend(s_tx_q, &dst_idx, 0);
@@ -648,30 +658,32 @@ void arcade_video_perf(char *out, uint32_t len)
     uint32_t f = s_perf_frames ? s_perf_frames : 1;
     uint32_t b = s_perf_blit_frames ? s_perf_blit_frames : 1;
     uint32_t t = s_perf_tx_frames ? s_perf_tx_frames : 1;
-    /* 送屏带宽（只统计 lisa_display_write 里的纯传输耗时） */
-    uint32_t tx_rate_x10 = 0;
+    /* 送屏带宽（按写出字节 / 纯传输耗时） */
+    uint32_t tx_rate_kbps = 0;
     uint32_t bytes = (uint32_t)s_fb_w * (uint32_t)s_fb_h * 2U;
+    uint32_t blit_us = arcade_cyc_to_us(s_perf_blit / b);
+    uint32_t wait_us = arcade_cyc_to_us(s_perf_wait / f);
+    uint32_t tx_us = arcade_cyc_to_us(s_perf_tx / t);
 
     if (out == NULL || len == 0) {
         return;
     }
 
-    if (s_perf_tx > 0) {
-        tx_rate_x10 = (uint32_t)(((uint64_t)bytes * s_perf_tx_frames * 10000ULL) /
-                                 ((uint64_t)s_perf_tx * 1048576ULL / 1000ULL));
+    if (tx_us > 0) {
+        /* tx_us 是单帧平均耗时，bytes 是单帧字节数 → bytes/us = KB/ms */
+        tx_rate_kbps = (uint32_t)(((uint64_t)bytes * 1000ULL) / (uint64_t)tx_us);
     }
 
     snprintf(out, len,
              "scale=%s %dx%d at %d,%d\n"
-             "present blit=%u.%ums wait=%u.%ums tx=%u.%ums\n"
-             "frames=%u blitf=%u txf=%u txcache=%u.%u MB/s",
+             "present blit=%u.%uus wait=%u.%uus tx=%u.%uus\n"
+             "frames=%u blitf=%u txf=%u txcache=%u KB/s",
              s_scale == SCALE_1X ? "1x" : "1.5x", s_fb_w, s_fb_h, s_rect_x, s_rect_y,
-             (unsigned)(s_perf_blit / b), (unsigned)((s_perf_blit * 10 / b) % 10),
-             (unsigned)(s_perf_wait / f), (unsigned)((s_perf_wait * 10 / f) % 10),
-             (unsigned)(s_perf_tx / t), (unsigned)((s_perf_tx * 10 / t) % 10),
+             (unsigned)(blit_us / 1000), (unsigned)((blit_us / 100) % 10),
+             (unsigned)(wait_us / 1000), (unsigned)((wait_us / 100) % 10),
+             (unsigned)(tx_us / 1000), (unsigned)((tx_us / 100) % 10),
              (unsigned)s_perf_frames, (unsigned)s_perf_blit_frames,
-             (unsigned)s_perf_tx_frames,
-             (unsigned)(tx_rate_x10 / 10), (unsigned)(tx_rate_x10 % 10));
+             (unsigned)s_perf_tx_frames, (unsigned)tx_rate_kbps);
 }
 
 /* ---------------- Peanut-GB（DMG 内核）用到的逐行接口 ---------------- */

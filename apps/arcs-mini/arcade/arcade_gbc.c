@@ -79,8 +79,8 @@ struct arcade_gbc_priv {
     uint16_t hist_pc[PC_HIST_SLOTS];
     uint16_t hist_sp[PC_HIST_SLOTS];
     uint32_t hist_n[PC_HIST_SLOTS];
-    /* 帧耗时拆分（ms tick 累计）：emu=模拟器本体，blit=帧缓冲放大 */
-    TickType_t perf_emu_ticks;
+    /* 帧耗时拆分（cycle 累计）：emu=模拟器本体，blit=帧缓冲放大 */
+    uint64_t perf_emu_cycles;
     uint32_t perf_frames;
 };
 
@@ -539,8 +539,8 @@ void arcade_gb_run_frame(void)
     Ticks until;
     EmulatorEvent ev;
     int guard = 0;
-    TickType_t t0;
-    TickType_t t1;
+    uint32_t t0;
+    uint32_t t1;
 
     if (p == NULL || p->emu == NULL) {
         return;
@@ -556,7 +556,7 @@ void arcade_gb_run_frame(void)
      * 还在被缩放任务读的那块，画面会撕裂 */
     emulator_set_frame_buffer(p->emu, (FBPixel *)fb);
 
-    t0 = xTaskGetTickCount();
+    t0 = arcade_cycles();
 
     /*
      * 跑到「当前 tick + 一帧」为止。返回 AUDIO_BUFFER_FULL 之类的事件时
@@ -598,12 +598,12 @@ void arcade_gb_run_frame(void)
         cart_ram_sync_from_emu(p);
     }
 
-    t1 = xTaskGetTickCount();
+    t1 = arcade_cycles();
     /* 缩放 + 送屏交给 video 模块的三级流水，这里只记模拟器本体耗时。
      * 屏上有 LVGL 提示文字时不缩放也不送帧，否则会把提示盖掉。 */
     arcade_video_end_frame(
         fb != NULL && !arcade_ui_player_message_visible());
-    p->perf_emu_ticks += t1 - t0;
+    p->perf_emu_cycles += (uint32_t)(t1 - t0);
     p->perf_frames++;
 
     stats_sample(p);
@@ -729,14 +729,14 @@ int arcade_gb_machine_report(char *out, uint32_t out_len)
     /* 帧耗时：emu 是模拟器本体（video 模块自己的 blit/送屏计时单独报） */
     {
         uint32_t f = s_priv->perf_frames ? s_priv->perf_frames : 1;
+        uint32_t emu_us = arcade_cyc_to_us(s_priv->perf_emu_cycles / f);
         char video_perf[192];
 
         arcade_video_perf(video_perf, sizeof(video_perf));
 
         n += snprintf(out + n, out_len - (uint32_t)n,
                       "perf emu=%u.%ums of %u frames\n%s",
-                      (unsigned)(s_priv->perf_emu_ticks / f),
-                      (unsigned)((s_priv->perf_emu_ticks * 10 / f) % 10),
+                      (unsigned)(emu_us / 1000), (unsigned)((emu_us / 100) % 10),
                       (unsigned)f, video_perf);
     }
 
@@ -790,6 +790,17 @@ int arcade_gb_hist_report(char *out, uint32_t out_len)
     return off;
 }
 
+/* 清零帧耗时统计（`arcade perf reset` / apu / bg 切换前后对比用） */
+void arcade_gb_reset_perf(void)
+{
+    if (s_priv == NULL) {
+        return;
+    }
+
+    s_priv->perf_emu_cycles = 0;
+    s_priv->perf_frames = 0;
+}
+
 int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len)
 {    uint32_t off = 0;
 
@@ -832,6 +843,29 @@ int arcade_gb_set_audio_enabled(bool on)
     for (int i = 0; i < APU_CHANNEL_COUNT; i++) {
         config.disable_sound[i] = on ? FALSE : TRUE;
     }
+    emulator_set_config(s_priv->emu, &config);
+
+    return 0;
+}
+
+/*
+ * 调试：只关掉 PIXEL 渲染（BG / window / OBJ），模拟照旧推进。
+ *
+ * `arcade bg 0` 之后 emu 耗时掉了多少，就是 PPU 画像素的成本；
+ * 剩下的是 CPU 解释器 + 每 tick 的状态机。两者分开才能知道该优化哪边。
+ */
+int arcade_gb_set_render_enabled(bool on)
+{
+    EmulatorConfig config;
+
+    if (s_priv == NULL || s_priv->emu == NULL) {
+        return -1;
+    }
+
+    config = emulator_get_config(s_priv->emu);
+    config.disable_bg = on ? FALSE : TRUE;
+    config.disable_window = on ? FALSE : TRUE;
+    config.disable_obj = on ? FALSE : TRUE;
     emulator_set_config(s_priv->emu, &config);
 
     return 0;

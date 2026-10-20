@@ -36,6 +36,10 @@
 #include "lsfs.h"
 #include "esp_heap_caps.h"
 
+/* POWER_EN 的 AON 强制输出位（`arcade pwrho1d`，开发期刷机用） */
+#include "arcs_ap.h"
+#include "pinmux.h"
+
 #define TAG "arcade"
 
 #define ARCADE_TASK_STACK     4096
@@ -107,6 +111,29 @@ static uint32_t s_work_ema = CONFIG_ARCADE_FRAME_PERIOD_MS;
 /* 连续超预算的帧数（每 8 帧让一个 tick 给 IDLE，别把它饿死） */
 static uint32_t s_overrun_count;
 static bool s_period_auto = true;
+
+/*
+ * 自动缩放。
+ *
+ * 口径（用户要求）：大画面优先，但速度永远优先于画面 —— 帧率不够时自己
+ * 降到 1x，不让用户手动切。用帧周期（rdcycle 实测）判定，不用 fps
+ * （fps 是 1 秒窗口的平均值，反映太慢）。
+ *
+ *   1.5x 的额外开销只有 1ms 左右（缩放任务单独跑），所以常态应该是 1.5x；
+ *   只有帧周期持续超过 17.5ms 才降级。回切需要连续 5 秒都很宽裕。
+ */
+#define SCALE_DOWN_US       17500U
+#define SCALE_UP_US         16200U
+#define SCALE_DOWN_FRAMES   60U
+#define SCALE_UP_FRAMES     300U
+
+static bool s_scale_auto = true;
+static uint32_t s_frame_us;          /* 帧周期 EMA（µs） */
+static uint32_t s_scale_down_cnt;
+static uint32_t s_scale_up_cnt;
+static uint32_t s_last_frame_cyc;
+/* PLAY 模式下把 LVGL 定时器降频后，用来数帧 */
+static uint32_t s_lvgl_skip;
 
 /* 最近若干帧的帧间隔（ms），用来回答「抖不抖」 */
 #define FRAME_STAT_SLOTS 64
@@ -279,6 +306,14 @@ static void arcade_start_selected(void)
     s_frames = 0;
     s_fps_tick = xTaskGetTickCount();
     s_fps_x10 = 0;
+    /* 自动缩放从 1.5x（大画面）开始，跑不动再自己降 */
+    s_last_frame_cyc = 0;
+    s_frame_us = 0;
+    s_scale_down_cnt = 0;
+    s_scale_up_cnt = 0;
+    if (s_scale_auto) {
+        arcade_video_set_scale(2);
+    }
 }
 
 static void arcade_stop_game(void)
@@ -491,6 +526,64 @@ static void arcade_frame_tick(void)
     }
 }
 
+/*
+ * 自动缩放：每帧量一次真实帧周期，持续不达标就降 1x。
+ * 必须在 arcade 任务里调（arcade_video_set_scale 会排空送屏流水线）。
+ */
+static void arcade_auto_scale_tick(void)
+{
+    uint32_t now = arcade_cycles();
+    uint32_t delta;
+
+    if (s_last_frame_cyc == 0) {
+        s_last_frame_cyc = now;
+        return;
+    }
+
+    delta = arcade_cyc_to_us((uint32_t)(now - s_last_frame_cyc));
+    s_last_frame_cyc = now;
+
+    /* 切页面 / 载入 / 写盘那种几十上百毫秒的长停帧不参与统计 */
+    if (delta > 200000U) {
+        return;
+    }
+
+    s_frame_us = (s_frame_us * 7U + delta) / 8U;
+
+    if (!s_scale_auto) {
+        return;
+    }
+
+    if (arcade_video_scale() != 1) {
+        if (s_frame_us > SCALE_DOWN_US) {
+            if (++s_scale_down_cnt >= SCALE_DOWN_FRAMES) {
+                uint32_t avg = s_frame_us;
+
+                s_scale_down_cnt = 0;
+                s_scale_up_cnt = 0;
+                s_frame_us = 0;
+                arcade_video_set_scale(1);
+                LISA_LOGW(TAG, "auto scale -> 1x (frame %u us, 跑不满 60fps)",
+                          (unsigned)avg);
+            }
+        } else {
+            s_scale_down_cnt = 0;
+        }
+        return;
+    }
+
+    if (s_frame_us < SCALE_UP_US) {
+        if (++s_scale_up_cnt >= SCALE_UP_FRAMES) {
+            s_scale_up_cnt = 0;
+            s_frame_us = 0;
+            arcade_video_set_scale(2);
+            LISA_LOGI(TAG, "auto scale -> 1.5x (帧周期有余量)");
+        }
+    } else {
+        s_scale_up_cnt = 0;
+    }
+}
+
 static void arcade_task(void *arg)
 {
     (void)arg;
@@ -550,10 +643,26 @@ static void arcade_task(void *arg)
                 arcade_core_set_input(arcade_input_mask() | kbd);
                 arcade_core_run_frame();
                 arcade_frame_tick();
+                arcade_auto_scale_tick();
             }
         }
 
-        idle = arcade_ui_handler();
+        /*
+         * 游戏页的帧是 arcade_video 直接写面板的，LVGL 在这段时间没有任何
+         * 东西要画。每帧调 lv_timer_handler() 纯属白花时间（它要跑定时器链表、
+         * 判脏区、再调驱动的 flush），所以播放中降到每 8 帧一次；
+         * 有暂停/提示文字盖在画面上时照旧每帧跑。
+         */
+        if (s_mode == ARCADE_MODE_PLAY && !s_frozen &&
+            !arcade_ui_player_message_visible()) {
+            if ((s_lvgl_skip++ & 7U) == 0) {
+                idle = arcade_ui_handler();
+            } else {
+                idle = 0;
+            }
+        } else {
+            idle = arcade_ui_handler();
+        }
 
         TickType_t spent = xTaskGetTickCount() - start;
 
@@ -1419,16 +1528,20 @@ static int cmd_perf(int argc, char **argv)
 
     if (argc >= 1 && strcasecmp(argv[0], "reset") == 0) {
         arcade_video_reset_perf();
+        arcade_gb_reset_perf();
         shellPrint(shell, "计时已清零\r\n");
         return 0;
     }
 
     line[0] = '\0';
     arcade_video_perf(line, sizeof(line));
-    shellPrint(shell, "fps=%d.%d mode=%s sysclk=%u MHz\r\n",
+    shellPrint(shell, "fps=%d.%d mode=%s sysclk=%u MHz scale=%s %s frame≈%u.%ums\r\n",
                (int)(s_fps_x10 / 10), (int)(s_fps_x10 % 10),
                s_mode == ARCADE_MODE_LIST ? "list" : "play",
-               (unsigned)(SystemCoreClock / 1000000U));
+               (unsigned)(SystemCoreClock / 1000000U),
+               arcade_video_scale() == 1 ? "1x" : "1.5x",
+               s_scale_auto ? "auto" : "manual",
+               (unsigned)(s_frame_us / 1000), (unsigned)((s_frame_us / 100) % 10));
 
     for (char *p = line; p != NULL && *p != '\0';) {
         char *nl = strchr(p, '\n');
@@ -1443,20 +1556,30 @@ static int cmd_perf(int argc, char **argv)
     return 0;
 }
 
-/* arcade scale <1|15>：1 = 160x144 原尺寸，15 = 1.5 倍 240x216（默认） */
+/* arcade scale <1|15|auto>：1 = 160x144，15 = 1.5 倍 240x216，auto = 自动 */
 static int cmd_scale(int argc, char **argv)
 {
     Shell *shell = shellGetCurrent();
 
     if (argc >= 1) {
-        int v = atoi(argv[0]);
+        if (strcasecmp(argv[0], "auto") == 0) {
+            s_scale_auto = true;
+            s_frame_us = 0;
+            s_scale_down_cnt = 0;
+            s_scale_up_cnt = 0;
+            shellPrint(shell, "缩放: 自动（优先 1.5x，帧率不够就掉 1x）\r\n");
+            return 0;
+        }
 
-        arcade_video_set_scale(v == 1 ? 1 : 2);
+        s_scale_auto = false;
+        arcade_video_set_scale(atoi(argv[0]) == 1 ? 1 : 2);
     }
 
-    shellPrint(shell, "缩放: %s (%dx%d)（arcade scale <1|15>）\r\n",
+    shellPrint(shell, "缩放: %s %s（%dx%d）  frame≈%u.%ums\r\n",
                arcade_video_scale() == 1 ? "1x" : "1.5x",
-               arcade_video_fb_width(), arcade_video_fb_height());
+               s_scale_auto ? "auto" : "manual",
+               arcade_video_fb_width(), arcade_video_fb_height(),
+               (unsigned)(s_frame_us / 1000), (unsigned)((s_frame_us / 100) % 10));
     return 0;
 }
 
@@ -1549,8 +1672,69 @@ static int cmd_apu(int argc, char **argv)
     arcade_gb_set_audio_enabled(atoi(argv[0]) != 0);
     /* 计时清零，跑几秒再 arcade perf 看 emu 耗时变化 */
     arcade_video_reset_perf();
-    shellPrint(shell, "APU %s（计时已清零，等几秒后 arcade perf）\r\n",
+    arcade_gb_reset_perf();
+    shellPrint(shell, "APU %s（计时已清零，等几秒 后 arcade perf）\r\n",
                atoi(argv[0]) != 0 ? "on" : "off");
+    return 0;
+}
+
+/*
+ * arcade bg <0|1>：只关 PPU 像素渲染（游戏逻辑照跑）。
+ *
+ * 用来把 emu 耗时拆成两半：「画像素」vs「CPU 解释器 + 每 tick 状态机」。
+ * bg 0 后 emu 少掉的那部分就是 PPU 渲染成本，剩下的是 CPU 侧。
+ */
+static int cmd_bg(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (!arcade_core_running()) {
+        shellPrint(shell, "当前没有运行中的 ROM\r\n");
+        return 0;
+    }
+
+    if (argc < 1) {
+        shellPrint(shell, "用法: arcade bg <0|1>\r\n");
+        return 0;
+    }
+
+    arcade_gb_set_render_enabled(atoi(argv[0]) != 0);
+    arcade_video_reset_perf();
+    arcade_gb_reset_perf();
+    shellPrint(shell, "PPU 渲染 %s（计时已清零，等几秒后 arcade cpu）\r\n",
+               atoi(argv[0]) != 0 ? "on" : "off");
+    return 0;
+}
+
+/*
+ * arcade pwrho1d <0|1>：用 AON IOMUX 的 force-output 把 POWER_EN 锁到高。
+ *
+ * 为什么需要：这台机器是电池供电，POWER_EN 是电源自锁的栅极。cskburn 刷完
+ * 会复位芯片，复位窗口里 PB3 没有驱动、自锁撑不住，设备就掉电了 —— 所以每刷
+ * 一次都得人工长按开机。先把它锁到高，复位过程 AON 域一直硬拉高，刷完
+ * 设备还能自己起来（开发期省事用，正式固件不该调）。
+ *
+ * pwrho1d 0 把 force 位交还给常规 GPIO 驱动。
+ */
+static int cmd_pwrho1d(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    int on = (argc >= 1) ? (atoi(argv[0]) != 0) : 1;
+    volatile uint32_t *aon =
+        (volatile uint32_t *)&IP_AON_IOMUX->REG_PAD_AON_GPIOB_00.all + POWER_EN_PIN;
+    uint32_t before = *aon;
+
+    /* bit22 OEN_FRC / bit23 OUT_REG / bit24 OUT_FRC：强制输出高 */
+    if (on) {
+        *aon &= ~(0x1E00000u);
+        *aon |= 0x1C00000u;
+    } else {
+        *aon &= ~(0x1C00000u);
+    }
+
+    shellPrint(shell, "POWER_EN(PB%d) AON force %s  reg=%08X -> %08X\r\n",
+               POWER_EN_PIN, on ? "ON（复位期间保持供电）" : "OFF（交还 GPIO）",
+               (unsigned)before, (unsigned)*aon);
     return 0;
 }
 
@@ -1702,10 +1886,12 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"perf", cmd_perf, "帧率与各段耗时：perf [reset]"},
     {"period", cmd_period, "帧节拍：period [ms]（0 = 回到固定节拍）"},
     {"clock", cmd_clock, "量真实核频（mcycle）"},
-    {"scale", cmd_scale, "缩放：scale <1|15>（15 = 1.5 倍）"},
+    {"scale", cmd_scale, "缩放：scale <1|15|auto>（auto = 帧率不够自动掉 1x）"},
     {"roty", cmd_roty, "180° 硬件翻转的行偏移：roty [px]（-1 = 自动）"},
     {"spi", cmd_spi, "面板 SPI 时钟：spi [MHz]（改完钉 arcade perf 看带宽）"},
     {"apu", cmd_apu, "开关模拟器 APU：apu <0|1>（量声音耗时）"},
+    {"bg", cmd_bg, "开关 PPU 像素渲染：bg <0|1>（量画像素耗时）"},
+    {"pwrho1d", cmd_pwrho1d, "把 POWER_EN 锁到高：pwrho1d <0|1>（刷机调试用）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
 };
 
