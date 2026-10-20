@@ -278,8 +278,8 @@ typedef struct {
     /**
      * 面板自己用硬件（MADCTL）完成了当前方向的行列镜像，驱动层不需要
      * 再用 SRAM 中转块把像素数据软件旋转一遍。为 true 时
-     * panel_draw_pixels() 直接直通 DMA；坐标镜像（panel_set_mem_area）仍按
-     * orientation 做，两者配合得到的画面和软件旋转完全一致。
+     * panel_draw_pixels() 直接直通 DMA；panel_set_mem_area() 也不再镜像
+     * 窗口坐标（只按 gram_h 补行偏移），否则就是双重变换。
      */
     bool hw_rotate;
 } lisa_display_capabilities_t;
@@ -465,6 +465,14 @@ static inline int lisa_display_attach_bus(lisa_device_t *dev, const lisa_display
     lisa_display_api_t *api = (lisa_display_api_t *)dev->api;
     return api->attach_bus ? api->attach_bus(dev, config) : LISA_DEVICE_ERR_NOT_SUPPORT;
 }
+
+/**
+ * @brief 调试用：覆盖 180° 硬件翻转时的行偏移（像素）
+ *
+ * 正常不用调用，驱动按「控制器显存行数 - 玻璃行数」自动补偿。
+ * 传 -1 恢复自动推算。仅供调试命令（arcade roty）使用。
+ */
+void lisa_display_set_rotate_row_shift(int16_t shift);
 
 /* ========================================================================
  * 便捷宏定义

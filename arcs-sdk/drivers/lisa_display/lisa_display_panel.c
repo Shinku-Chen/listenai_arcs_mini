@@ -209,6 +209,17 @@ void panel_reset_pin_set(lisa_display_panel_t *panel, uint8_t level)
     lisa_gpio_write_pin(panel->rst_gpio, panel->rst_pin, level);
 }
 
+/*
+ * 180° 硬件翻转的行偏移覆盖量（像素）。-1 = 按 gram_h - panel_h 自动推算。
+ * 只在调试时用（arcade roty），不参与正常逻辑。
+ */
+static int16_t s_rotate_row_shift_override = -1;
+
+void lisa_display_set_rotate_row_shift(int16_t shift)
+{
+    s_rotate_row_shift_override = shift;
+}
+
 void panel_set_mem_area(lisa_display_panel_t *panel, lisa_display_panel_mem_area_t *area, lisa_mem_coord_t x, lisa_mem_coord_t y)
 {
     uint16_t new_x, new_y, new_w, new_h;
@@ -222,6 +233,26 @@ void panel_set_mem_area(lisa_display_panel_t *panel, lisa_display_panel_mem_area
         new_y = area->x;
         new_w = area->h;
         new_h = area->w;
+    } else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_180 && panel->caps.hw_rotate) {
+        /*
+         * 180° 由面板 MADCTL(MY|MX) 自己做行列镜像，驱动层不能再镜像一次
+         * ——那就是双重变换，画面会错位（一帧整写时恰好是恒等变换，看不出
+         * 来，但 LVGL 的脏矩形会变成镜像碎片）。所以这里坐标原样透传。
+         *
+         * 但 MY 是在控制器整块显存里翻（ST7789 是 240x320 行），而玻璃只占
+         * 中间/边上连续的 panel_h 行，所以镜像后窗口起始行要补
+         * (gram_h - panel_h)，否则画面整体偏移这段距离。
+         */
+        int32_t shift = s_rotate_row_shift_override;
+
+        if (shift < 0) {
+            shift = (area->gram_h > area->panel_h) ? (int32_t)(area->gram_h - area->panel_h) : 0;
+        }
+
+        new_x = area->x;
+        new_y = (uint16_t)(area->y + (uint16_t)shift);
+        new_w = area->w;
+        new_h = area->h;
     } else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_180) {
         new_x = area->panel_w - area->x - area->w;
         new_y = area->panel_h - area->y - area->h;

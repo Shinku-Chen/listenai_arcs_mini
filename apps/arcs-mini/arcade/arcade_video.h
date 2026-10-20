@@ -69,6 +69,13 @@ void arcade_video_present_drain(void);
 void arcade_video_set_scale(int scale);
 int arcade_video_scale(void);
 
+/**
+ * 调试：180° 硬件翻转的行偏移覆盖（像素），-1 = 自动推算。
+ * 改完下一帧就生效（不改 MADCTL，只改窗口起始行）。
+ */
+void arcade_video_set_rotate_row_shift(int16_t shift);
+int16_t arcade_video_rotate_row_shift(void);
+
 void arcade_video_reset_perf(void);
 void arcade_video_perf(char *out, uint32_t len);
 

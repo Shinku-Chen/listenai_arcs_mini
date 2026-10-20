@@ -70,6 +70,8 @@ static int s_fb_h = ARCADE_FB_HEIGHT;
 static int s_rect_x;                        /* 面板上的位置 */
 static int s_rect_y = (240 - ARCADE_FB_HEIGHT) / 2;
 static lv_color_t *s_last;                  /* 最近一次提交的缓冲（调试用） */
+/* 180° 硬件翻转的行偏移覆盖（-1 = 驱动自动推算），调试用 */
+static int16_t s_rotate_row_shift = -1;
 
 static lisa_device_t *s_disp;
 static QueueHandle_t s_free_q;              /* 可写的缓冲索引 */
@@ -307,6 +309,18 @@ void arcade_video_set_scale(int scale)
 int arcade_video_scale(void)
 {
     return s_scale;
+}
+
+void arcade_video_set_rotate_row_shift(int16_t shift)
+{
+    s_rotate_row_shift = shift;
+    lisa_display_set_rotate_row_shift(shift);
+    LISA_LOGI(TAG, "rotate row shift %d", (int)shift);
+}
+
+int16_t arcade_video_rotate_row_shift(void)
+{
+    return s_rotate_row_shift;
 }
 
 /* RGBA(0xAABBGGRR) → RGB565，和 LVGL 的 lv_color_make 出同样的位模式 */

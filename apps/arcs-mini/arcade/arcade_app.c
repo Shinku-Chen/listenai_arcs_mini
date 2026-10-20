@@ -1464,6 +1464,26 @@ static int cmd_scale(int argc, char **argv)
     return 0;
 }
 
+/*
+ * arcade roty [px]：180° 硬件翻转的行偏移覆盖（调试）
+ *
+ * 面板用 MADCTL MY|MX 做整块显存的镜像，行偏移补偿是推算出来的
+ * （显存行数 - 玻璃行数 = 80）。万一实际玻璃位置不同，可以用这条命令在
+ * 不重新烧录的情况下当场试：roty 0 / roty 80 / roty -1（恢复自动）。
+ */
+static int cmd_roty(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (argc >= 1) {
+        arcade_video_set_rotate_row_shift((int16_t)atoi(argv[0]));
+    }
+
+    shellPrint(shell, "rotate row shift = %d（-1 = 自动）\r\n",
+               (int)arcade_video_rotate_row_shift());
+    return 0;
+}
+
 /* arcade apu <0|1>：开关模拟器 APU（用来量声音占多少时间） */
 static int cmd_apu(int argc, char **argv)
 {
@@ -1636,6 +1656,7 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"period", cmd_period, "定步长帧周期：period [ms]（0 = 自适应）"},
     {"clock", cmd_clock, "量真实核频（mcycle）"},
     {"scale", cmd_scale, "缩放：scale <1|15>（15 = 1.5 倍）"},
+    {"roty", cmd_roty, "180° 硬件翻转的行偏移：roty [px]（-1 = 自动）"},
     {"apu", cmd_apu, "开关模拟器 APU：apu <0|1>（量声音耗时）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
 };

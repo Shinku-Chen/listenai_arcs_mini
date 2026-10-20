@@ -47,9 +47,9 @@ static const uint8_t init_sequence[] = {
  * 分 14 段各起一次 DMA；而 MY|MX 同时镜像行列地址就能让面板自己翻转，
  * 数据直通 DMA 就行。
  *
- * 注意：MADCTL 翻转的是「显存地址 → 面板像素」的映射，写入窗口的坐标仍
- * 需要镜像（panel_set_mem_area() 按 caps.orientation 做），两者配合才是
- * 完整的 180° 旋转。
+ * 注意：MADCTL 翻转的是「显存地址 → 面板像素」的映射，所以写入窗口的
+ * 坐标**不能**再镜像一次（panel_set_mem_area() 在 caps.hw_rotate 时只补
+ * 行偏移）；漏改会得到双重变换，画面整体错位。
  */
 static void st7789p3_write_madctl(lisa_display_panel_t *panel, uint8_t value)
 {
@@ -121,6 +121,7 @@ static void st7789p3_set_window(lisa_display_panel_t *panel, uint16_t x, uint16_
         .panel_h = panel->caps.height,
         .x_offset = CONFIG_PANEL_ST7789P3_X_OFFSET,
         .y_offset = CONFIG_PANEL_ST7789P3_Y_OFFSET,
+        .gram_h = CONFIG_PANEL_ST7789P3_GRAM_HEIGHT,
         .x = x,
         .y = y,
         .w = w,

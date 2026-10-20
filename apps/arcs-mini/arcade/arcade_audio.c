@@ -9,13 +9,16 @@
  *
  * 为什么需要重采样：
  *   GB 一帧是 16.74ms 的模拟时间，binjgb 每帧固定产出 803 个 48kHz 采样。
- *   但实测模拟器只有 52~54 fps（比实机 59.7 慢），也就是每秒只能喂
- *   41.8k 采样，而 DAC 每秒固定吃掉 48k。不做处理的话每秒会欠载 6k 采样，
+ *   但实测模拟器只有 42~54 fps（比实机 59.7 慢），也就是每秒只能喂
+ *   34~43k 采样，而 DAC 每秒固定吃掉 48k。不做处理的话每秒会欠载 5~14k 采样，
  *   声音就是持续爆音。
- *   这里用「环形缓冲水位闭环」的做法：DAC 每写一块就按水位决定这一块要从
- *   环形缓冲里取多少采样（PI 控制器，长期积分项跟上「模拟器比实时慢」的稳态
- *   偏差）。取多了音调升、取少了音调降，换来的是不爆音，而且音画同步
- *   —— 视频本来就是 52fps 慢放，声音跟着一起慢才对得上。
+ *   这里用「比例锁定」：目标比例 = 模拟器实际产出率的 1/8 指数平均
+ *   （≈ 每块产出样本数），当前比例按 ±3%/s 的速度向目标滑。比例小于 1 时
+ *   DAC 每块需要多少输出就拉多长的源数据，也就是音调变低；换来的是不爆音，
+ *   而且音画同步——视频本来就是慢放，声音跟着一起慢才对得上。
+ *
+ *   历史教训：以前是按水位做 PI 闭环、每块都改比例，音高一直在抖（vibrato），
+ *   听起来像走调。现在水位只做极端保护（<15% / >90% 才推一小步）。
  *
  * 内存：环形缓冲 / staging / 输出块都放 PSRAM。本平台 exram_malloc 失败会
  * __builtin_trap()，所以分配前先查 PSRAM 余量。
@@ -54,6 +57,18 @@
 /* 每块最多取多少 / 最少取多少（±40%，再大就明显跑调了） */
 #define READ_MIN            (BLOCK_SAMPLES * 6 / 10)
 #define READ_MAX            (BLOCK_SAMPLES * 14 / 10)
+/*
+ * 比例（音高）的最大变化率，千分比/秒。
+ * 原来的 PI 每块都改比例，而模拟器只有实机 70% 速度，比例被拉到 0.6x
+ * 之后还在持续摆动 —— 听起来就是音高在抖（vibrato）。
+ * 限制到 3%/s 后音高是稳的：慢速滑过去，之后不再动。
+ */
+#define RATIO_SLEW_PERMILLE_PER_S   30
+/* 每秒多少个 DAC 块（48000/800 = 60） */
+#define BLOCKS_PER_SEC      (ARCADE_AUDIO_RATE / BLOCK_SAMPLES)
+/* 水位只做极端保护：低于 15% 才略微加快，高于 90% 才略微放慢 */
+#define LEVEL_LOW           (RING_SAMPLES * 15 / 100)
+#define LEVEL_HIGH          (RING_SAMPLES * 90 / 100)
 /* 幅度小于这个值当静音：8bit 采样中心偏差会带来低频嗡声 */
 #define NOISE_GATE          24
 /* 统计窗口：64 块 ≈ 1.07 秒 */
@@ -82,9 +97,19 @@ struct arcade_audio_ctx {
     volatile uint32_t wr_total;
     volatile uint32_t rd_total;
 
-    /* 消费者私有：插值小数位、水位积分项 */
+    /* 消费者私有：插值小数位 */
     uint32_t frac_q16;
-    int32_t bias;
+
+    /*
+     * 比例控制（音高）：read_q16 是「每块从环形缓冲取多少样本」的当前值
+     * （Q16 定点，允许亚样本级慢速滑动），prod_ema_q8 是模拟器每块产出
+     * 样本数的 1/8 指数平均（Q8），用它算目标比例。
+     */
+    uint32_t read_q16;
+    int32_t prod_ema_q8;
+    int32_t level_ema_q8;
+    uint32_t last_wr;
+    bool ratio_primed;
 
     /* DC 阻断（一阶高通）状态 */
     int32_t dc_x1;
@@ -97,7 +122,8 @@ struct arcade_audio_ctx {
     volatile uint32_t overruns;    /* 环形缓冲满时丢掉的样本数 */
     volatile uint32_t write_err;
     volatile uint32_t ratio_permille;
-    volatile int32_t bias_snapshot;
+    volatile uint32_t ratio_target_permille;
+    volatile int32_t ratio_slew_permille_s;   /* 最近一块的比例变化率（千分比/秒） */
     uint16_t peak[STAT_BLOCKS];
     uint32_t mean_sq[STAT_BLOCKS];
     uint32_t stat_pos;
@@ -205,8 +231,104 @@ void arcade_audio_push(const uint8_t *src, uint32_t frames)
 /* ---------------- 消费者：音频任务 ---------------- */
 
 /*
- * 从环形缓冲里按水位取一块出来，做线性插值重采样填满 BLOCK_SAMPLES。
- * 水位高 → 这一块多取一点（音调略升）；水位低 → 少取一点（音调略降）。
+ * 比例控制：算出这一块应该从环形缓冲取多少样本。
+ *
+ * 旧做法是按水位做 PI，每块都改 —— 音高持续抖。现在分两层：
+ *   1. 目标比例 = 模拟器实际产出率（产出样本/块）的 1/8 指数平均，
+ *      再叠一个「水位慢修正」（水位 EMA 与目标水位的差 /2，它是常量偏置，
+ *      不是每块大摆的 P 项；修正同时受下面的速率限制）。
+ *      模拟器快、产出多，就每块多取一点（音高升）；这是决定音高的量。
+ *   2. 当前比例按 ±3%/s 的速度向目标滑——稳定不抖，只有模拟速度变化时才
+ *      听到一次很慢的滑音。
+ * 为什么不能直接拿瞬时水位算：模拟器每帧一次性推 803 个样本，水位是锯齿，
+ * 逐块跟它算就是那个抖动（vibrato）的根源。所以水位先过 EMA 再用。
+ */
+static uint32_t audio_read_count(struct arcade_audio_ctx *c, uint32_t avail)
+{
+    int32_t target_q16;
+    int32_t cur;
+    int32_t max_step;
+    int32_t step;
+    int32_t level_err;
+    uint32_t delta;
+
+    /* 产出量估计：上一块到现在模拟器推进了多少样本 */
+    delta = c->wr_total - c->last_wr;
+    c->last_wr = c->wr_total;
+    if (delta > 2u * BLOCK_SAMPLES) {
+        /* 切游戏/快进时的大跳变不参与估计 */
+        delta = 2u * BLOCK_SAMPLES;
+    }
+
+    /* 水位也过一遍 EMA（同样是 1/8），把每帧推一大块的锯齿磨平 */
+    c->level_ema_q8 += (((int32_t)avail << 8) - c->level_ema_q8) / 8;
+
+    if (!c->ratio_primed) {
+        /* 第一块直接拿实际产出量当初值，省掉从 1.0x 慢滑到 0.7x 的滑音 */
+        c->prod_ema_q8 = (int32_t)delta << 8;
+        c->level_ema_q8 = (int32_t)avail << 8;
+        c->ratio_primed = true;
+    } else {
+        c->prod_ema_q8 += (((int32_t)delta << 8) - c->prod_ema_q8) / 8;
+    }
+
+    target_q16 = (int32_t)((uint32_t)c->prod_ema_q8 >> 8) << 16;
+
+    /* 水位慢修正：只把目标往「回到 TARGET_LEVEL」推一点点势 */
+    level_err = (int32_t)((uint32_t)c->level_ema_q8 >> 8) - (int32_t)TARGET_LEVEL;
+    target_q16 += level_err / 2;
+
+    /* 速率限制（每块最大能改多少，Q16 定点） */
+    max_step = (int32_t)(((int64_t)RATIO_SLEW_PERMILLE_PER_S * BLOCK_SAMPLES * 65536) /
+                         (1000 * BLOCKS_PER_SEC));
+
+    /* 极端水位：直接按最大速率推，防止长时间漂到吃穿/滞死 */
+    if (avail < LEVEL_LOW) {
+        target_q16 = (int32_t)c->read_q16 + max_step;
+        c->level_ema_q8 = (int32_t)avail << 8;
+    } else if (avail > LEVEL_HIGH) {
+        target_q16 = (int32_t)c->read_q16 - max_step;
+        c->level_ema_q8 = (int32_t)avail << 8;
+    }
+
+    if (target_q16 < ((int32_t)READ_MIN << 16)) {
+        target_q16 = (int32_t)READ_MIN << 16;
+    } else if (target_q16 > ((int32_t)READ_MAX << 16)) {
+        target_q16 = (int32_t)READ_MAX << 16;
+    }
+
+    cur = (int32_t)c->read_q16;
+    if (cur == 0) {
+        cur = target_q16;
+    }
+
+    step = target_q16 - cur;
+    if (step > max_step) {
+        step = max_step;
+    } else if (step < -max_step) {
+        step = -max_step;
+    }
+    cur += step;
+
+    if (cur < ((int32_t)READ_MIN << 16)) {
+        cur = (int32_t)READ_MIN << 16;
+    } else if (cur > ((int32_t)READ_MAX << 16)) {
+        cur = (int32_t)READ_MAX << 16;
+    }
+
+    c->read_q16 = (uint32_t)cur;
+    c->ratio_permille = (uint32_t)(((uint64_t)cur * 1000u) / ((uint32_t)BLOCK_SAMPLES << 16));
+    c->ratio_target_permille =
+        (uint32_t)(((uint64_t)target_q16 * 1000u) / ((uint32_t)BLOCK_SAMPLES << 16));
+    /* 实际变化率（千分比/秒），隔一会儿再跑一条 `arcade audio` 对比即知是否还在抖 */
+    c->ratio_slew_permille_s =
+        (int32_t)(((int64_t)step * 1000 * BLOCKS_PER_SEC) / BLOCK_SAMPLES);
+
+    return (uint32_t)(cur >> 16);
+}
+
+/*
+ * 从环形缓冲里取一块出来，做线性插值重采样填满 BLOCK_SAMPLES。
  */
 static void audio_fill_block(struct arcade_audio_ctx *c)
 {
@@ -216,8 +338,6 @@ static void audio_fill_block(struct arcade_audio_ctx *c)
     uint32_t span;
     uint32_t consumed;
     uint32_t i;
-    int32_t err;
-    int32_t rc;
     uint64_t pos;
     uint64_t step;
     int32_t peak = 0;
@@ -228,44 +348,27 @@ static void audio_fill_block(struct arcade_audio_ctx *c)
 
     if (avail < 16) {
         /* 欠载：输出静音，并把插值/DC 状态复位，避免下一块从旧数据接上来。
-         * 注意不能清零 bias：那是「模拟器恒定偏慢/偏快」的学习值，
+         * 不清比例状态——那是「模拟器恒定偏慢/偏快」的学习值，
          * 一欠载就清会让它永远学不会比例，反复欠载。 */
         memset(out, 0, sizeof(int16_t) * BLOCK_SAMPLES);
         c->frac_q16 = 0;
         c->dc_x1 = 0;
         c->dc_y1 = 0;
         c->underruns++;
-        c->ratio_permille = 0;
-        c->bias_snapshot = c->bias;
+        c->last_wr = c->wr_total;
         c->blocks++;
         stat_store(c, 0, 0);
         return;
     }
 
-    /* PI 控制：err 是当前水位与目标的偏差。
-     * bias 是积分项，负责吃掉「模拟器速度恒定偏慢/偏快」的长期偏差；
-     * err/4 是比例项，负责把短时抖动拉回来。 */
-    err = (int32_t)avail - TARGET_LEVEL;
-    c->bias += err / 32;
-    if (c->bias > 400) {
-        c->bias = 400;
-    } else if (c->bias < -400) {
-        c->bias = -400;
-    }
+    read_count = audio_read_count(c, avail);
 
-    rc = (int32_t)BLOCK_SAMPLES + c->bias + err / 4;
-    if (rc < READ_MIN) {
-        rc = READ_MIN;
-    } else if (rc > READ_MAX) {
-        rc = READ_MAX;
+    if (read_count > avail) {
+        read_count = avail;
     }
-    if (rc > (int32_t)avail) {
-        rc = (int32_t)avail;
+    if (read_count < 2) {
+        read_count = 2;
     }
-
-    read_count = (uint32_t)rc;
-    c->ratio_permille = read_count * 1000u / BLOCK_SAMPLES;
-    c->bias_snapshot = c->bias;
 
     /* 拷到连续 staging：环形缓冲最多跨一次边界，逐个取模太浪费 */
     span = read_count + 2;
@@ -591,9 +694,12 @@ void arcade_audio_flush(void)
     taskEXIT_CRITICAL();
 
     c->frac_q16 = 0;
-    c->bias = 0;
     c->dc_x1 = 0;
     c->dc_y1 = 0;
+    /* 进游戏/切 ROM 时产出率变了，重新学：下一块直接对齐实际产出量 */
+    c->ratio_primed = false;
+    c->read_q16 = 0;
+    c->last_wr = c->wr_total;
 }
 
 void arcade_audio_set_volume(uint32_t vol)
@@ -643,8 +749,9 @@ int arcade_audio_report(char *out, uint32_t out_len)
     uint32_t over;
     uint32_t errs;
     uint32_t ratio;
+    uint32_t target;
     uint32_t level;
-    int32_t bias;
+    int32_t slew;
     int n;
 
     if (out == NULL || out_len < 64) {
@@ -664,7 +771,8 @@ int arcade_audio_report(char *out, uint32_t out_len)
     over = c->overruns;
     errs = c->write_err;
     ratio = c->ratio_permille;
-    bias = c->bias_snapshot;
+    target = c->ratio_target_permille;
+    slew = c->ratio_slew_permille_s;
     taskEXIT_CRITICAL();
 
     level = wr - rd;
@@ -678,9 +786,14 @@ int arcade_audio_report(char *out, uint32_t out_len)
     }
 
     n += snprintf(out + n, out_len - (uint32_t)n,
-                  "vol=%u%% ratio=%u.%03ux bias=%d active=%d\n",
+                  "vol=%u%% ratio=%u.%03ux target=%u.%03ux slew=%s%d.%02u%%/s active=%d\n",
                   (unsigned)s_vol, (unsigned)(ratio / 1000u),
-                  (unsigned)(ratio % 1000u), (int)bias, s_active ? 1 : 0);
+                  (unsigned)(ratio % 1000u),
+                  (unsigned)(target / 1000u), (unsigned)(target % 1000u),
+                  slew < 0 ? "-" : "+",
+                  (unsigned)((slew < 0 ? -slew : slew) / 10),
+                  (unsigned)((slew < 0 ? -slew : slew) % 10),
+                  s_active ? 1 : 0);
     if (n < 0 || (uint32_t)n >= out_len) {
         return n;
     }

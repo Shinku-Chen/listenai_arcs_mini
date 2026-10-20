@@ -45,6 +45,10 @@ typedef struct {
     uint16_t h;
     uint16_t x_offset;
     uint16_t y_offset;
+    /* 控制器显存的总行数（ST7789 为 320，玻璃只有 panel_h 行）。
+     * 硬件行镜像（MADCTL MY）是在整块显存里翻的，需要靠它算出补偿量。
+     * 0 表示未知，按 panel_h 处理（不补偿）。 */
+    uint16_t gram_h;
 } lisa_display_panel_mem_area_t;
 
 typedef uint8_t lisa_mem_coord_t[4];
