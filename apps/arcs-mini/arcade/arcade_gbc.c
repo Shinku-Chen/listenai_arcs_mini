@@ -514,6 +514,16 @@ static void stats_sample(struct arcade_gbc_priv *p)
 {
     EmulatorArcadeSnapshot snap;
 
+    /*
+     * PC/SP 直方图是调试用的：emulator_arcade_snapshot() 每次都把二十几个字段
+     * 从 PSRAM 的 Emulator 里读一遍，而这个 Emulator 每帧都在搅 D-Cache。
+     * 每帧都采没有额外信息量，改成每 8 帧一次，把这笔开销从热路径上挪走。
+     */
+    if ((p->frame_n & 7U) != 0) {
+        p->frame_n++;
+        return;
+    }
+
     emulator_arcade_snapshot(p->emu, &snap);
     p->frame_n++;
     hist_sample(p, snap.pc, snap.sp);

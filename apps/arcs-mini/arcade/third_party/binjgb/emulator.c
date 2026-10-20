@@ -22,6 +22,19 @@
 
 #include "emulator.h"
 
+/*
+ * ARCS-MINI 移植：把最热的小函数放进 ILM（16KB 指令紧耦合内存）。
+ *
+ * CP 核的 I-Cache 只有 32KB / 2 路，而 execute_instruction 一个函数就 39.7KB
+ * （整个 emulator.c 的 text 是 97KB），PPU 这类按 tick 调用的同步函数在里面
+ * 反复取指、几乎每次都 miss —— 每次 miss 都是一次 PSRAM 读。放进 ILM 后不经过
+ * cache，取指是 0 等待。
+ *
+ * 只放「每帧调用上千次且体积小」的函数，不要往这里塞大函数：ILM 共 16KB，
+ * LVGL 已经占掉 5.6KB，溢出时链接会直接报错（>ITCM 放不下）。
+ */
+#define ITCM_TEXT __attribute__((section(".itcm_text")))
+
 #define MAX_CART_INFOS (MAXIMUM_ROM_SIZE / MINIMUM_ROM_SIZE)
 #define VIDEO_RAM_SIZE KILOBYTES(16)
 #define WORK_RAM_SIZE KILOBYTES(32)
@@ -1990,7 +2003,7 @@ static Bool is_dma_access_ok(Emulator* e, Address addr) {
   return DMA.state != DMA_ACTIVE || (addr & 0xff00) != 0xfe00;
 }
 
-static u8 read_u8_pair(Emulator* e, MemoryTypeAddressPair pair, Bool raw) {
+static ITCM_TEXT u8 read_u8_pair(Emulator* e, MemoryTypeAddressPair pair, Bool raw) {
   switch (pair.type) {
     /* Take advantage of the fact that MEMORY_MAP_ROM9 is 0, and ROM1 is 1 when
      * indexing into rom_base. */
@@ -3433,7 +3446,7 @@ static u32 mode3_tick_count(Emulator* e) {
   return ticks;
 }
 
-static void ppu_mode3_synchronize(Emulator* e) {
+static ITCM_TEXT void ppu_mode3_synchronize(Emulator* e) {
   u8 x = PPU.render_x;
   const u8 y = PPU.line_y;
   if (STAT.mode != PPU_MODE_MODE3 || x >= SCREEN_WIDTH) return;
@@ -3619,7 +3632,7 @@ static void ppu_mode3_synchronize(Emulator* e) {
   PPU.render_x = x;
 }
 
-static void ppu_synchronize(Emulator* e) {
+static ITCM_TEXT void ppu_synchronize(Emulator* e) {
   assert(IS_ALIGNED(PPU.sync_ticks, CPU_TICK));
   Ticks aligned_ticks = ALIGN_DOWN(TICKS, CPU_TICK);
   if (aligned_ticks > PPU.sync_ticks) {

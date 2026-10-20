@@ -84,6 +84,30 @@ static uint32_t s_frames;
 static TickType_t s_fps_tick;
 static uint32_t s_fps_x10;
 
+/*
+ * 帧节奏（定步长自适应）。
+ *
+ * CGB 模拟器一帧要 25~35ms，离 CONFIG_ARCADE_FRAME_PERIOD_MS（16ms，60fps）
+ * 差得远。原来按固定 16ms 跑，每帧都超时，帧间隔在 27~45ms 之间乱跳，
+ * 观感就是「一卡一卡」。改成定步长：
+ * 一帧实际耗时超过当前步长 → 用指数平均跟踪实际工作量，把步长抬到「工作量 + 2ms」；
+ * 工作量降下来时每帧回落 1ms（不一次跳到底，避免抖）。
+ *   - `arcade period <ms>` 可以手动钉住步长做对比实验，0 = 回到自适应。
+ * 结果是帧间隔变成常数（例如恒定 30fps），比 20~27fps 抖动的观感线性得多，
+ * 而且限流之后送屏任务能真正和模拟器并行，不会两边抢缓冲。
+ */
+#define ARCADE_MIN_FRAME_PERIOD_MS  CONFIG_ARCADE_FRAME_PERIOD_MS
+#define ARCADE_MAX_FRAME_PERIOD_MS  60
+static uint32_t s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
+static uint32_t s_work_ema = CONFIG_ARCADE_FRAME_PERIOD_MS;
+static bool s_period_auto = true;
+
+/* 最近若干帧的帧间隔（ms），用来回答「抖不抖」 */
+#define FRAME_STAT_SLOTS 64
+static uint8_t s_frame_ms[FRAME_STAT_SLOTS];
+static uint32_t s_frame_pos;
+static uint32_t s_frame_cnt;
+
 extern int boot_watchdog_feed(void);
 extern struct lsfs_mount_t *platform_sd_mount_get(void);
 /* 时钟频率（MHz 级即可），用来把耗时换算成 cycles 参考 */
@@ -384,6 +408,60 @@ static void arcade_handle_request(void)
 
 /* ------------- 主循环 ------------- */
 
+/* 记一帧的间隔（ms tick）；只统计播放状态的帧 */
+static void frame_stat_push(TickType_t spent)
+{
+    if (s_mode != ARCADE_MODE_PLAY) {
+        return;
+    }
+
+    s_frame_ms[s_frame_pos] = (uint8_t)(spent > 255 ? 255 : spent);
+    s_frame_pos = (s_frame_pos + 1) % FRAME_STAT_SLOTS;
+    if (s_frame_cnt < FRAME_STAT_SLOTS) {
+        s_frame_cnt++;
+    }
+}
+
+/* 打印帧间隔统计：min/avg/p95/max，抖动看 p95 和 max 的差 */
+static void frame_stat_report(char *out, uint32_t len)
+{
+    uint8_t sorted[FRAME_STAT_SLOTS];
+    uint32_t n = s_frame_cnt;
+    uint32_t sum = 0;
+
+    if (out == NULL || len == 0) {
+        return;
+    }
+
+    if (n == 0) {
+        snprintf(out, len, "frame n=0");
+        return;
+    }
+
+    memcpy(sorted, s_frame_ms, n);
+    for (uint32_t i = 1; i < n; i++) {
+        uint8_t key = sorted[i];
+        int32_t j = (int32_t)i - 1;
+
+        while (j >= 0 && sorted[j] > key) {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = key;
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        sum += sorted[i];
+    }
+
+    /* p95 用「第 90% 分位」的写法，n<20 时基本等于 max */
+    uint32_t p95 = sorted[(n * 95U) / 100U >= n ? n - 1 : (n * 95U) / 100U];
+
+    snprintf(out, len, "frame n=%u min=%u avg=%u p95=%u max=%u",
+             (unsigned)n, (unsigned)sorted[0], (unsigned)(sum / n),
+             (unsigned)p95, (unsigned)sorted[n - 1]);
+}
+
 static void arcade_frame_tick(void)
 {
     TickType_t now = xTaskGetTickCount();
@@ -462,12 +540,52 @@ static void arcade_task(void *arg)
 
         idle = arcade_ui_handler();
 
-        uint32_t period = CONFIG_ARCADE_FRAME_PERIOD_MS;
-        if (s_mode != ARCADE_MODE_PLAY && idle > period) {
-            period = idle;
+        TickType_t spent = xTaskGetTickCount() - start;
+
+        /*
+         * 定步长自适应（见 s_period_ms 的注释）：
+         * 用 1/8 的指数平均跟踪「一帧真正要干多少活」，再拿它 +2ms 当步长。
+         * 单帧尖尖（比如存盘那一帧）只影响 1/8，不会被误当成常态；
+         * 活变轻时每帧回落 1ms，不会一直卡在慢档。
+         */
+        if (s_mode == ARCADE_MODE_PLAY) {
+            s_work_ema = (s_work_ema * 7U + (uint32_t)spent) / 8U;
+
+            if (s_period_auto) {
+                uint32_t target = s_work_ema + 2;
+
+                if (target < ARCADE_MIN_FRAME_PERIOD_MS) {
+                    target = ARCADE_MIN_FRAME_PERIOD_MS;
+                } else if (target > ARCADE_MAX_FRAME_PERIOD_MS) {
+                    target = ARCADE_MAX_FRAME_PERIOD_MS;
+                }
+
+                if (target > s_period_ms) {
+                    s_period_ms = target;
+                    LISA_LOGI(TAG, "frame period -> %u ms (%u fps locked, work ~%u ms)",
+                              (unsigned)s_period_ms,
+                              (unsigned)(s_period_ms > 0 ? 1000U / s_period_ms : 0),
+                              (unsigned)s_work_ema);
+                } else if (target + 3 < s_period_ms) {
+                    s_period_ms--;
+                }
+            }
         }
 
-        TickType_t spent = xTaskGetTickCount() - start;
+        frame_stat_push(spent);
+
+        uint32_t period = s_period_ms;
+        if (s_mode != ARCADE_MODE_PLAY) {
+            /* 不在玩游戏时把步长复位，下次开局重新学 */
+            if (s_period_auto) {
+                s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
+            }
+            period = s_period_ms;
+            if (idle > period) {
+                period = idle;
+            }
+        }
+
         TickType_t wait = pdMS_TO_TICKS(period);
         if (spent < wait) {
             vTaskDelay(wait - spent);
@@ -569,6 +687,96 @@ static int cmd_stat(int argc, char **argv)
                arcade_save_pending() ? 1 : 0);
     shellPrint(shell, "psram_free=%u KB\r\n",
                (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    {
+        char line[160];
+
+        frame_stat_report(line, sizeof(line));
+        shellPrint(shell, "%s (period=%u ms%s)\r\n", line, (unsigned)s_period_ms,
+                   s_period_auto ? ", auto" : ", fixed");
+    }
+    return 0;
+}
+
+/*
+ * arcade period [ms]：显示/钉住定步长的帧周期。
+ *
+ * 0 表示恢复自适应（默认）：慢就把步长抬上去，求恒定帧率。
+ * 给定数值则固定成那个周期，方便对比「33ms 恒定」和「自适应」的观感。
+ */
+static int cmd_period(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (argc < 1) {
+        shellPrint(shell, "period=%u ms (%s)\r\n", (unsigned)s_period_ms,
+                   s_period_auto ? "auto" : "fixed");
+        return 0;
+    }
+
+    int v = atoi(argv[0]);
+
+    if (v <= 0) {
+        s_period_auto = true;
+        s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
+        s_work_ema = CONFIG_ARCADE_FRAME_PERIOD_MS;
+        shellPrint(shell, "period: auto (%u ms 起)\r\n", (unsigned)s_period_ms);
+        return 0;
+    }
+
+    if (v < 8) {
+        v = 8;
+    } else if (v > ARCADE_MAX_FRAME_PERIOD_MS) {
+        v = ARCADE_MAX_FRAME_PERIOD_MS;
+    }
+
+    s_period_auto = false;
+    s_period_ms = (uint32_t)v;
+    shellPrint(shell, "period: 固定 %d ms (%d fps)\r\n", v, 1000 / v);
+    return 0;
+}
+
+/*
+ * arcade clock：量真实的核频。
+ *
+ * SystemCoreClock 在本 SoC 上只是个常量（system_RISCVN300.c 的
+ * SystemCoreClockUpdate() 直接赋 SYSTEM_CLOCK），串口里打出来的 24MHz
+ * 不是真实频率。用 rdcycle 在一个已知的 tick 间隔里数一下才是真的。
+ */
+static inline uint32_t arcade_rdcycle(void)
+{
+    uint32_t v;
+
+    __asm__ volatile("rdcycle %0" : "=r"(v));
+    return v;
+}
+
+static int cmd_clock(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    uint32_t c0;
+    uint32_t c1;
+    TickType_t t0;
+    TickType_t t1;
+    uint32_t ms;
+
+    (void)argc;
+    (void)argv;
+
+    c0 = arcade_rdcycle();
+    t0 = xTaskGetTickCount();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    t1 = xTaskGetTickCount();
+    c1 = arcade_rdcycle();
+
+    ms = (uint32_t)(t1 - t0);
+    if (ms == 0) {
+        ms = 1;
+    }
+
+    shellPrint(shell, "wall=%u ms cycles=%u -> %u MHz (SystemCoreClock=%u MHz)\r\n",
+               (unsigned)ms, (unsigned)(c1 - c0),
+               (unsigned)((uint32_t)(c1 - c0) / (ms * 1000U)),
+               (unsigned)(SystemCoreClock / 1000000U));
     return 0;
 }
 
@@ -1425,6 +1633,8 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"audio", cmd_audio, "音频状态：audio [peak|reset]"},
     {"vol", cmd_vol, "音量：vol <0-100>"},
     {"perf", cmd_perf, "帧率与各段耗时：perf [reset]"},
+    {"period", cmd_period, "定步长帧周期：period [ms]（0 = 自适应）"},
+    {"clock", cmd_clock, "量真实核频（mcycle）"},
     {"scale", cmd_scale, "缩放：scale <1|15>（15 = 1.5 倍）"},
     {"apu", cmd_apu, "开关模拟器 APU：apu <0|1>（量声音耗时）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
