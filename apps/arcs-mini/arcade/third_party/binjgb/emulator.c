@@ -661,16 +661,15 @@ typedef struct {
 } CpuSpeed;
 
 /*
- * ARCS-MINI port: VRAM（16KB，两个 bank）改成指针，实体放内部 SRAM
- * （见下面的 s_vram_data）。
+ * ARCS-MINI port: VRAM（16KB，两个 bank）和 WRAM（32KB，八个 bank）都改成
+ * 指针，实体放内部 SRAM（见下面的 s_vram_data / s_wram_data）。
  *
- * 原因：Emulator 结构体整体在 PSRAM，VRAM 是模拟器里访问最频繁的数组之一
- * （PPU 每个可见像素都要读瓦片位平面 + CGB 属性表）。32KB 的 D-Cache 一边被
- * 92KB 帧缓冲写冲刷、一边要装 ROM 取指，VRAM 几乎每次都 miss；实测一帧
- * 70224 tick 要 27ms（300MHz 核 ≈ 8.1M cycles），折合每条指令 300+ cycles，
- * 大头就是这种访存代价。放进 SRAM 后这部分访问不再 miss。
- *
- * WRAM 有 32KB，SRAM 里腾不出这么多，所以它留在 PSRAM。
+ * 原因：Emulator 结构体整体在 PSRAM，VRAM/WRAM 是模拟器里访问最频繁的数组
+ * （PPU 每个可见像素都要读瓦片位平面 + CGB 属性表；CPU 的栈、热变量、零页
+ * 全在 WRAM）。16KB 的 D-Cache 一边被 46KB 帧缓冲写冲刷、一边要装 ROM 取指，
+ * 这两个数组几乎每次都 miss；实测一帧 70224 tick 要 27ms（300MHz 核 ≈ 8.1M
+ * cycles），折合每条指令 300+ cycles，大头就是这种访存代价。搬进 SRAM 后
+ * 这部分访问不再 miss。
  */
 #if defined(CONFIG_ARCADE_GB_STATE_IN_SRAM)
 typedef struct {
@@ -689,11 +688,28 @@ typedef struct {
 } Vram;
 #endif
 
+#if defined(CONFIG_ARCADE_GB_STATE_IN_SRAM)
+typedef struct {
+  u8* data;
+  Address offset;
+  u8 bank;
+} Wram;
+
+/*
+ * 八个 4KB bank 连成一维 32KB 数组，和 binjgb 原本的布局完全一致：
+ * bank n 的基址就是 data[n << 12]，bank0 特例地把 offset 定在 0x1000
+ * （GB 的 0xC000~0xCFFF 固定页，见 WRAM.offset 的赋值处）。
+ * 所以搬进 SRAM 只需要换实体内存，bank 切换逻辑一行不用改。
+ */
+static u8 s_wram_data[WORK_RAM_SIZE] __attribute__((aligned(32)));
+#define WRAM_STATE_DATA s_wram_data
+#else
 typedef struct {
   u8 data[WORK_RAM_SIZE];
   Address offset;
   u8 bank;
 } Wram;
+#endif
 
 typedef struct {
   DmaState state;
@@ -5059,9 +5075,12 @@ Result emulator_read_state(Emulator* e, const FileData* file_data) {
             SAVE_STATE_HEADER);
   memcpy(&e->state, new_state, sizeof(EmulatorState));
 #if defined(CONFIG_ARCADE_GB_STATE_IN_SRAM)
-  /* VRAM.data 是指向静态数组的指针，memcpy 会把存档里那份指针覆盖掉，
-   * 这里重新挂回来（否则下一次访问直接野指针）。 */
+  /* VRAM/WRAM 的 data 是指向静态数组的指针，memcpy 会把存档里那份指针覆盖掉，
+   * 这里重新挂回来（否则下一次访问直接野指针）。
+   * 注意：存档格式因此不包含 VRAM/WRAM 内容（指针所在标量被拷了，实体没拷），
+   * 这和 VRAM 搬 SRAM 之前已有的限制一致；当前固件不调用存档状态接口。 */
   e->state.vram.data = VRAM_STATE_DATA;
+  e->state.wram.data = WRAM_STATE_DATA;
 #endif
   set_cart_info(e, e->state.cart_info_index);
 
@@ -5167,8 +5186,9 @@ Emulator* emulator_new(const EmulatorInit* init) {
   /* ARCS-MINI port: PSRAM 分配可能返回 NULL，不先判会直接空指针解引用 */
   CHECK(e != NULL);
 #if defined(CONFIG_ARCADE_GB_STATE_IN_SRAM)
-  /* VRAM 的实体是 SRAM 里的静态数组，必须在任何访问之前挂上 */
+  /* VRAM/WRAM 的实体是 SRAM 里的静态数组，必须在任何访问之前挂上 */
   e->state.vram.data = VRAM_STATE_DATA;
+  e->state.wram.data = WRAM_STATE_DATA;
 #endif
   CHECK(SUCCESS(set_rom_file_data(e, &init->rom)));
   CHECK(SUCCESS(init_emulator(e, init)));
