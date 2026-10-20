@@ -135,6 +135,38 @@ static uint32_t s_last_frame_cyc;
 /* PLAY 模式下把 LVGL 定时器降频后，用来数帧 */
 static uint32_t s_lvgl_skip;
 
+/*
+ * 跳帧保速（skip / render decoupling）。
+ *
+ * 背景：GBC 模拟一帧路逻辑要 ~13.7ms，再加上 PPU 画像素 ~4.5ms 就到 18.2ms，
+ * 超过 GB 机的真实帧周期 16.74ms（70224 tick / 4.194304MHz）—— 帧率只能到
+ * ~55fps，于是「游戏变慢、音高偏低」。
+ *
+ * 但这 60Hz 里真正不能慢的是**逻辑与音频**，画面可以少画几张。所以：
+ *   - 模拟（CPU/PPU 状态机/APU/定时器）每一帧必跑，按 16.74ms 节拍锁住；
+ *   - 像素渲染/送屏按「预算信用」挑着做，不够就跳（保留上一帧画面）。
+ *
+ * 信用账：每帧进账一个帧预算，花掉这一帧的实测耗时（rdcycle）。
+ * 只要信用 ≥ 渲染的额外开销就渲染。稳态会自动收敛成 2/3 帧渲染（~40fps）、
+ * 逻辑恒定 59.7fps。
+ */
+#define ARCADE_GB_FRAME_US       16743U   /* GB 真实帧周期 */
+#define ARCADE_RENDER_EXTRA_INIT 4500U    /* 渲染额外开销初值（µs） */
+
+static bool s_skip_auto = true;                       /* 自动跳帧保速 */
+static arcade_render_mode_t s_skip_mech = ARCADE_RENDER_SKIP;  /* 跳过的实现方式 */
+static int32_t s_skip_credit_us;                      /* 渲染余量信用（µs） */
+static uint32_t s_render_extra_us = ARCADE_RENDER_EXTRA_INIT;
+static uint32_t s_render_cost_us = 18200;             /* 渲染帧耗时 EMA */
+static uint32_t s_skip_cost_us = 13700;               /* 跳过帧耗时 EMA */
+static bool s_last_render = true;
+static uint32_t s_logic_frames;
+static uint32_t s_render_frames;
+static uint32_t s_skipped_frames;
+static uint32_t s_logic_fps_x10;
+static uint32_t s_render_fps_x10;
+static TickType_t s_rate_tick;
+
 /* 最近若干帧的帧间隔（ms），用来回答「抖不抖」 */
 #define FRAME_STAT_SLOTS 64
 static uint8_t s_frame_ms[FRAME_STAT_SLOTS];
@@ -311,6 +343,16 @@ static void arcade_start_selected(void)
     s_frame_us = 0;
     s_scale_down_cnt = 0;
     s_scale_up_cnt = 0;
+    /* 跳帧保速的信用与成本估计重新学（不同 ROM 的开销差很多） */
+    s_skip_credit_us = 0;
+    s_render_extra_us = ARCADE_RENDER_EXTRA_INIT;
+    s_render_cost_us = 18200;
+    s_skip_cost_us = 13700;
+    s_last_render = true;
+    s_logic_frames = 0;
+    s_render_frames = 0;
+    s_skipped_frames = 0;
+    s_rate_tick = 0;
     if (s_scale_auto) {
         arcade_video_set_scale(2);
     }
@@ -526,6 +568,80 @@ static void arcade_frame_tick(void)
     }
 }
 
+/* 逻辑帧 / 渲染帧分开数（跳帧保速后两者不再相等） */
+static void arcade_rate_tick(bool rendered)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    s_logic_frames++;
+    if (rendered) {
+        s_render_frames++;
+    } else {
+        s_skipped_frames++;
+    }
+
+    if (s_rate_tick == 0) {
+        s_rate_tick = now;
+        return;
+    }
+
+    if ((uint32_t)(now - s_rate_tick) >= pdMS_TO_TICKS(1000)) {
+        uint32_t elapsed = (uint32_t)(now - s_rate_tick);
+
+        s_logic_fps_x10 = (s_logic_frames * 10000U) / elapsed;
+        s_render_fps_x10 = (s_render_frames * 10000U) / elapsed;
+        s_logic_frames = 0;
+        s_render_frames = 0;
+        s_rate_tick = now;
+    }
+}
+
+/* 这一帧要不要画？信用不够就跳（保留上一帧画面） */
+static bool arcade_should_render(void)
+{
+    if (!s_skip_auto) {
+        return true;
+    }
+
+    return s_skip_credit_us >= (int32_t)s_render_extra_us;
+}
+
+/*
+ * 信用账：每帧进账一个 GB 帧周期（16.74ms），花掉这一帧的实测耗时。
+ * 同时用 EMA 学会「画」与「不画」各自的成本差，作为下一帧的准入门槛。
+ */
+static void arcade_skip_account(uint32_t cost_us, bool rendered)
+{
+    int32_t pace;
+    uint32_t extra;
+
+    if (cost_us < 2000U) {
+        cost_us = 2000U;
+    } else if (cost_us > 100000U) {
+        /* 切页面 / 写卡那种长停帧不参与统计，否则 EMA 会被带飞 */
+        return;
+    }
+
+    if (rendered) {
+        s_render_cost_us = (s_render_cost_us * 7U + cost_us) / 8U;
+    } else {
+        s_skip_cost_us = (s_skip_cost_us * 7U + cost_us) / 8U;
+    }
+
+    extra = (s_render_cost_us > s_skip_cost_us)
+                ? (s_render_cost_us - s_skip_cost_us) : 0U;
+    s_render_extra_us = (s_render_extra_us * 3U + extra) / 4U;
+
+    /* pace > 0 = 比 59.7Hz 节拍快，可以先花在渲染上；< 0 = 已经落后 */
+    pace = s_skip_credit_us + (int32_t)ARCADE_GB_FRAME_US - (int32_t)cost_us;
+    if (pace > (int32_t)(2U * ARCADE_GB_FRAME_US)) {
+        pace = (int32_t)(2U * ARCADE_GB_FRAME_US);
+    } else if (pace < -(int32_t)ARCADE_GB_FRAME_US) {
+        pace = -(int32_t)ARCADE_GB_FRAME_US;
+    }
+    s_skip_credit_us = pace;
+}
+
 /*
  * 自动缩放：每帧量一次真实帧周期，持续不达标就降 1x。
  * 必须在 arcade 任务里调（arcade_video_set_scale 会排空送屏流水线）。
@@ -551,6 +667,18 @@ static void arcade_auto_scale_tick(void)
     s_frame_us = (s_frame_us * 7U + delta) / 8U;
 
     if (!s_scale_auto) {
+        return;
+    }
+
+    /*
+     * 跳帧保速下，渲染帧率已经被解耦出来 ——— 降分辨率换不来速度，只会变小画面，
+     * 所以直接钉 1.5x（用户口径：速度优先，但画面能大就大）。
+     */
+    if (s_skip_auto) {
+        if (arcade_video_scale() == 1) {
+            s_scale_up_cnt = 0;
+            arcade_video_set_scale(2);
+        }
         return;
     }
 
@@ -619,6 +747,7 @@ static void arcade_task(void *arg)
 
     for (;;) {
         TickType_t start = xTaskGetTickCount();
+        uint32_t frame_t0 = arcade_cycles();
         uint32_t idle;
 
         if (s_pending_action != 0xFF) {
@@ -640,9 +769,18 @@ static void arcade_task(void *arg)
                 LISA_LOGI(TAG, "ESC from keyboard, back to ROM list");
                 arcade_stop_game();
             } else {
+                bool render = arcade_should_render();
+
                 arcade_core_set_input(arcade_input_mask() | kbd);
+                /*
+                 * 逻辑每帧必跑；画面按预算选。跳过的帧 panel 上保留上一帧，
+                 * 因为 present 也一并跳过了（不会重复送同一块内容）。
+                 */
+                arcade_gb_set_render_mode(render ? ARCADE_RENDER_FULL : s_skip_mech);
                 arcade_core_run_frame();
+                s_last_render = render;
                 arcade_frame_tick();
+                arcade_rate_tick(render);
                 arcade_auto_scale_tick();
             }
         }
@@ -665,35 +803,71 @@ static void arcade_task(void *arg)
         }
 
         TickType_t spent = xTaskGetTickCount() - start;
+        uint32_t cost_us = arcade_cyc_to_us((uint32_t)(arcade_cycles() - frame_t0));
 
         /*
          * 只跟踪工作量（留给 `arcade period` 报告），不再拿它去抬步长。
          */
         if (s_mode == ARCADE_MODE_PLAY) {
-            s_work_ema = (s_work_ema * 7U + (uint32_t)spent) / 8U;
+            s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
+            arcade_skip_account(cost_us, s_last_render);
         }
 
         frame_stat_push(spent);
 
+        /*
+         * 帧节拍：按 rdcycle 的微秒数算，而不是按 1ms 的 tick 算。
+         * tick 粒度向下取整会把 16.74ms 的预算变成 16ms（62.5fps，音频偏快
+         * 4.5%），四舍五入到最近的 tick 才能压在 59.7fps 附近。
+         */
         uint32_t period = s_period_ms;
+        uint32_t budget_us = (s_mode == ARCADE_MODE_PLAY && s_period_auto)
+                                 ? ARCADE_GB_FRAME_US : (period * 1000U);
+
         if (s_mode != ARCADE_MODE_PLAY) {
             /* 不在玩游戏时把步长复位 */
             if (s_period_auto) {
                 s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
             }
             period = s_period_ms;
+            budget_us = period * 1000U;
             if (idle > period) {
-                period = idle;
+                budget_us = idle * 1000U;
             }
         }
 
-        TickType_t wait = pdMS_TO_TICKS(period);
-        if (spent < wait) {
-            vTaskDelay(wait - spent);
-        } else if (++s_overrun_count >= 8U) {
-            /* 一直超预算时也别把 IDLE 饿死：每 8 帧让一个 tick */
-            s_overrun_count = 0;
-            vTaskDelay(1);
+        if (s_mode == ARCADE_MODE_PLAY) {
+            /*
+             * 跳帧保速的节拍控制：pace 是「领先于 59.7Hz 节拍的微秒数」。
+             * 领先部分先留给渲染（所以阈值至少是 render_extra），剩下的才睡——
+             * 这样既不会把渲染机会睡掉，也不会让逻辑跑快（逻辑快了音高就偏高）。
+             */
+            int32_t reserve = s_skip_auto ? (int32_t)s_render_extra_us : 0;
+            int32_t ahead = s_skip_credit_us - reserve;
+
+            if (ahead > 0) {
+                uint32_t wait_ms = ((uint32_t)ahead + 500U) / 1000U;
+
+                if (wait_ms > 0) {
+                    vTaskDelay(pdMS_TO_TICKS(wait_ms));
+                    s_skip_credit_us -= (int32_t)(wait_ms * 1000U);
+                }
+                s_overrun_count = 0;
+            } else if (++s_overrun_count >= 8U) {
+                /* 一直超预算时也别把 IDLE 饿死：每 8 帧让一个 tick */
+                s_overrun_count = 0;
+                vTaskDelay(1);
+                s_skip_credit_us -= 1000;
+            } else {
+                taskYIELD();
+            }
+        } else if (cost_us < budget_us) {
+            /* 不在玩游戏（列表 / 菜单）：按固定周期填满，不参与跳帧控制 */
+            uint32_t wait_ms = (budget_us - cost_us + 500U) / 1000U;
+
+            if (wait_ms > 0) {
+                vTaskDelay(pdMS_TO_TICKS(wait_ms));
+            }
         } else {
             taskYIELD();
         }
@@ -799,6 +973,21 @@ static int cmd_stat(int argc, char **argv)
         shellPrint(shell, "%s (period=%u ms%s)\r\n", line, (unsigned)s_period_ms,
                    s_period_auto ? ", auto" : ", fixed");
     }
+    shellPrint(shell, "logic=%d.%d render=%d.%d fps skipped=%u skip=%s(%s)\r\n",
+               (int)(s_logic_fps_x10 / 10), (int)(s_logic_fps_x10 % 10),
+               (int)(s_render_fps_x10 / 10), (int)(s_render_fps_x10 % 10),
+               (unsigned)s_skipped_frames,
+               s_skip_auto ? "auto" : "off",
+               s_skip_mech == ARCADE_RENDER_DUMMY ? "dummy" : "full");
+    shellPrint(shell, "cost: render=%u.%ums skip=%u.%ums extra=%u.%ums credit=%d.%ums\r\n",
+               (unsigned)(s_render_cost_us / 1000),
+               (unsigned)((s_render_cost_us / 100) % 10),
+               (unsigned)(s_skip_cost_us / 1000),
+               (unsigned)((s_skip_cost_us / 100) % 10),
+               (unsigned)(s_render_extra_us / 1000),
+               (unsigned)((s_render_extra_us / 100) % 10),
+               (int)(s_skip_credit_us / 1000),
+               (int)((s_skip_credit_us / 100) % 10));
     return 0;
 }
 
@@ -1542,6 +1731,15 @@ static int cmd_perf(int argc, char **argv)
                arcade_video_scale() == 1 ? "1x" : "1.5x",
                s_scale_auto ? "auto" : "manual",
                (unsigned)(s_frame_us / 1000), (unsigned)((s_frame_us / 100) % 10));
+    shellPrint(shell, "logic=%d.%d render=%d.%d fps skip=%s(%s) render≈%u.%ums skip≈%u.%ums\r\n",
+               (int)(s_logic_fps_x10 / 10), (int)(s_logic_fps_x10 % 10),
+               (int)(s_render_fps_x10 / 10), (int)(s_render_fps_x10 % 10),
+               s_skip_auto ? "auto" : "off",
+               s_skip_mech == ARCADE_RENDER_DUMMY ? "dummy" : "full",
+               (unsigned)(s_render_cost_us / 1000),
+               (unsigned)((s_render_cost_us / 100) % 10),
+               (unsigned)(s_skip_cost_us / 1000),
+               (unsigned)((s_skip_cost_us / 100) % 10));
 
     for (char *p = line; p != NULL && *p != '\0';) {
         char *nl = strchr(p, '\n');
@@ -1681,8 +1879,10 @@ static int cmd_apu(int argc, char **argv)
 /*
  * arcade bg <0|1>：只关 PPU 像素渲染（游戏逻辑照跑）。
  *
- * 用来把 emu 耗时拆成两半：「画像素」vs「CPU 解释器 + 每 tick 状态机」。
+ * 把 emu 耗时拆成两半：「画像素」vs 「CPU 解释器 + 每 tick 状态机」。
  * bg 0 后 emu 少掉的那部分就是 PPU 渲染成本，剩下的是 CPU 侧。
+ * 现在是 `arcade skip` 的快捷方式：0 = 强制全程跳像素（等于跳帧保速的
+ * 全跳模式），1 = 交回自动调度。
  */
 static int cmd_bg(int argc, char **argv)
 {
@@ -1698,11 +1898,65 @@ static int cmd_bg(int argc, char **argv)
         return 0;
     }
 
-    arcade_gb_set_render_enabled(atoi(argv[0]) != 0);
+    if (atoi(argv[0]) != 0) {
+        s_skip_auto = true;
+        shellPrint(shell, "PPU 渲染恢复（跳帧保速 auto）\r\n");
+    } else {
+        s_skip_auto = false;
+        arcade_gb_set_render_mode(ARCADE_RENDER_SKIP);
+        shellPrint(shell, "PPU 像素渲染 off（逻辑/音频照跑，等几秒 arcade cpu 看 emu）\r\n");
+    }
+
+    if (s_skip_auto) {
+        arcade_gb_set_render_mode(ARCADE_RENDER_FULL);
+    }
+
     arcade_video_reset_perf();
     arcade_gb_reset_perf();
-    shellPrint(shell, "PPU 渲染 %s（计时已清零，等几秒后 arcade cpu）\r\n",
-               atoi(argv[0]) != 0 ? "on" : "off");
+    return 0;
+}
+
+/*
+ * arcade skip <0|auto|full|dummy>：跳帧保速（逻辑/音频恒 59.7Hz，画面按需少画）。
+ *
+ *   0     关闭：每帧都渲染（帧率会被 PPU 拖到 ~55fps，音频跟着变慢）
+ *   auto  默认：按帧预算挑着渲染（约 2/3 帧，30~40fps）
+ *   full  跳过时连像素都不算（默认实现）
+ *   dummy 跳过时照算像素但不写显存（PPU 时序逐 tick 一致，用来对比）
+ */
+static int cmd_skip(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (argc >= 1) {
+        if (strcasecmp(argv[0], "0") == 0 || strcasecmp(argv[0], "off") == 0) {
+            s_skip_auto = false;
+            arcade_gb_set_render_mode(ARCADE_RENDER_FULL);
+        } else if (strcasecmp(argv[0], "auto") == 0) {
+            s_skip_auto = true;
+        } else if (strcasecmp(argv[0], "full") == 0) {
+            s_skip_auto = true;
+            s_skip_mech = ARCADE_RENDER_SKIP;
+        } else if (strcasecmp(argv[0], "dummy") == 0) {
+            s_skip_auto = true;
+            s_skip_mech = ARCADE_RENDER_DUMMY;
+        } else {
+            shellPrint(shell, "用法: arcade skip <0|auto|full|dummy>\r\n");
+            return 0;
+        }
+
+        s_skip_credit_us = 0;
+    }
+
+    shellPrint(shell, "skip=%s 方式=%s  render≈%u.%ums skip≈%u.%ums extra≈%u.%ums\r\n",
+               s_skip_auto ? "auto" : "off",
+               s_skip_mech == ARCADE_RENDER_DUMMY ? "dummy" : "full",
+               (unsigned)(s_render_cost_us / 1000),
+               (unsigned)((s_render_cost_us / 100) % 10),
+               (unsigned)(s_skip_cost_us / 1000),
+               (unsigned)((s_skip_cost_us / 100) % 10),
+               (unsigned)(s_render_extra_us / 1000),
+               (unsigned)((s_render_extra_us / 100) % 10));
     return 0;
 }
 
@@ -1890,7 +2144,8 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"roty", cmd_roty, "180° 硬件翻转的行偏移：roty [px]（-1 = 自动）"},
     {"spi", cmd_spi, "面板 SPI 时钟：spi [MHz]（改完钉 arcade perf 看带宽）"},
     {"apu", cmd_apu, "开关模拟器 APU：apu <0|1>（量声音耗时）"},
-    {"bg", cmd_bg, "开关 PPU 像素渲染：bg <0|1>（量画像素耗时）"},
+    {"bg", cmd_bg, "开关 PPU 像素渲染：bg <0|1>（= skip 快捷方式，量画像素耗时）"},
+    {"skip", cmd_skip, "跳帧保速：skip <0|auto|full|dummy>（逻辑/音频恒 59.7Hz）"},
     {"pwrho1d", cmd_pwrho1d, "把 POWER_EN 锁到高：pwrho1d <0|1>（刷机调试用）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
 };

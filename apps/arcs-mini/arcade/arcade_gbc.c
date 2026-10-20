@@ -533,6 +533,10 @@ static void stats_sample(struct arcade_gbc_priv *p)
     hist_sample(p, snap.pc, snap.sp);
 }
 
+static arcade_render_mode_t s_render_mode = ARCADE_RENDER_FULL;
+
+static void apply_render_mode(Emulator *emu, arcade_render_mode_t mode);
+
 void arcade_gb_run_frame(void)
 {
     struct arcade_gbc_priv *p = s_priv;
@@ -541,17 +545,21 @@ void arcade_gb_run_frame(void)
     int guard = 0;
     uint32_t t0;
     uint32_t t1;
+    bool render;
 
     if (p == NULL || p->emu == NULL) {
         return;
     }
 
+    render = (s_render_mode == ARCADE_RENDER_FULL);
+    apply_render_mode(p->emu, s_render_mode);
     /*
      * 先把这一帧的渲染目标要到手：video 模块的源帧双缓冲让缩放（1.9ms）
      * 和模拟并行，所以 PPU 得直接写进那块缓冲，而不是模拟器自己的。
      * 拿不到就退回模拟器内部缓冲（只少一帧画面，不影响运行）。
+     * 跳帧时不取源缓冲（否则会和缩放任务抢 slot，白等 200ms 超时）。
      */
-    arcade_fbpixel_t *fb = arcade_video_begin_frame();
+    arcade_fbpixel_t *fb = render ? arcade_video_begin_frame() : NULL;
     /* 拿不到源缓冲时要显式退回模拟器内部缓冲：否则 PPU 可能继续写上一帧
      * 还在被缩放任务读的那块，画面会撕裂 */
     emulator_set_frame_buffer(p->emu, (FBPixel *)fb);
@@ -600,9 +608,9 @@ void arcade_gb_run_frame(void)
 
     t1 = arcade_cycles();
     /* 缩放 + 送屏交给 video 模块的三级流水，这里只记模拟器本体耗时。
-     * 屏上有 LVGL 提示文字时不缩放也不送帧，否则会把提示盖掉。 */
-    arcade_video_end_frame(
-        fb != NULL && !arcade_ui_player_message_visible());
+     * 屏上有 LVGL 提示文字时不缩放也不送帧，否则会把提示盖掉。
+     * 跳帧时 fb 本来就是 NULL，end_frame(false) 会把 slot 直接还回去。 */
+    arcade_video_end_frame(fb != NULL && !arcade_ui_player_message_visible());
     p->perf_emu_cycles += (uint32_t)(t1 - t0);
     p->perf_frames++;
 
@@ -856,17 +864,40 @@ int arcade_gb_set_audio_enabled(bool on)
  */
 int arcade_gb_set_render_enabled(bool on)
 {
+    s_render_mode = on ? ARCADE_RENDER_FULL : ARCADE_RENDER_SKIP;
+    return 0;
+}
+
+/*
+ * 跳帧保速用的渲染模式。
+ *
+ *   FULL   正常渲染 + 送屏
+ *   DUMMY  颜色照算、像素不写显存（PPU 时序逐 tick 一致，用来量「写显存」的成本）
+ *   SKIP   连像素都不算（PPU 时序仍然一致，见 emulator.c 里 do_ppu_mode2 的说明）
+ */
+void arcade_gb_set_render_mode(arcade_render_mode_t mode)
+{
+    s_render_mode = mode;
+}
+
+arcade_render_mode_t arcade_gb_render_mode(void)
+{
+    return s_render_mode;
+}
+
+/* 把渲染模式落到 binjgb 的 EmulatorConfig 上（每帧调一次，只是拷一个结构体） */
+static void apply_render_mode(Emulator *emu, arcade_render_mode_t mode)
+{
     EmulatorConfig config;
 
-    if (s_priv == NULL || s_priv->emu == NULL) {
-        return -1;
+    if (emu == NULL) {
+        return;
     }
 
-    config = emulator_get_config(s_priv->emu);
-    config.disable_bg = on ? FALSE : TRUE;
-    config.disable_window = on ? FALSE : TRUE;
-    config.disable_obj = on ? FALSE : TRUE;
-    emulator_set_config(s_priv->emu, &config);
-
-    return 0;
+    config = emulator_get_config(emu);
+    config.disable_bg = (mode != ARCADE_RENDER_FULL);
+    config.disable_window = (mode != ARCADE_RENDER_FULL);
+    config.disable_obj = (mode != ARCADE_RENDER_FULL);
+    config.disable_render = (mode != ARCADE_RENDER_FULL);
+    emulator_set_config(emu, &config);
 }

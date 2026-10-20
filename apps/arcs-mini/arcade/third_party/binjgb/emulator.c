@@ -3413,7 +3413,13 @@ static void write_u8(Emulator* e, Address addr, u8 value) {
 
 static void do_ppu_mode2(Emulator* e) {
   dma_synchronize(e);
-  if (!LCDC.obj_display || e->config.disable_obj) {
+  /*
+   * ARCS-MINI port: 这里原来还会因为 config.disable_obj 提前返回。但
+   * PPU.line_obj_count 会喂给 mode3_tick_count()（决定 mode3 的长度，也就是
+   * 什么时候触发 mode0 / HDMA 中断）—— 提前返回等于改了 PPU 时序。
+   * 所以 disable_obj 只用于「不往屏幕上画」，行内 sprite 列表照旧扫一遍。
+   */
+  if (!LCDC.obj_display) {
     return;
   }
 
@@ -3492,7 +3498,8 @@ static ITCM_TEXT void ppu_mode3_synchronize(Emulator* e) {
   u16 map_base = map_select_to_address(LCDC.bg_tile_map_select) |
                  ((my >> 3) * TILE_MAP_WIDTH);
   FBPixel* pixel;
-  if (SGB.mask != SGB_MASK_CANCEL) {
+  if (SGB.mask != SGB_MASK_CANCEL || e->config.disable_render) {
+    /* 复用 SGB 遮罩用的那条 scratch 行：写进去就地丢掉，零显存流量 */
     static FBPixel s_dummy_frame_buffer_line[SCREEN_WIDTH];
     pixel = s_dummy_frame_buffer_line;
   } else {

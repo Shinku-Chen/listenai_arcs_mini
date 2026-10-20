@@ -187,6 +187,12 @@ typedef struct EmulatorConfig {
   Bool disable_bg;
   Bool disable_window;
   Bool disable_obj;
+  /*
+   * ARCS-MINI port: 只跳过 framebuffer 的像素**写入**（改写到一条内部
+   * scratch 行），没有任何时序/状态影响 —— 颜色计算、VRAM 读取、
+   * line_obj、mode3 的 tick 数全都照旧。用于「跳帧保速」的计时精确版。
+   */
+  Bool disable_render;
   Bool allow_simulataneous_dpad_opposites;
   Bool log_apu_writes;
 } EmulatorConfig;

@@ -58,6 +58,24 @@ int arcade_gb_set_audio_enabled(bool on);
  */
 int arcade_gb_set_render_enabled(bool on);
 
+/*
+ * 渲染模式（跳帧保速用）。
+ *
+ * 上层按帧预算决定这一帧要不要画：逻辑/音频永远按 59.7Hz 推进，
+ * 只是画的帧少一些 —— 游戏速度与音高就不会因为帧率不够而变慢。
+ */
+typedef enum {
+    ARCADE_RENDER_FULL = 0,   /* 正常画 + 送屏 */
+    ARCADE_RENDER_DUMMY,      /* 照算颜色但不写显存（PPU 时序逐 tick 一致） */
+    ARCADE_RENDER_SKIP,       /* 连像素都不算（PPU 时序仍然一致） */
+} arcade_render_mode_t;
+
+/** 设置下一帧的渲染模式（在 arcade_gb_run_frame() 之前调） */
+void arcade_gb_set_render_mode(arcade_render_mode_t mode);
+
+/** 当前渲染模式 */
+arcade_render_mode_t arcade_gb_render_mode(void);
+
 /** 清零帧耗时统计 */
 void arcade_gb_reset_perf(void);
 
