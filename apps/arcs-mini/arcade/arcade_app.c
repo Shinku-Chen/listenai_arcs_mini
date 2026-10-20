@@ -603,7 +603,11 @@ static bool arcade_should_render(void)
         return true;
     }
 
-    return s_skip_credit_us >= (int32_t)s_render_extra_us;
+    /*
+     * 门槛取 render_extra 的 3/4：睡觉是按整 tick 向下取整的，留 1/4 的余量
+     * 才不会每次睡完都刚好差一点、永远轮不到渲染（实测那会把渲染帧率压到个位数）。
+     */
+    return s_skip_credit_us >= (int32_t)((s_render_extra_us * 3U) / 4U);
 }
 
 /*
@@ -842,11 +846,12 @@ static void arcade_task(void *arg)
              * 领先部分先留给渲染（所以阈值至少是 render_extra），剩下的才睡——
              * 这样既不会把渲染机会睡掉，也不会让逻辑跑快（逻辑快了音高就偏高）。
              */
-            int32_t reserve = s_skip_auto ? (int32_t)s_render_extra_us : 0;
+            int32_t reserve = s_skip_auto ? (int32_t)((s_render_extra_us * 3U) / 4U) : 0;
             int32_t ahead = s_skip_credit_us - reserve;
 
             if (ahead > 0) {
-                uint32_t wait_ms = ((uint32_t)ahead + 500U) / 1000U;
+                /* 向下取整到 tick：多睡就少一次渲染机会，少睡只是让 IDLE 少跑一会 */
+                uint32_t wait_ms = (uint32_t)ahead / 1000U;
 
                 if (wait_ms > 0) {
                     vTaskDelay(pdMS_TO_TICKS(wait_ms));
