@@ -31,6 +31,8 @@
 #include "lisa_log.h"
 #include "lisa_device.h"
 #include "lisa_audio.h"
+#include "lisa_gpio.h"
+#include "board.h"
 #include "lisa_kv.h"
 
 #include "arcade_audio.h"
@@ -382,8 +384,38 @@ static void arcade_audio_task(void *arg)
 
 /* ---------------- 对外接口 ---------------- */
 
+/* 外部功放（PA）使能：正常固件由 voice_player_comm 管；模拟器固件跳过了语音
+ * 链路，所以这里自己把 PA MUTE 脚拉到"非静音"电平，否则 DAC 有声但喇叭不出声。 */
+static void arcade_audio_pa_enable(void)
+{
+#ifdef PA_MUTE_DEVICE_NAME
+    lisa_device_t *dev = lisa_device_get(PA_MUTE_DEVICE_NAME);
+    uint32_t level;
+    uint32_t init_flag;
+
+    if (dev == NULL || !lisa_device_ready(dev)) {
+        LISA_LOGW(TAG, "PA mute device not ready");
+        return;
+    }
+
+    /* ACTIVE_LEVEL==0 表示低电平静音，所以拉到相反电平 = 放音 */
+    level = (PA_MUTE_ACTIVE_LEVEL != 0) ? LISA_GPIO_LOW : LISA_GPIO_HIGH;
+    init_flag = (level == LISA_GPIO_HIGH) ? LISA_GPIO_OUTPUT_INIT_HIGH
+                                          : LISA_GPIO_OUTPUT_INIT_LOW;
+
+    if (lisa_gpio_configure(dev, PA_MUTE_PIN, LISA_GPIO_OUTPUT | init_flag) == 0) {
+        (void)lisa_gpio_write_pin(dev, PA_MUTE_PIN, level);
+        LISA_LOGI(TAG, "PA enabled (pin %d -> %s)", PA_MUTE_PIN,
+                  (level == LISA_GPIO_HIGH) ? "HIGH" : "LOW");
+    } else {
+        LISA_LOGW(TAG, "PA mute GPIO configure failed");
+    }
+#endif
+}
+
 int arcade_audio_init(void)
 {
+    arcade_audio_pa_enable();
     lisa_audio_play_config_t cfg;
     int analog_gain;
     int digital_gain;
