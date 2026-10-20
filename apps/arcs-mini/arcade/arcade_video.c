@@ -320,17 +320,23 @@ int arcade_video_scale(void)
  * 1.5 倍：水平方向 2 个源像素铺 3 个目标像素（偶数列复制一份），
  *         垂直方向偶数源行铺 1 行、奇数源行铺 2 行 —— 144 条源行正好铺满 216 行。
  * 两个循环都是「按源顺序读、按目标顺序写」，没有随机跳读，也没有逐像素查表。
+ *
+ * ARCADE_FB_RGB565=1 时源已经是 RGB565，这里只做缩放，不做色彩转换。
  */
-static void blit_frame(uint16_t *dst, const uint32_t *src)
+static void blit_frame(uint16_t *dst, const arcade_fbpixel_t *src)
 {
     if (s_scale == SCALE_1X) {
         for (int y = 0; y < SRC_HEIGHT; y++) {
             uint16_t *d = dst + (size_t)y * SRC_WIDTH;
-            const uint32_t *s = src + (size_t)y * SRC_WIDTH;
+            const arcade_fbpixel_t *s = src + (size_t)y * SRC_WIDTH;
 
+#if ARCADE_FB_RGB565
+            memcpy(d, s, (size_t)SRC_WIDTH * sizeof(uint16_t));
+#else
             for (int x = 0; x < SRC_WIDTH; x++) {
                 d[x] = RGBA_TO_565(s[x]);
             }
+#endif
         }
         return;
     }
@@ -339,11 +345,16 @@ static void blit_frame(uint16_t *dst, const uint32_t *src)
 
     for (int y = 0; y < SRC_HEIGHT; y++) {
         uint16_t *d = dst + (size_t)dy * ARCADE_FB_WIDTH;
-        const uint32_t *s = src + (size_t)y * SRC_WIDTH;
+        const arcade_fbpixel_t *s = src + (size_t)y * SRC_WIDTH;
 
         for (int x = 0; x < SRC_WIDTH; x += 2) {
+#if ARCADE_FB_RGB565
+            uint16_t a = (uint16_t)s[x];
+            uint16_t b = (uint16_t)s[x + 1];
+#else
             uint16_t a = RGBA_TO_565(s[x]);
             uint16_t b = RGBA_TO_565(s[x + 1]);
+#endif
 
             d[0] = a;
             d[1] = a;
@@ -363,13 +374,13 @@ static void blit_frame(uint16_t *dst, const uint32_t *src)
     }
 }
 
-void arcade_video_present_frame(const uint32_t *rgba)
+void arcade_video_present_frame(const arcade_fbpixel_t *src)
 {
     int idx;
     TickType_t t0;
     TickType_t t1;
 
-    if (rgba == NULL || s_buf[0] == NULL) {
+    if (src == NULL || s_buf[0] == NULL) {
         return;
     }
 
@@ -386,7 +397,7 @@ void arcade_video_present_frame(const uint32_t *rgba)
     t1 = xTaskGetTickCount();
     s_perf_wait += t1 - t0;
 
-    blit_frame((uint16_t *)s_buf[idx], rgba);
+    blit_frame((uint16_t *)s_buf[idx], src);
 
     s_last = s_buf[idx];
     s_perf_blit += xTaskGetTickCount() - t1;

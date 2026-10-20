@@ -39,6 +39,10 @@
 
 #define TAG "arcade-gbc"
 
+/* 送屏模块和 binjgb 必须对帧缓冲像素宽度达成一致（都看 arcade_fb.h） */
+_Static_assert(sizeof(FBPixel) == sizeof(arcade_fbpixel_t),
+               "frame buffer pixel type mismatch");
+
 #define ROM_SIZE_LIMIT          (8U * 1024U * 1024U)
 #define ROM_BANK_BYTES          (32U * 1024U)   /* binjgb 要求 ROM 是 32KB 的整数倍 */
 #define PSRAM_ALLOC_MARGIN      (96U * 1024U)
@@ -588,7 +592,7 @@ void arcade_gb_run_frame(void)
     /* 转换 + 送屏都在 video 模块里双缓冲并行，这里只记模拟器本体耗时。
      * 屏上有 LVGL 提示文字时不送帧，否则会把提示盖掉。 */
     if (!arcade_ui_player_message_visible()) {
-        arcade_video_present_frame((const uint32_t *)emulator_get_frame_buffer(p->emu));
+        arcade_video_present_frame((const arcade_fbpixel_t *)emulator_get_frame_buffer(p->emu));
     }
     p->perf_emu_ticks += t1 - t0;
     p->perf_frames++;

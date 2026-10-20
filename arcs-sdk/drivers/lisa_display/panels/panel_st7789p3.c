@@ -15,6 +15,7 @@
 
 /* ST7789P3 特定命令（非标准 MIPI DCS）*/
 // 可在此添加芯片特定命令宏
+// MADCTL / MADCTL_MY / MADCTL_MX 已在 mipi_dcs.h 里定义，直接用
 
 /* 初始化序列 */
 static const uint8_t init_sequence[] = {
@@ -39,6 +40,22 @@ static const uint8_t init_sequence[] = {
  *  lisa_display_api_t 实现
  * ======================================================================== */
 
+/*
+ * 用面板自己的 MADCTL 做方向变换。
+ *
+ * 驱动层的软件 180° 旋转要把 103KB 的帧数据读出来、写进 SRAM 中转块、
+ * 分 14 段各起一次 DMA；而 MY|MX 同时镜像行列地址就能让面板自己翻转，
+ * 数据直通 DMA 就行。
+ *
+ * 注意：MADCTL 翻转的是「显存地址 → 面板像素」的映射，写入窗口的坐标仍
+ * 需要镜像（panel_set_mem_area() 按 caps.orientation 做），两者配合才是
+ * 完整的 180° 旋转。
+ */
+static void st7789p3_write_madctl(lisa_display_panel_t *panel, uint8_t value)
+{
+    panel_write_cmd_data(panel, LCD_CMD_MADCTL, 8, &value, 1);
+}
+
 static int st7789p3_init(lisa_display_panel_t *panel)
 {
     panel->priv_data         = NULL;
@@ -46,6 +63,7 @@ static int st7789p3_init(lisa_display_panel_t *panel)
     panel->caps.height       = CONFIG_PANEL_ST7789P3_HEIGHT;
     panel->caps.pixel_format = LISA_DISPLAY_PIXEL_FORMAT_RGB_565;
     panel->caps.orientation  = LISA_DISPLAY_ORIENTATION_0;
+    panel->caps.hw_rotate    = false;
     panel->caps.supported_pixel_formats = (1U << LISA_DISPLAY_PIXEL_FORMAT_RGB_565);
 
     // 硬件复位
@@ -170,6 +188,18 @@ static int st7789p3_set_brightness(lisa_display_panel_t *panel, uint8_t brightne
 
 static int st7789p3_set_orientation(lisa_display_panel_t *panel, lisa_display_orientation_t orientation)
 {
+    /* 只有 180° 交给硬件：90/270 除了翻转还要转置，MV 单独用会连带改变
+     * 写入窗口的形状，留给驱动层的软件旋转处理更稳妥。 */
+    if (orientation == LISA_DISPLAY_ORIENTATION_180) {
+        st7789p3_write_madctl(panel, MADCTL_MY | MADCTL_MX);
+        panel->caps.hw_rotate = true;
+    } else {
+        if (panel->caps.hw_rotate) {
+            st7789p3_write_madctl(panel, 0x00);
+        }
+        panel->caps.hw_rotate = false;
+    }
+
     panel->caps.orientation = orientation;
     return LISA_DEVICE_OK;
 }

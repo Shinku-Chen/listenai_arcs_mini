@@ -6,6 +6,14 @@
 #include "lvgl.h"
 
 #include "arcade_core.h"
+#include "arcade_fb.h"
+
+/** 模拟器帧缓冲的像素类型：RGB565(u16) 或 RGBA(u32)，由 ARCADE_FB_RGB565 决定 */
+#if ARCADE_FB_RGB565
+typedef uint16_t arcade_fbpixel_t;
+#else
+typedef uint32_t arcade_fbpixel_t;
+#endif
 
 /**
  * 申请两块仿真帧缓冲（240x216 RGB565，PSRAM）并准备送屏。
@@ -46,10 +54,10 @@ uint16_t arcade_video_palette_raw(int shade);
 const uint8_t (*arcade_video_dmg_palette_rgb(void))[3];
 
 /**
- * binjgb 帧输出：160x144 的 RGBA（0xAABBGGRR）转 RGB565 写进空闲缓冲，
- * 交给送屏任务；和上一帧的 SPI 传输并行。每帧调一次。
+ * binjgb 帧输出：160x144 的帧缓冲（RGB565 或 RGBA，见 arcade_fb.h）缩放后写进
+ * 空闲缓冲，交给送屏任务；和上一帧的 SPI 传输并行。每帧调一次。
  */
-void arcade_video_present_frame(const uint32_t *rgba);
+void arcade_video_present_frame(const arcade_fbpixel_t *src);
 
 /** 把当前缓冲内容立即送屏一次（`arcade fb fill` 自检用） */
 void arcade_video_present_now(void);

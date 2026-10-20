@@ -2334,8 +2334,9 @@ static void unpack_sgb_palette_ram(Emulator* e, int pal, u8 idx_lo, u8 idx_hi) {
 }
 
 static void clear_frame_buffer(Emulator* e, RGBA color) {
+  FBPixel pixel = RGBA_TO_FBPIXEL(color);
   for (size_t i = 0; i < SCREEN_WIDTH * SCREEN_HEIGHT; ++i) {
-    e->frame_buffer[i] = color;
+    e->frame_buffer[i] = pixel;
   }
 }
 
@@ -3465,9 +3466,9 @@ static ITCM_TEXT void ppu_mode3_synchronize(Emulator* e) {
   u8 my = PPU.scy + y;
   u16 map_base = map_select_to_address(LCDC.bg_tile_map_select) |
                  ((my >> 3) * TILE_MAP_WIDTH);
-  RGBA* pixel;
+  FBPixel* pixel;
   if (SGB.mask != SGB_MASK_CANCEL) {
-    static RGBA s_dummy_frame_buffer_line[SCREEN_WIDTH];
+    static FBPixel s_dummy_frame_buffer_line[SCREEN_WIDTH];
     pixel = s_dummy_frame_buffer_line;
   } else {
     pixel = &e->frame_buffer[y * SCREEN_WIDTH + x];
@@ -3537,16 +3538,16 @@ static ITCM_TEXT void ppu_mode3_synchronize(Emulator* e) {
           hi <<= shift;
         }
         u8 palette_index = ((hi >> 6) & 2) | (lo >> 7);
-        pixel[i] = pal->color[palette_index];
+        pixel[i] = RGBA_TO_FBPIXEL(pal->color[palette_index]);
         bg_is_zero[i] = palette_index == 0;
         bg_priority[i] = priority;
       } else {
         if (IS_CGB) {
-          pixel[i] = PPU.bgcp.palettes[0].color[0];
+          pixel[i] = RGBA_TO_FBPIXEL(PPU.bgcp.palettes[0].color[0]);
         } else if (IS_SGB) {
-          pixel[i] = e->sgb_pal[0].color[0];
+          pixel[i] = RGBA_TO_FBPIXEL(e->sgb_pal[0].color[0]);
         } else {
-          pixel[i] = e->color_to_rgba[0].color[0];
+          pixel[i] = RGBA_TO_FBPIXEL(e->color_to_rgba[0].color[0]);
         }
       }
     }
@@ -3620,9 +3621,9 @@ static ITCM_TEXT void ppu_mode3_synchronize(Emulator* e) {
                   u8 palidx = 
                     (SGB.attr_map[idx >> 2] >> (2 * (3 - (idx & 3)))) & 3;
                   u8 sgb_color = PPU.pal[o->palette + 1].color[palette_index];
-                  pixel[i] = e->sgb_pal[palidx].color[sgb_color];
+                  pixel[i] = RGBA_TO_FBPIXEL(e->sgb_pal[palidx].color[sgb_color]);
                 } else {
-                  pixel[i] = pal->color[palette_index];
+                  pixel[i] = RGBA_TO_FBPIXEL(pal->color[palette_index]);
                 }
             }
         }

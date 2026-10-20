@@ -275,6 +275,13 @@ typedef struct {
     lisa_display_pixel_format_t pixel_format;    /* 当前像素格式 */
     lisa_display_orientation_t orientation;      /* 当前方向 */
     uint32_t supported_pixel_formats;            /* 支持的像素格式位掩码 */
+    /**
+     * 面板自己用硬件（MADCTL）完成了当前方向的行列镜像，驱动层不需要
+     * 再用 SRAM 中转块把像素数据软件旋转一遍。为 true 时
+     * panel_draw_pixels() 直接直通 DMA；坐标镜像（panel_set_mem_area）仍按
+     * orientation 做，两者配合得到的画面和软件旋转完全一致。
+     */
+    bool hw_rotate;
 } lisa_display_capabilities_t;
 
 /**

@@ -8,6 +8,7 @@
 #define BINJGB_EMULATOR_H_
 
 #include "common.h"
+#include "arcade_fb.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,7 +66,17 @@ typedef struct JoypadCallbackInfo {
   void* user_data;
 } JoypadCallbackInfo;
 
-typedef RGBA FrameBuffer[SCREEN_WIDTH * SCREEN_HEIGHT];
+#if ARCADE_FB_RGB565
+typedef u16 FBPixel;
+#define RGBA_TO_FBPIXEL(c)                                              \
+  ((FBPixel)((((c) >> 3) & 0x001f) | (((c) >> 5) & 0x07e0) |             \
+             (((c) >> 8) & 0xf800)))
+#else
+typedef RGBA FBPixel;
+#define RGBA_TO_FBPIXEL(c) (c)
+#endif
+
+typedef FBPixel FrameBuffer[SCREEN_WIDTH * SCREEN_HEIGHT];
 typedef RGBA SgbFrameBuffer[SGB_SCREEN_WIDTH * SGB_SCREEN_HEIGHT];
 
 typedef enum Color {

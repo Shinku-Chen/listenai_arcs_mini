@@ -98,7 +98,7 @@ int panel_draw_pixels(lisa_display_panel_t *panel, uint32_t cmd, uint16_t cmd_bi
         return ret;
     }
 
-    if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_180) {
+    if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_180 && !panel->caps.hw_rotate) {
         ret = panel_send_data_with_sram_rotate_180(panel, w, h, pixels);
     }
     else if (panel->caps.orientation == LISA_DISPLAY_ORIENTATION_90 ||
