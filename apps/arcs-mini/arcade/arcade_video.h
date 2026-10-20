@@ -21,6 +21,8 @@ typedef uint32_t arcade_fbpixel_t;
  */
 int arcade_video_init(void);
 
+#include <stdbool.h>
+
 void arcade_video_deinit(void);
 
 /** 最近一帧送屏的缓冲首地址（调试用，长度 = fb_width()*fb_height()） */
@@ -54,10 +56,18 @@ uint16_t arcade_video_palette_raw(int shade);
 const uint8_t (*arcade_video_dmg_palette_rgb(void))[3];
 
 /**
- * binjgb 帧输出：160x144 的帧缓冲（RGB565 或 RGBA，见 arcade_fb.h）缩放后写进
- * 空闲缓冲，交给送屏任务；和上一帧的 SPI 传输并行。每帧调一次。
+ * 取一块本帧可以渲染的源帧缓冲（160x144，PSRAM）。模拟器的 frame_buffer
+ * 必须用 emulator_set_frame_buffer() 指过去，模拟完再调
+ * arcade_video_end_frame()。返回 NULL 时表示源缓冲暂时拿不到，
+ * 这时候模拟照旧跑（渲染到模拟器自己的缓冲），画面上少一帧而已。
  */
-void arcade_video_present_frame(const arcade_fbpixel_t *src);
+arcade_fbpixel_t *arcade_video_begin_frame(void);
+
+/**
+ * 把本帧的源缓冲交给缩放/送屏流水线。
+ * @param present false = 只还缓冲，不缩放也不送屏（屏幕上有 LVGL 提示时用）
+ */
+void arcade_video_end_frame(bool present);
 
 /** 把当前缓冲内容立即送屏一次（`arcade fb fill` 自检用） */
 void arcade_video_present_now(void);
@@ -75,6 +85,15 @@ int arcade_video_scale(void);
  */
 void arcade_video_set_rotate_row_shift(int16_t shift);
 int16_t arcade_video_rotate_row_shift(void);
+
+/**
+ * 运行期改面板 SPI 时钟（`arcade spi <MHz>` 用）。
+ * 必须在流水线空闲时调（上层先 present_drain）。
+ * @param hz 目标频率；0 = 只查询当前频率
+ * @return 0 成功；负数失败；hz==0 时返回当前频率
+ */
+int arcade_video_set_spi_freq(uint32_t hz);
+uint32_t arcade_video_spi_freq(void);
 
 void arcade_video_reset_perf(void);
 void arcade_video_perf(char *out, uint32_t len);

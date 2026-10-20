@@ -221,6 +221,8 @@ JoypadCallbackInfo emulator_get_joypad_callback(Emulator*);
 void emulator_set_config(Emulator*, const EmulatorConfig*);
 EmulatorConfig emulator_get_config(Emulator*);
 FrameBuffer* emulator_get_frame_buffer(Emulator*);
+/* ARCS-MINI port: 切换 PPU 渲染目标（NULL = 回到模拟器内部缓冲） */
+void emulator_set_frame_buffer(Emulator*, FBPixel*);
 SgbFrameBuffer* emulator_get_sgb_frame_buffer(Emulator*);
 AudioBuffer* emulator_get_audio_buffer(Emulator*);
 Ticks emulator_get_ticks(Emulator*);

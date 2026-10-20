@@ -63,6 +63,7 @@ typedef enum {
     ARCADE_REQ_FB_REPORT,
     ARCADE_REQ_FB_FILL,
     ARCADE_REQ_FB_RESUME,
+    ARCADE_REQ_SPI,
 } arcade_req_t;
 
 static arcade_mode_t s_mode = ARCADE_MODE_LIST;
@@ -72,6 +73,9 @@ static volatile uint8_t s_pending_action = 0xFF;
 
 static volatile arcade_req_t s_req;
 static volatile int s_req_arg;
+/* arcade spi 的结果（在模拟器任务里改频，不能直接从 shell 任务碰 SPI） */
+static volatile int s_spi_result;
+static volatile uint32_t s_spi_freq_req;
 /* shell 的 arcade save 命令等这个结果 */
 static volatile int s_save_result;
 
@@ -85,21 +89,23 @@ static TickType_t s_fps_tick;
 static uint32_t s_fps_x10;
 
 /*
- * 帧节奏（定步长自适应）。
+ * 帧节奏（固定节拍）。
  *
- * CGB 模拟器一帧要 25~35ms，离 CONFIG_ARCADE_FRAME_PERIOD_MS（16ms，60fps）
- * 差得远。原来按固定 16ms 跑，每帧都超时，帧间隔在 27~45ms 之间乱跳，
- * 观感就是「一卡一卡」。改成定步长：
- * 一帧实际耗时超过当前步长 → 用指数平均跟踪实际工作量，把步长抬到「工作量 + 2ms」；
- * 工作量降下来时每帧回落 1ms（不一次跳到底，避免抖）。
- *   - `arcade period <ms>` 可以手动钉住步长做对比实验，0 = 回到自适应。
- * 结果是帧间隔变成常数（例如恒定 30fps），比 20~27fps 抖动的观感线性得多，
- * 而且限流之后送屏任务能真正和模拟器并行，不会两边抢缓冲。
+ * 一帧的预算是 CONFIG_ARCADE_FRAME_PERIOD_MS（16ms）。以前那套「自适应步长」
+ * 把步长抬到「工作量 + 2ms」，回落条件又是 target + 3 < 步长，稳态就落在
+ * 工作量 + 5ms —— 实测干 18ms 的活却按 23ms 一拍跑，白丢 20% 帧率
+ * （43.5fps，而同样的工作本可以跑 54fps）。
+ *
+ * 现在只做一件事：干完活如果还有富余就睡到 16ms 的固定节拍，超预算就不睡
+ * （超多少跑多少，这才是最快的）。连续超预算时每 8 帧让一个 tick 给 IDLE。
+ *   - `arcade period <ms>` 可以手动钉住节拍做对比实验，0 = 回到固定节拍。
  */
 #define ARCADE_MIN_FRAME_PERIOD_MS  CONFIG_ARCADE_FRAME_PERIOD_MS
 #define ARCADE_MAX_FRAME_PERIOD_MS  60
 static uint32_t s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
 static uint32_t s_work_ema = CONFIG_ARCADE_FRAME_PERIOD_MS;
+/* 连续超预算的帧数（每 8 帧让一个 tick 给 IDLE，别把它饿死） */
+static uint32_t s_overrun_count;
 static bool s_period_auto = true;
 
 /* 最近若干帧的帧间隔（ms），用来回答「抖不抖」 */
@@ -401,6 +407,15 @@ static void arcade_handle_request(void)
         arcade_video_fill_black();
         arcade_video_present_now();
         break;
+    case ARCADE_REQ_SPI:
+        /* 改 SPI 时钟必须在没有在途传输的时候做：先把流水线清空
+         * （present_drain 会等到两块目标缓冲都回到空闲队列），
+         * 然后直接把新频率写进 lisa_spi 的当前配置。
+         * bus_spi4_write_pixels() 每帧都会 get_config 再 configure，
+         * 所以下一帧就会按新频率跑，不用重烧。 */
+        arcade_video_present_drain();
+        s_spi_result = arcade_video_set_spi_freq(s_spi_freq_req);
+        break;
     default:
         break;
     }
@@ -543,40 +558,17 @@ static void arcade_task(void *arg)
         TickType_t spent = xTaskGetTickCount() - start;
 
         /*
-         * 定步长自适应（见 s_period_ms 的注释）：
-         * 用 1/8 的指数平均跟踪「一帧真正要干多少活」，再拿它 +2ms 当步长。
-         * 单帧尖尖（比如存盘那一帧）只影响 1/8，不会被误当成常态；
-         * 活变轻时每帧回落 1ms，不会一直卡在慢档。
+         * 只跟踪工作量（留给 `arcade period` 报告），不再拿它去抬步长。
          */
         if (s_mode == ARCADE_MODE_PLAY) {
             s_work_ema = (s_work_ema * 7U + (uint32_t)spent) / 8U;
-
-            if (s_period_auto) {
-                uint32_t target = s_work_ema + 2;
-
-                if (target < ARCADE_MIN_FRAME_PERIOD_MS) {
-                    target = ARCADE_MIN_FRAME_PERIOD_MS;
-                } else if (target > ARCADE_MAX_FRAME_PERIOD_MS) {
-                    target = ARCADE_MAX_FRAME_PERIOD_MS;
-                }
-
-                if (target > s_period_ms) {
-                    s_period_ms = target;
-                    LISA_LOGI(TAG, "frame period -> %u ms (%u fps locked, work ~%u ms)",
-                              (unsigned)s_period_ms,
-                              (unsigned)(s_period_ms > 0 ? 1000U / s_period_ms : 0),
-                              (unsigned)s_work_ema);
-                } else if (target + 3 < s_period_ms) {
-                    s_period_ms--;
-                }
-            }
         }
 
         frame_stat_push(spent);
 
         uint32_t period = s_period_ms;
         if (s_mode != ARCADE_MODE_PLAY) {
-            /* 不在玩游戏时把步长复位，下次开局重新学 */
+            /* 不在玩游戏时把步长复位 */
             if (s_period_auto) {
                 s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
             }
@@ -589,8 +581,12 @@ static void arcade_task(void *arg)
         TickType_t wait = pdMS_TO_TICKS(period);
         if (spent < wait) {
             vTaskDelay(wait - spent);
-        } else {
+        } else if (++s_overrun_count >= 8U) {
+            /* 一直超预算时也别把 IDLE 饿死：每 8 帧让一个 tick */
+            s_overrun_count = 0;
             vTaskDelay(1);
+        } else {
+            taskYIELD();
         }
 
         boot_watchdog_feed();
@@ -708,8 +704,8 @@ static int cmd_period(int argc, char **argv)
     Shell *shell = shellGetCurrent();
 
     if (argc < 1) {
-        shellPrint(shell, "period=%u ms (%s)\r\n", (unsigned)s_period_ms,
-                   s_period_auto ? "auto" : "fixed");
+        shellPrint(shell, "period=%u ms (%s) work≈%u ms\r\n", (unsigned)s_period_ms,
+                   s_period_auto ? "auto" : "fixed", (unsigned)s_work_ema);
         return 0;
     }
 
@@ -719,7 +715,7 @@ static int cmd_period(int argc, char **argv)
         s_period_auto = true;
         s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
         s_work_ema = CONFIG_ARCADE_FRAME_PERIOD_MS;
-        shellPrint(shell, "period: auto (%u ms 起)\r\n", (unsigned)s_period_ms);
+        shellPrint(shell, "period: auto (%u ms 节拍)\r\n", (unsigned)s_period_ms);
         return 0;
     }
 
@@ -1484,6 +1480,57 @@ static int cmd_roty(int argc, char **argv)
     return 0;
 }
 
+/*
+ * arcade spi [MHz]：运行期改面板 SPI 时钟（测上限 / 提升送屏带宽用）。
+ *
+ * 改频动作本身必须挖到模拟器任务的空闲窗口里做（在途 DMA 会让 SPI_Control
+ * 回 BUSY），所以这里只投递请求、在 arcade_handle_request() 里执行。
+ * 改完之后用 `arcade perf` 的 txcache（MB/s）看实际效果。
+ */
+static int cmd_spi(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    uint32_t cur = arcade_video_spi_freq();
+    int mhz;
+
+    if (argc < 1) {
+        shellPrint(shell, "spi=%u kHz（实测带宽看 arcade perf 的 txcache）\r\n",
+                   (unsigned)(cur / 1000U));
+        return 0;
+    }
+
+    mhz = atoi(argv[0]);
+    if (mhz < 1 || mhz > 200) {
+        shellPrint(shell, "MHz 取值范围 1~200\r\n");
+        return 0;
+    }
+
+    s_spi_result = 0x7FFFFFFF;
+    s_spi_freq_req = (uint32_t)mhz * 1000000U;
+    s_req_arg = mhz;
+    s_req = ARCADE_REQ_SPI;
+
+    /* 等模拟器任务把改频做完（最多 1s） */
+    for (int i = 0; i < 100 && s_spi_result == 0x7FFFFFFF; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (s_spi_result == 0x7FFFFFFF) {
+        shellPrint(shell, "改频超时（模拟器任务没响应）\r\n");
+        return 0;
+    }
+
+    if (s_spi_result != 0) {
+        shellPrint(shell, "改 %d MHz 失败（ret=%d），仍为 %u kHz\r\n", mhz,
+                   s_spi_result, (unsigned)(arcade_video_spi_freq() / 1000U));
+        return 0;
+    }
+
+    shellPrint(shell, "display spi = %u kHz，跑几秒后 arcade perf 看 txcache\r\n",
+               (unsigned)(arcade_video_spi_freq() / 1000U));
+    return 0;
+}
+
 /* arcade apu <0|1>：开关模拟器 APU（用来量声音占多少时间） */
 static int cmd_apu(int argc, char **argv)
 {
@@ -1653,10 +1700,11 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"audio", cmd_audio, "音频状态：audio [peak|reset]"},
     {"vol", cmd_vol, "音量：vol <0-100>"},
     {"perf", cmd_perf, "帧率与各段耗时：perf [reset]"},
-    {"period", cmd_period, "定步长帧周期：period [ms]（0 = 自适应）"},
+    {"period", cmd_period, "帧节拍：period [ms]（0 = 回到固定节拍）"},
     {"clock", cmd_clock, "量真实核频（mcycle）"},
     {"scale", cmd_scale, "缩放：scale <1|15>（15 = 1.5 倍）"},
     {"roty", cmd_roty, "180° 硬件翻转的行偏移：roty [px]（-1 = 自动）"},
+    {"spi", cmd_spi, "面板 SPI 时钟：spi [MHz]（改完钉 arcade perf 看带宽）"},
     {"apu", cmd_apu, "开关模拟器 APU：apu <0|1>（量声音耗时）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
 };

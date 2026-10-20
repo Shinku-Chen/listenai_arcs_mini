@@ -6,15 +6,17 @@
  *   线程走 SPI。实测 lv_task_handler 单独就吃掉 8ms/帧（103KB 的 PSRAM 拷贝 +
  *   对象/脏区处理），而模拟器本身只有 20~30fps，这 8ms 直接换算成 fps。
  *
- * 现在的结构（双缓冲 + 独立送屏任务）：
+ * 现在的结构（三级流水 + 源帧双缓冲）：
  *
- *   模拟器任务：emu → 把 RGBA 转 RGB565 写进 back buffer → 投递索引
- *   送屏任务 ：lisa_display_write(back buffer)（等 TE + SPI，阻塞）
+ *   模拟器任务：把 160x144 的帧直接渲染进 src[0/1]（binjgb 的 frame_buffer
+ *               换成指针，帧与帧交替），渲染完只投递索引，不做缩放
+ *   缩放任务  ：src → RGB565 1.5 倍放大 → dst[0/1]（1.9ms/帧）
+ *   送屏任务  ：lisa_display_write(dst)（SPI + DMA，阻塞 17.7ms/帧）
  *
- * 转码（CPU）和 SPI 传输（DMA）并行，屏上的开销基本被模拟器吃掉。
- * 两块缓冲用「空闲队列」管理：模拟器取一块填，送屏任务发完把索引还回队列；
- * 队列空说明两块都在用（例如 1.5 倍 240x216 的 SPI 传输慢于模拟），
- * 这时模拟器任务会阻塞等 —— 天然限流，不会撕裂、不会丢帧。
+ * 关键点：缩放（1.9ms）原来串在模拟器任务里，把 16.5ms 的模拟硬生生拖成
+ * 18.4ms 的帧周期。拆成三级之后帧周期由最慢的一级决定（模拟 16.5ms /
+ * 送屏 17.7ms），缩放被完全藏进流水线。各级之间用队列传递缓冲索引：
+ * 队列空就说明下游还没消化完，上游等一等 —— 天然限流，不会撕裂、不会丢帧。
  */
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +29,7 @@
 #include "esp_heap_caps.h"
 #include "lisa_device.h"
 #include "lisa_display.h"
+#include "lisa_spi.h"
 #include "lisa_log.h"
 
 #include "arcade_video.h"
@@ -63,6 +66,13 @@ static bool s_palette_ready;
 /* ---- 送屏管线 ---- */
 static lv_color_t *s_buf[2];
 static uint32_t s_buf_bytes;
+
+/* ---- 源帧（模拟器渲染目标）双缓冲 ---- */
+static arcade_fbpixel_t *s_src[2];
+static int s_src_slots;                     /* 实际分到的块数：0/1/2 */
+static QueueHandle_t s_src_free_q;          /* 可以拿来渲染的源缓冲索引 */
+static QueueHandle_t s_src_q;               /* 待缩放的源缓冲索引 */
+static int s_src_cur = -1;                  /* 本帧正在渲染的源索引，-1 = 没取到 */
 static int s_scale = SCALE_1_5X;
 static int s_stride = ARCADE_FB_WIDTH;      /* 一行多少像素（u16） */
 static int s_fb_w = ARCADE_FB_WIDTH;
@@ -72,17 +82,23 @@ static int s_rect_y = (240 - ARCADE_FB_HEIGHT) / 2;
 static lv_color_t *s_last;                  /* 最近一次提交的缓冲（调试用） */
 /* 180° 硬件翻转的行偏移覆盖（-1 = 驱动自动推算），调试用 */
 static int16_t s_rotate_row_shift = -1;
+/* 当前（上一次接受成功的）面板 SPI 时钟，改频失败时用来回滚 */
+static uint32_t s_spi_freq_backup = 50000000U;
 
 static lisa_device_t *s_disp;
-static QueueHandle_t s_free_q;              /* 可写的缓冲索引 */
+static QueueHandle_t s_free_q;              /* 可写的目标缓冲索引 */
 static QueueHandle_t s_tx_q;                /* 待送的缓冲索引 */
-static TaskHandle_t s_task;
+static TaskHandle_t s_task;                 /* 送屏任务 */
+static TaskHandle_t s_blit_task;
+
+static void blit_task(void *arg);
 
 /* 计时（ms tick 累计，按帧平均） */
 static volatile TickType_t s_perf_blit;
 static volatile TickType_t s_perf_wait;
 static volatile TickType_t s_perf_tx;
-static volatile uint32_t s_perf_frames;
+static volatile uint32_t s_perf_frames;      /* 模拟器提交的帧数 */
+static volatile uint32_t s_perf_blit_frames;
 static volatile uint32_t s_perf_tx_frames;
 
 static void palette_prepare(void)
@@ -179,6 +195,28 @@ static bool present_start(void)
         }
     }
 
+    if (s_src_free_q == NULL && s_src_slots > 0) {
+        s_src_free_q = xQueueCreate((UBaseType_t)s_src_slots, sizeof(int));
+        s_src_q = xQueueCreate((UBaseType_t)s_src_slots, sizeof(int));
+        if (s_src_free_q == NULL || s_src_q == NULL) {
+            LISA_LOGE(TAG, "source queue create failed");
+            s_src_slots = 0;
+        } else {
+            for (int i = 0; i < s_src_slots; i++) {
+                xQueueSend(s_src_free_q, &i, 0);
+            }
+        }
+    }
+
+    if (s_src_slots > 0 && s_blit_task == NULL) {
+        if (xTaskCreate(blit_task, "arcade_blit", PRESENT_TASK_STACK, NULL,
+                        PRESENT_TASK_PRIO, &s_blit_task) != pdPASS) {
+            LISA_LOGE(TAG, "blit task create failed");
+            s_blit_task = NULL;
+            s_src_slots = 0;
+        }
+    }
+
     if (xTaskCreate(present_task, "arcade_disp", PRESENT_TASK_STACK, NULL,
                     PRESENT_TASK_PRIO, &s_task) != pdPASS) {
         LISA_LOGE(TAG, "present task create failed");
@@ -186,8 +224,8 @@ static bool present_start(void)
         return false;
     }
 
-    LISA_LOGI(TAG, "present task ready, %dx%d scale 1/%d", s_fb_w, s_fb_h,
-              s_scale == SCALE_1X ? 1 : 2);
+    LISA_LOGI(TAG, "present task ready, %dx%d scale 1/%d, src slots %d",
+              s_fb_w, s_fb_h, s_scale == SCALE_1X ? 1 : 2, s_src_slots);
     return true;
 }
 
@@ -222,7 +260,33 @@ int arcade_video_init(void)
         s_buf_bytes = (uint32_t)need;
     }
 
+    /* 源帧双缓冲：模拟器这一帧写 A，缩放任务同时读上一帧的 B。
+     * 拿不到就退化成单块（模拟器和缩放串行，跟以前一样，只是不再丢功能）。 */
+    if (s_src[0] == NULL) {
+        size_t src_need = (size_t)SRC_WIDTH * SRC_HEIGHT * sizeof(arcade_fbpixel_t);
+        int got = 0;
+
+        for (int i = 0; i < 2; i++) {
+            if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < src_need + 96 * 1024) {
+                break;
+            }
+            s_src[i] = (arcade_fbpixel_t *)exram_malloc(4, src_need);
+            if (s_src[i] == NULL) {
+                break;
+            }
+            got++;
+        }
+
+        s_src_slots = got;
+        LISA_LOGI(TAG, "source frames %d x %u bytes", got, (unsigned)src_need);
+    }
+
     arcade_video_fill_black();
+
+    /* 记住面板当前的实际 SPI 频率，`arcade spi` 改频失败时用它回滚 */
+    if (arcade_video_spi_freq() != 0) {
+        s_spi_freq_backup = arcade_video_spi_freq();
+    }
 
     LISA_LOGI(TAG, "framebuffer %dx%d x2 at %p/%p", ARCADE_FB_WIDTH, ARCADE_FB_HEIGHT,
               (void *)s_buf[0], (void *)s_buf[1]);
@@ -234,11 +298,16 @@ void arcade_video_deinit(void)
 {
     /* 送屏任务不销毁（帧缓冲是静态生命周期），这里只释放缓冲 */
     for (int i = 0; i < 2; i++) {
+        if (s_src[i] != NULL) {
+            exram_free(s_src[i]);
+            s_src[i] = NULL;
+        }
         if (s_buf[i] != NULL) {
             exram_free(s_buf[i]);
             s_buf[i] = NULL;
         }
     }
+    s_src_slots = 0;
     s_last = NULL;
 }
 
@@ -300,6 +369,12 @@ const uint8_t (*arcade_video_dmg_palette_rgb(void))[3]
 
 void arcade_video_set_scale(int scale)
 {
+    /* 几何参数（行宽/送屏矩形）是送屏和缩放两个任务共用的，必须等流水线清空
+     * 再改，否则在途的那一帧会按旧几何去缩放/送屏。 */
+    if (s_task != NULL) {
+        arcade_video_present_drain();
+    }
+
     s_scale = (scale == SCALE_1X) ? SCALE_1X : SCALE_1_5X;
     geometry_update();
     LISA_LOGI(TAG, "scale %s (%dx%d)", s_scale == SCALE_1X ? "1x" : "1.5x",
@@ -321,6 +396,55 @@ void arcade_video_set_rotate_row_shift(int16_t shift)
 int16_t arcade_video_rotate_row_shift(void)
 {
     return s_rotate_row_shift;
+}
+
+/*
+ * 运行期改面板 SPI 时钟（`arcade spi <MHz>`）。
+ *
+ * 前提：调用之前流水线已经清空（没有在途 DMA），否则 SPI_Control 会回 BUSY。
+ * 这里只改 lisa_spi 的当前配置，bus_spi4 下一帧 configure 时会带上新频率。
+ */
+int arcade_video_set_spi_freq(uint32_t hz)
+{
+    lisa_device_t *dev = lisa_device_get("spi0");
+    lisa_spi_config_t cfg;
+    int ret;
+
+    if (dev == NULL) {
+        return -1;
+    }
+    if (lisa_spi_get_config(dev, &cfg) != 0) {
+        return -2;
+    }
+    if (hz == 0) {
+        return (int)cfg.frequency;
+    }
+
+    cfg.frequency = hz;
+    ret = lisa_spi_configure(dev, &cfg);
+    if (ret != 0) {
+        /* 改失败：把原来的频率写回去，别把屏线路弄成未知状态 */
+        LISA_LOGW(TAG, "spi %u Hz rejected (%d), restoring %u Hz",
+                  (unsigned)hz, ret, (unsigned)s_spi_freq_backup);
+        cfg.frequency = s_spi_freq_backup;
+        (void)lisa_spi_configure(dev, &cfg);
+        return -3;
+    }
+
+    s_spi_freq_backup = hz;
+    LISA_LOGI(TAG, "display spi -> %u Hz", (unsigned)hz);
+    return 0;
+}
+
+uint32_t arcade_video_spi_freq(void)
+{
+    lisa_device_t *dev = lisa_device_get("spi0");
+    lisa_spi_config_t cfg;
+
+    if (dev == NULL || lisa_spi_get_config(dev, &cfg) != 0) {
+        return 0;
+    }
+    return cfg.frequency;
 }
 
 /* RGBA(0xAABBGGRR) → RGB565，和 LVGL 的 lv_color_make 出同样的位模式 */
@@ -388,36 +512,75 @@ static void blit_frame(uint16_t *dst, const arcade_fbpixel_t *src)
     }
 }
 
-void arcade_video_present_frame(const arcade_fbpixel_t *src)
+static void blit_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        int src_idx;
+        int dst_idx;
+        TickType_t t0;
+        TickType_t t1;
+
+        if (xQueueReceive(s_src_q, &src_idx, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        t0 = xTaskGetTickCount();
+        if (xQueueReceive(s_free_q, &dst_idx, pdMS_TO_TICKS(200)) != pdTRUE) {
+            /* 两块目标缓冲都还在 SPI 上：这一帧丢掉，但源缓冲必须还回去，
+             * 否则模拟器任务会卡死在这一帧 */
+            s_perf_wait += xTaskGetTickCount() - t0;
+            xQueueSend(s_src_free_q, &src_idx, 0);
+            continue;
+        }
+        t1 = xTaskGetTickCount();
+        s_perf_wait += t1 - t0;
+
+        blit_frame((uint16_t *)s_buf[dst_idx], s_src[src_idx]);
+
+        s_last = s_buf[dst_idx];
+        s_perf_blit += xTaskGetTickCount() - t1;
+        s_perf_blit_frames++;
+
+        xQueueSend(s_tx_q, &dst_idx, 0);
+        xQueueSend(s_src_free_q, &src_idx, 0);
+    }
+}
+
+arcade_fbpixel_t *arcade_video_begin_frame(void)
 {
     int idx;
-    TickType_t t0;
-    TickType_t t1;
 
-    if (src == NULL || s_buf[0] == NULL) {
+    if (s_src_slots == 0 || s_buf[0] == NULL || !present_start()) {
+        return NULL;
+    }
+
+    if (xQueueReceive(s_src_free_q, &idx, pdMS_TO_TICKS(200)) != pdTRUE) {
+        /* 缩放任务还没把上一帧的源缓冲交回来（缩放真的跑不动了），
+         * 这一帧不缩放也不送屏，但模拟本身继续跑，不拖慢游戏 */
+        return NULL;
+    }
+
+    s_src_cur = idx;
+    return s_src[idx];
+}
+
+void arcade_video_end_frame(bool present)
+{
+    int idx = s_src_cur;
+
+    s_src_cur = -1;
+
+    if (idx < 0) {
         return;
     }
 
-    if (!present_start()) {
-        return;
-    }
-
-    t0 = xTaskGetTickCount();
-    if (xQueueReceive(s_free_q, &idx, pdMS_TO_TICKS(200)) != pdTRUE) {
-        /* 两块缓冲都在送屏（屏比模拟器慢），这一帧丢掉，别把模拟器拖住 */
-        s_perf_frames++;
-        return;
-    }
-    t1 = xTaskGetTickCount();
-    s_perf_wait += t1 - t0;
-
-    blit_frame((uint16_t *)s_buf[idx], src);
-
-    s_last = s_buf[idx];
-    s_perf_blit += xTaskGetTickCount() - t1;
     s_perf_frames++;
 
-    xQueueSend(s_tx_q, &idx, 0);
+    if (!present || xQueueSend(s_src_q, &idx, 0) != pdTRUE) {
+        xQueueSend(s_src_free_q, &idx, 0);
+    }
 }
 
 void arcade_video_present_now(void)
@@ -453,6 +616,21 @@ void arcade_video_present_drain(void)
     for (int i = 0; i < n; i++) {
         xQueueSend(s_free_q, &got[i], 0);
     }
+
+    /* 源缓冲也一并收回，避免改几何/切页面时还有一帧在缩放任务手里 */
+    if (s_src_free_q != NULL) {
+        int sgot[2];
+        int sn = 0;
+
+        while (sn < s_src_slots &&
+               xQueueReceive(s_src_free_q, &sgot[sn], pdMS_TO_TICKS(200)) == pdTRUE) {
+            sn++;
+        }
+
+        for (int i = 0; i < sn; i++) {
+            xQueueSend(s_src_free_q, &sgot[i], 0);
+        }
+    }
 }
 
 void arcade_video_reset_perf(void)
@@ -461,26 +639,39 @@ void arcade_video_reset_perf(void)
     s_perf_wait = 0;
     s_perf_tx = 0;
     s_perf_frames = 0;
+    s_perf_blit_frames = 0;
     s_perf_tx_frames = 0;
 }
 
 void arcade_video_perf(char *out, uint32_t len)
 {
     uint32_t f = s_perf_frames ? s_perf_frames : 1;
+    uint32_t b = s_perf_blit_frames ? s_perf_blit_frames : 1;
     uint32_t t = s_perf_tx_frames ? s_perf_tx_frames : 1;
+    /* 送屏带宽（只统计 lisa_display_write 里的纯传输耗时） */
+    uint32_t tx_rate_x10 = 0;
+    uint32_t bytes = (uint32_t)s_fb_w * (uint32_t)s_fb_h * 2U;
 
     if (out == NULL || len == 0) {
         return;
     }
 
+    if (s_perf_tx > 0) {
+        tx_rate_x10 = (uint32_t)(((uint64_t)bytes * s_perf_tx_frames * 10000ULL) /
+                                 ((uint64_t)s_perf_tx * 1048576ULL / 1000ULL));
+    }
+
     snprintf(out, len,
              "scale=%s %dx%d at %d,%d\n"
-             "present blit=%u.%ums wait=%u.%ums tx=%u.%ums frames=%u txf=%u",
+             "present blit=%u.%ums wait=%u.%ums tx=%u.%ums\n"
+             "frames=%u blitf=%u txf=%u txcache=%u.%u MB/s",
              s_scale == SCALE_1X ? "1x" : "1.5x", s_fb_w, s_fb_h, s_rect_x, s_rect_y,
-             (unsigned)(s_perf_blit / f), (unsigned)((s_perf_blit * 10 / f) % 10),
+             (unsigned)(s_perf_blit / b), (unsigned)((s_perf_blit * 10 / b) % 10),
              (unsigned)(s_perf_wait / f), (unsigned)((s_perf_wait * 10 / f) % 10),
              (unsigned)(s_perf_tx / t), (unsigned)((s_perf_tx * 10 / t) % 10),
-             (unsigned)s_perf_frames, (unsigned)s_perf_tx_frames);
+             (unsigned)s_perf_frames, (unsigned)s_perf_blit_frames,
+             (unsigned)s_perf_tx_frames,
+             (unsigned)(tx_rate_x10 / 10), (unsigned)(tx_rate_x10 % 10));
 }
 
 /* ---------------- Peanut-GB（DMG 内核）用到的逐行接口 ---------------- */

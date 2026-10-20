@@ -546,6 +546,16 @@ void arcade_gb_run_frame(void)
         return;
     }
 
+    /*
+     * 先把这一帧的渲染目标要到手：video 模块的源帧双缓冲让缩放（1.9ms）
+     * 和模拟并行，所以 PPU 得直接写进那块缓冲，而不是模拟器自己的。
+     * 拿不到就退回模拟器内部缓冲（只少一帧画面，不影响运行）。
+     */
+    arcade_fbpixel_t *fb = arcade_video_begin_frame();
+    /* 拿不到源缓冲时要显式退回模拟器内部缓冲：否则 PPU 可能继续写上一帧
+     * 还在被缩放任务读的那块，画面会撕裂 */
+    emulator_set_frame_buffer(p->emu, (FBPixel *)fb);
+
     t0 = xTaskGetTickCount();
 
     /*
@@ -589,11 +599,10 @@ void arcade_gb_run_frame(void)
     }
 
     t1 = xTaskGetTickCount();
-    /* 转换 + 送屏都在 video 模块里双缓冲并行，这里只记模拟器本体耗时。
-     * 屏上有 LVGL 提示文字时不送帧，否则会把提示盖掉。 */
-    if (!arcade_ui_player_message_visible()) {
-        arcade_video_present_frame((const arcade_fbpixel_t *)emulator_get_frame_buffer(p->emu));
-    }
+    /* 缩放 + 送屏交给 video 模块的三级流水，这里只记模拟器本体耗时。
+     * 屏上有 LVGL 提示文字时不缩放也不送帧，否则会把提示盖掉。 */
+    arcade_video_end_frame(
+        fb != NULL && !arcade_ui_player_message_visible());
     p->perf_emu_ticks += t1 - t0;
     p->perf_frames++;
 

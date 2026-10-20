@@ -772,7 +772,16 @@ struct Emulator {
   CartInfo* cart_info; /* Cached for convenience. */
   MemoryMap memory_map;
   EmulatorState state;
-  FrameBuffer frame_buffer;
+  /*
+   * ARCS-MINI port: 帧缓冲改成指针 + 内联后备存储。
+   *
+   * 把 PPU 的渲染目标交给上层做「源帧双缓冲」：模拟器这一帧写 A，缩放任务
+   * 同时读上一帧的 B，缩放这 1.9ms 就从帧周期里挪出去了。
+   * 默认仍指向 frame_buffer_storage，不调 emulator_set_frame_buffer() 时
+   * 行为与原版逐字节一致。
+   */
+  FBPixel* frame_buffer;
+  FrameBuffer frame_buffer_storage;
   /*
    * ARCS-MINI port: SGB 边框帧缓冲原本是内联的 256x224x4B = 229KB，
    * 占掉本平台 PSRAM 的四分之一，而 SGB（SFC 增强 GB）游戏极少。
@@ -5004,7 +5013,14 @@ EmulatorConfig emulator_get_config(Emulator* e) {
 }
 
 FrameBuffer* emulator_get_frame_buffer(Emulator* e) {
-  return &e->frame_buffer;
+  return (FrameBuffer*)e->frame_buffer;
+}
+
+/* ARCS-MINI port: 把 PPU 渲染目标切到外部缓冲（传 NULL 回到内联存储）。
+ * 上层用它做源帧双缓冲，让缩放和模拟并行。 */
+void emulator_set_frame_buffer(Emulator* e, FBPixel* framebuffer) {
+  e->frame_buffer =
+      framebuffer != NULL ? framebuffer : (FBPixel*)e->frame_buffer_storage;
 }
 
 SgbFrameBuffer* emulator_get_sgb_frame_buffer(Emulator* e) {
@@ -5185,6 +5201,8 @@ Emulator* emulator_new(const EmulatorInit* init) {
   Emulator* e = xcalloc(1, sizeof(Emulator));
   /* ARCS-MINI port: PSRAM 分配可能返回 NULL，不先判会直接空指针解引用 */
   CHECK(e != NULL);
+  /* 帧缓冲指针默认指向内联后备存储（calloc 之后必须显式挂上） */
+  e->frame_buffer = (FBPixel*)e->frame_buffer_storage;
 #if defined(CONFIG_ARCADE_GB_STATE_IN_SRAM)
   /* VRAM/WRAM 的实体是 SRAM 里的静态数组，必须在任何访问之前挂上 */
   e->state.vram.data = VRAM_STATE_DATA;
