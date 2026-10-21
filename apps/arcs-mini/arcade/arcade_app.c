@@ -27,6 +27,7 @@
 #include "arcade_audio.h"
 #include "arcade_core.h"
 #include "arcade_dino.h"
+#include "arcade_jump.h"
 #include "arcade_gb.h"
 #include "arcade_input.h"
 #include "arcade_rom.h"
@@ -57,7 +58,8 @@
 typedef enum {
     ARCADE_MODE_LIST = 0,
     ARCADE_MODE_PLAY,
-    ARCADE_MODE_DINO,     /* 内置小游戏（原生，不走模拟器） */
+    ARCADE_MODE_DINO,     /* 内置小游戏「小恐龙」（原生，不走模拟器） */
+    ARCADE_MODE_JUMP,     /* 内置小游戏「跳一跳」（原生） */
 } arcade_mode_t;
 
 typedef enum {
@@ -70,17 +72,34 @@ typedef enum {
     ARCADE_REQ_FB_FILL,
     ARCADE_REQ_FB_RESUME,
     ARCADE_REQ_SPI,
-    ARCADE_REQ_DINO,          /* 进入内置小游戏 */
+    ARCADE_REQ_DINO,          /* 进入内置小游戏「小恐龙」 */
     ARCADE_REQ_DINO_RESET,    /* 重开一局 */
+    ARCADE_REQ_JUMP,          /* 进入内置小游戏「跳一跳」 */
+    ARCADE_REQ_JUMP_RESET,    /* 跳一跳重开一局 */
+    ARCADE_REQ_JUMP_CHARGE,   /* 跳一跳：按住 arg 毫秒后松手 */
 } arcade_req_t;
 
 static arcade_mode_t s_mode = ARCADE_MODE_LIST;
 static int s_sel;
 /* 按键任务写、模拟器任务读，必须 volatile，否则可能被优化成只读一次的循环 */
 static volatile uint8_t s_pending_action = 0xFF;
-/* 内置小游戏：上一帧「跳跃键是否按下」，用来做边沿触发 */
+/* 内置小游戏：「上一帧跳跃键是否按下」，用来做边沿触发 */
 static bool s_dino_prev_pressed;
+static bool s_jump_prev_pressed;
 
+/*
+ * 物理按键的原始事件队列（service_button 的 raw 回调 → arcade 主循环）。
+ * 回调跑在按键扫描任务（20ms 一轮），这里只用单生产者/单消费者的读写指针，
+ * 不加重入保护：队列满了就丢掉最旧的（按键本来就只是「状态变化」）。
+ */
+#define ARCADE_RAW_Q_LEN 8
+static volatile uint8_t s_raw_q[ARCADE_RAW_Q_LEN];
+static volatile uint8_t s_raw_head;
+static volatile uint8_t s_raw_tail;
+/* 调试用：原始事件计数 / 最后一条（`arcade jump stat` 里能看到，
+ * 用来确认「按下」真的在蓄力之前就已经到了） */
+static volatile uint32_t s_raw_evt_cnt;
+static volatile uint8_t s_raw_evt_last = 0xFF;
 static volatile arcade_req_t s_req;
 static volatile int s_req_arg;
 /* arcade spi 的结果（在模拟器任务里改频，不能直接从 shell 任务碰 SPI） */
@@ -358,6 +377,8 @@ static const char *arcade_mode_name(void)
         return "play";
     case ARCADE_MODE_DINO:
         return "dino";
+    case ARCADE_MODE_JUMP:
+        return "jump";
     default:
         return "list";
     }
@@ -366,7 +387,65 @@ static const char *arcade_mode_name(void)
 /* 是否在「游戏页」（模拟器 / 内置小游戏）：帧节拍与 LVGL 降频都按这个判 */
 static bool arcade_in_game(void)
 {
-    return s_mode == ARCADE_MODE_PLAY || s_mode == ARCADE_MODE_DINO;
+    return s_mode == ARCADE_MODE_PLAY || s_mode == ARCADE_MODE_DINO ||
+           s_mode == ARCADE_MODE_JUMP;
+}
+
+/*
+ * 物理按键的**原始**事件回调（service_button → 这里）。
+ *
+ * 为什么要绕开 voice_msg 的 CLICK：那颗键要把单击/双击/…/长按区分开，必须
+ * 等多击判定窗口超时才能把一次按键定性成单击，实测下来几百毫秒，跳一跳的
+ * 「按住蓄力、松手起跳」根本没法玩。原始事件是按下/松开那一刻就来的。
+ *
+ * 回调跑在按键扫描任务（20ms 一轮）里：这里只把事件塞进队列，真正的处理在
+ * arcade 任务（arcade_raw_button_drain）里做。
+ */
+static void arcade_raw_button_cb(uint8_t btn_id, uint8_t event, void *user)
+{
+    uint8_t next = (uint8_t)((s_raw_head + 1U) % ARCADE_RAW_Q_LEN);
+
+    (void)btn_id;
+    (void)user;
+
+    s_raw_evt_cnt++;
+    s_raw_evt_last = event;
+
+    if (next == s_raw_tail) {
+        /* 满了就丢弃：按键事件只表达「状态变化」，旧的没用了 */
+        return;
+    }
+
+    s_raw_q[s_raw_head] = event;
+    s_raw_head = next;
+}
+
+/* 把排队的原始事件喂给当前小游戏（只在 arcade 任务里调） */
+static void arcade_raw_button_drain(void)
+{
+    while (s_raw_tail != s_raw_head) {
+        uint8_t ev = s_raw_q[s_raw_tail];
+
+        s_raw_tail = (uint8_t)((s_raw_tail + 1U) % ARCADE_RAW_Q_LEN);
+
+        if (s_mode != ARCADE_MODE_JUMP || !arcade_jump_active()) {
+            continue;
+        }
+
+        switch ((voice_msg_button_action_t)ev) {
+        case VOICE_MSG_BUTTON_ACTION_PRESS_DOWN:
+            arcade_jump_press();
+            break;
+        /* 短按松开 / 长按（>800ms 的蓄力）松开，都是「松手起跳」 */
+        case VOICE_MSG_BUTTON_ACTION_SHORT_UP:
+        case VOICE_MSG_BUTTON_ACTION_LONG_UP:
+        case VOICE_MSG_BUTTON_ACTION_LONG_HOLD_UP:
+            arcade_jump_release();
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 /*
@@ -393,6 +472,7 @@ static void arcade_start_dino(void)
     arcade_dino_enter();
 
     s_mode = ARCADE_MODE_DINO;
+    s_dino_prev_pressed = false;
     s_frames = 0;
     s_fps_tick = xTaskGetTickCount();
     s_fps_x10 = 0;
@@ -416,6 +496,47 @@ static void arcade_stop_dino(void)
     LISA_LOGI(TAG, "dino stopped");
 }
 
+/*
+ * 内置小游戏（跳一跳）。和 dino 完全一样的进出流程，只是换了一只游戏。
+ */
+static void arcade_start_jump(void)
+{
+    if (arcade_core_running()) {
+        arcade_audio_set_active(false);
+        arcade_core_stop();
+    }
+
+    arcade_ui_show_player();
+    arcade_ui_player_message(NULL);
+
+    arcade_video_use_fullscreen(true);
+    arcade_jump_enter();
+
+    s_mode = ARCADE_MODE_JUMP;
+    s_jump_prev_pressed = false;
+    s_frames = 0;
+    s_fps_tick = xTaskGetTickCount();
+    s_fps_x10 = 0;
+    s_logic_frames = 0;
+    s_render_frames = 0;
+    s_skipped_frames = 0;
+    s_rate_tick = 0;
+    s_next_start_cyc = arcade_cycles();
+    s_behind_cnt = 0;
+
+    LISA_LOGI(TAG, "jump started");
+}
+
+static void arcade_stop_jump(void)
+{
+    arcade_jump_leave();
+    arcade_video_use_fullscreen(false);
+    arcade_video_present_drain();
+    arcade_show_list();
+
+    LISA_LOGI(TAG, "jump stopped");
+}
+
 static void arcade_start_selected(void)
 {
     const char *path = arcade_rom_path(s_sel);
@@ -428,7 +549,14 @@ static void arcade_start_selected(void)
 
     /* 列表最前面是固件内置的小游戏，不需要 ROM */
     if (arcade_rom_is_builtin(s_sel)) {
-        arcade_start_dino();
+        switch (arcade_rom_builtin_id(s_sel)) {
+        case ARCADE_BUILTIN_JUMP:
+            arcade_start_jump();
+            break;
+        default:
+            arcade_start_dino();
+            break;
+        }
         return;
     }
 
@@ -490,6 +618,11 @@ static void arcade_stop_game(void)
 {
     if (s_mode == ARCADE_MODE_DINO) {
         arcade_stop_dino();
+        return;
+    }
+
+    if (s_mode == ARCADE_MODE_JUMP) {
+        arcade_stop_jump();
         return;
     }
 
@@ -570,6 +703,19 @@ static void arcade_handle_action(uint8_t action)
         return;
     }
 
+    /*
+     * 跳一跳：按下/松开走的是 service_button 的原始事件（arcade_raw_button_drain），
+     * 这里只能拿到过了多击窗口的汇总事件，再拿它去起跳会晚好几帧（而且会和
+     * 原始事件重复触发），所以这里只留「长按退出」。
+     */
+    if (s_mode == ARCADE_MODE_JUMP) {
+        if (action == VOICE_MSG_BUTTON_ACTION_LONG_HOLD) {
+            LISA_LOGI(TAG, "long press, leave jump");
+            arcade_stop_game();
+        }
+        return;
+    }
+
     /* 模拟器游戏页 */
     switch (action) {
     case VOICE_MSG_BUTTON_ACTION_CLICK:
@@ -619,6 +765,15 @@ static void arcade_handle_request(void)
         break;
     case ARCADE_REQ_DINO_RESET:
         arcade_dino_reset();
+        break;
+    case ARCADE_REQ_JUMP:
+        arcade_start_jump();
+        break;
+    case ARCADE_REQ_JUMP_RESET:
+        arcade_jump_reset();
+        break;
+    case ARCADE_REQ_JUMP_CHARGE:
+        arcade_jump_charge(arg);
         break;
     case ARCADE_REQ_RESCAN:
         arcade_rescan();
@@ -1036,6 +1191,9 @@ static void arcade_task(void *arg)
             arcade_handle_action(action);
         }
 
+        /* 物理按键的原始事件（按下/松开），跳一跳靠它做「按住蓄力」 */
+        arcade_raw_button_drain();
+
         arcade_handle_request();
 
         /* 每 30 秒（有改动才写）把 cart RAM 落盘，写盘期间允许掉帧 */
@@ -1097,6 +1255,37 @@ static void arcade_task(void *arg)
                 arcade_frame_tick();
                 arcade_rate_tick(arcade_dino_renders() != rendered_before);
             }
+        } else if (s_mode == ARCADE_MODE_JUMP && !s_frozen) {
+            /*
+             * 跳一跳：同样是 60Hz 逻辑 + 可能跳过的渲染。按键用的是物理键的
+             * 原始事件（按下开始蓄力、松手起跳）；这里多出来的那一条是给 USB
+             * 键盘 / 调试注入用的——它们没有原始事件，只能看 arcade_input 的位图
+             * 边沿，按下即蓄力、松开即起跳。
+             */
+            bool kbd_exit = false;
+            uint32_t kbd = arcade_input_take_keyboard(&kbd_exit);
+
+            if (kbd_exit) {
+                LISA_LOGI(TAG, "ESC from keyboard, leave jump");
+                arcade_stop_game();
+            } else {
+                uint32_t mask = arcade_input_mask() | kbd;
+                bool pressed = (mask & (ARCADE_KEY_A | ARCADE_KEY_UP |
+                                        ARCADE_KEY_START)) != 0U;
+
+                if (pressed && !s_jump_prev_pressed) {
+                    arcade_jump_press();
+                } else if (!pressed && s_jump_prev_pressed) {
+                    arcade_jump_release();
+                }
+                s_jump_prev_pressed = pressed;
+
+                uint32_t rendered_before = arcade_jump_renders();
+
+                arcade_jump_tick();
+                arcade_frame_tick();
+                arcade_rate_tick(arcade_jump_renders() != rendered_before);
+            }
         }
 
         /*
@@ -1135,7 +1324,7 @@ static void arcade_task(void *arg)
             s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
             s_cost_us = (s_cost_us * 7U + cost_us) / 8U;
             arcade_skip_account(cost_us, s_last_render);
-        } else if (s_mode == ARCADE_MODE_DINO) {
+        } else if (s_mode == ARCADE_MODE_DINO || s_mode == ARCADE_MODE_JUMP) {
             /* 小游戏的整帧耗时单独记（arcade perf 能直接看到） */
             s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
             s_cost_us = (s_cost_us * 7U + cost_us) / 8U;
@@ -1225,6 +1414,8 @@ int arcade_app_main(void)
     if (service_button_init() != 0) {
         LISA_LOGW(TAG, "button init failed");
     }
+    /* 小游戏要按键的原始「按下 / 松开」（多击判定窗口太慢，蓄力没法玩） */
+    service_button_set_raw_callback(arcade_raw_button_cb, NULL);
     LISA_LOGI(TAG, "button ready");
 
     /*
@@ -2612,6 +2803,104 @@ static int cmd_dino(int argc, char **argv)
     return 0;
 }
 
+/*
+ * arcade jump [...]: 内置小游戏「跳一跳」
+ *
+ *   arcade jump              进入游戏（等价于在列表里选第一项）
+ *   arcade jump stat         状态：分数 / 蓄力 / 平台参数 / fps
+ *   arcade jump charge <ms>  模拟「按住 ms 毫秒后松手」
+ *   arcade jump auto <0|1>   自动玩（按距离反算蓄力 + 随机误差，无人值守压测）
+ *   arcade jump reset        重开一局
+ *   arcade jump shot         帧缓冲 ASCII 图（看有没有画面）
+ *   arcade jump exit         退出回列表
+ */
+static int cmd_jump(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    const char *sub = argc >= 1 ? argv[0] : NULL;
+
+    if (sub == NULL) {
+        if (arcade_request(ARCADE_REQ_JUMP, 0) != 0) {
+            shellPrint(shell, "请求超时\r\n");
+            return 0;
+        }
+        shellPrint(shell, "跳一跳: 已进入（按住蓄力、松手起跳，长按退出）\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "stat") == 0) {
+        static const char *const k_state[] = {"ready", "charge", "fly", "pan",
+                                              "fall", "dead"};
+        uint8_t st = (uint8_t)arcade_jump_state();
+
+        if (!arcade_jump_active()) {
+            shellPrint(shell, "当前没在玩跳一跳（mode=%s）\r\n", arcade_mode_name());
+            return 0;
+        }
+
+        shellPrint(shell, "state=%s score=%u best=%u combo=%u charge=%d%%\r\n",
+                   st < sizeof(k_state) / sizeof(k_state[0]) ? k_state[st] : "?",
+                   (unsigned)arcade_jump_score(), (unsigned)arcade_jump_best(),
+                   (unsigned)arcade_jump_combo(), arcade_jump_charge_pct());
+        shellPrint(shell, "gap=%d dir=%s rx=%d nrx=%d err=%d\r\n",
+                   arcade_jump_gap(), arcade_jump_dir() > 0 ? "右上" : "左上",
+                   arcade_jump_radius(), arcade_jump_next_radius(),
+                   arcade_jump_land_err());
+        shellPrint(shell, "logic=%u.%u render=%u.%u fps frames=%u renders=%u skips=%u\r\n",
+                   (unsigned)(arcade_jump_logic_fps_x10() / 10),
+                   (unsigned)(arcade_jump_logic_fps_x10() % 10),
+                   (unsigned)(arcade_jump_render_fps_x10() / 10),
+                   (unsigned)(arcade_jump_render_fps_x10() % 10),
+                   (unsigned)arcade_jump_frames(), (unsigned)arcade_jump_renders(),
+                   (unsigned)arcade_jump_skips());
+        shellPrint(shell, "auto=%d raw=%u last=%u\r\n", arcade_jump_auto() ? 1 : 0,
+                   (unsigned)s_raw_evt_cnt, (unsigned)s_raw_evt_last);
+        return 0;
+    }
+
+    if (strcmp(sub, "charge") == 0) {
+        int ms = argc >= 2 ? atoi(argv[1]) : 400;
+
+        if (arcade_request(ARCADE_REQ_JUMP_CHARGE, ms) != 0) {
+            shellPrint(shell, "请求超时\r\n");
+            return 0;
+        }
+        shellPrint(shell, "charge %dms -> score=%u state=%d\r\n", ms,
+                   (unsigned)arcade_jump_score(), (int)arcade_jump_state());
+        return 0;
+    }
+
+    if (strcmp(sub, "auto") == 0) {
+        if (argc < 2) {
+            shellPrint(shell, "auto=%d\r\n", arcade_jump_auto() ? 1 : 0);
+            return 0;
+        }
+        arcade_jump_set_auto(atoi(argv[1]) != 0);
+        shellPrint(shell, "auto=%d\r\n", arcade_jump_auto() ? 1 : 0);
+        return 0;
+    }
+
+    if (strcmp(sub, "reset") == 0) {
+        (void)arcade_request(ARCADE_REQ_JUMP_RESET, 0);
+        shellPrint(shell, "已重开\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "shot") == 0) {
+        arcade_fb_ascii(shell);
+        return 0;
+    }
+
+    if (strcmp(sub, "exit") == 0) {
+        (void)arcade_request(ARCADE_REQ_EXIT, 0);
+        shellPrint(shell, "已返回列表\r\n");
+        return 0;
+    }
+
+    shellPrint(shell, "用法: arcade jump [stat|charge <ms>|auto <0|1>|reset|shot|exit]\r\n");
+    return 0;
+}
+
 static const struct listen_cmd_t g_arcade_cmds[] = {    {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
     {"rescan", cmd_rescan, "重新扫描 TF 卡"},
@@ -2644,6 +2933,7 @@ static const struct listen_cmd_t g_arcade_cmds[] = {    {"stat", cmd_stat, "打�
     {"pwrho1d", cmd_pwrho1d, "把 POWER_EN 锁到高：pwrho1d <0|1>（刷机调试用）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
     {"dino", cmd_dino, "内置小游戏小恐龙：dino [stat|jump|reset|auto <0|1>|shot|exit]"},
+    {"jump", cmd_jump, "内置小游戏跳一跳：jump [stat|charge <ms>|auto <0|1>|reset|shot|exit]"},
 };
 
 static int cmd_arcade_help(Shell *shell)

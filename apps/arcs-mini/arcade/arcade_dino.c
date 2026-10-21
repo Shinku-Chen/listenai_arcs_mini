@@ -29,6 +29,7 @@
 #include "lisa_log.h"
 
 #include "arcade_dino.h"
+#include "arcade_gfx.h"
 #include "arcade_video.h"
 
 #define TAG "arcade-dino"
@@ -128,75 +129,6 @@ static TickType_t s_rate_tick;
 static uint32_t s_rate_logic;
 static uint32_t s_rate_render;
 
-/* ---------------- 5x7 点阵字 ---------------- */
-/* 每字节一列，bit0 = 最上面一行（经典 5x7 LCD 字模） */
-
-static const uint8_t FONT_DIGIT[10][5] = {
-    {0x3E, 0x51, 0x49, 0x45, 0x3E},   /* 0 */
-    {0x00, 0x42, 0x7F, 0x40, 0x00},   /* 1 */
-    {0x42, 0x61, 0x51, 0x49, 0x46},   /* 2 */
-    {0x21, 0x41, 0x45, 0x4B, 0x31},   /* 3 */
-    {0x18, 0x14, 0x12, 0x7F, 0x10},   /* 4 */
-    {0x27, 0x45, 0x45, 0x45, 0x39},   /* 5 */
-    {0x3C, 0x4A, 0x49, 0x49, 0x30},   /* 6 */
-    {0x01, 0x71, 0x09, 0x05, 0x03},   /* 7 */
-    {0x36, 0x49, 0x49, 0x49, 0x36},   /* 8 */
-    {0x06, 0x49, 0x49, 0x29, 0x1E},   /* 9 */
-};
-
-static const uint8_t FONT_ALPHA[26][5] = {
-    {0x7E, 0x11, 0x11, 0x11, 0x7E},   /* A */
-    {0x7F, 0x49, 0x49, 0x49, 0x36},   /* B */
-    {0x3E, 0x41, 0x41, 0x41, 0x22},   /* C */
-    {0x7F, 0x41, 0x41, 0x22, 0x1C},   /* D */
-    {0x7F, 0x49, 0x49, 0x49, 0x41},   /* E */
-    {0x7F, 0x09, 0x09, 0x09, 0x01},   /* F */
-    {0x3E, 0x41, 0x49, 0x49, 0x7A},   /* G */
-    {0x7F, 0x08, 0x08, 0x08, 0x7F},   /* H */
-    {0x00, 0x41, 0x7F, 0x41, 0x00},   /* I */
-    {0x20, 0x40, 0x41, 0x3F, 0x01},   /* J */
-    {0x7F, 0x08, 0x14, 0x22, 0x41},   /* K */
-    {0x7F, 0x40, 0x40, 0x40, 0x40},   /* L */
-    {0x7F, 0x02, 0x0C, 0x02, 0x7F},   /* M */
-    {0x7F, 0x04, 0x08, 0x10, 0x7F},   /* N */
-    {0x3E, 0x41, 0x41, 0x41, 0x3E},   /* O */
-    {0x7F, 0x09, 0x09, 0x09, 0x06},   /* P */
-    {0x3E, 0x41, 0x51, 0x21, 0x5E},   /* Q */
-    {0x7F, 0x09, 0x19, 0x29, 0x46},   /* R */
-    {0x46, 0x49, 0x49, 0x49, 0x31},   /* S */
-    {0x01, 0x01, 0x7F, 0x01, 0x01},   /* T */
-    {0x3F, 0x40, 0x40, 0x40, 0x3F},   /* U */
-    {0x1F, 0x20, 0x40, 0x20, 0x1F},   /* V */
-    {0x3F, 0x40, 0x38, 0x40, 0x3F},   /* W */
-    {0x63, 0x14, 0x08, 0x14, 0x63},   /* X */
-    {0x07, 0x08, 0x70, 0x08, 0x07},   /* Y */
-    {0x61, 0x51, 0x49, 0x45, 0x43},   /* Z */
-};
-
-static const uint8_t FONT_DASH[5]  = {0x08, 0x08, 0x08, 0x08, 0x08};
-static const uint8_t FONT_COLON[5] = {0x00, 0x36, 0x36, 0x00, 0x00};
-
-static const uint8_t *font_glyph(char ch)
-{
-    if (ch >= '0' && ch <= '9') {
-        return FONT_DIGIT[ch - '0'];
-    }
-    if (ch >= 'A' && ch <= 'Z') {
-        return FONT_ALPHA[ch - 'A'];
-    }
-    if (ch >= 'a' && ch <= 'z') {
-        return FONT_ALPHA[ch - 'a'];
-    }
-    if (ch == '-') {
-        return FONT_DASH;
-    }
-    if (ch == ':') {
-        return FONT_COLON;
-    }
-
-    return NULL;
-}
-
 /* ---------------- 精灵图 ---------------- */
 /* '#' = 上色，其它 = 透明。行宽固定 DINO_SPRITE_W。 */
 
@@ -266,105 +198,6 @@ static const char *const CACTUS[OBS_SMALL_H] = {
     "....##....",
     "....##....",
 };
-
-/* ---------------- 绘制基础 ---------------- */
-
-static void fill_rect(uint16_t *fb, int x, int y, int w, int h, uint16_t color)
-{
-    if (x < 0) {
-        w += x;
-        x = 0;
-    }
-    if (y < 0) {
-        h += y;
-        y = 0;
-    }
-    if (x + w > DINO_SCREEN_W) {
-        w = DINO_SCREEN_W - x;
-    }
-    if (y + h > DINO_SCREEN_H) {
-        h = DINO_SCREEN_H - y;
-    }
-    if (w <= 0 || h <= 0) {
-        return;
-    }
-
-    uint32_t pair = ((uint32_t)color << 16) | color;
-
-    for (int row = 0; row < h; row++) {
-        uint16_t *d = fb + (size_t)(y + row) * DINO_SCREEN_W + x;
-        int n = w;
-
-        /* 32 位写要 4 字节对齐：列号为奇数时先单独写一个像素 */
-        if (((uintptr_t)d & 3U) != 0U) {
-            *d++ = color;
-            n--;
-        }
-
-        uint32_t *p = (uint32_t *)d;
-        int nw = n / 2;
-
-        for (int i = 0; i < nw; i++) {
-            p[i] = pair;
-        }
-        if (n & 1) {
-            d[n - 1] = color;
-        }
-    }
-}
-
-static void draw_sprite(uint16_t *fb, int x, int y, const char *const *rows, int nrows,
-                        int scale, uint16_t color)
-{
-    for (int r = 0; r < nrows; r++) {
-        const char *line = rows[r];
-
-        for (int c = 0; line[c] != '\0'; c++) {
-            if (line[c] == '#') {
-                fill_rect(fb, x + c * scale, y + r * scale, scale, scale, color);
-            }
-        }
-    }
-}
-
-static void draw_char(uint16_t *fb, int x, int y, char ch, int scale, uint16_t color)
-{
-    const uint8_t *cols = font_glyph(ch);
-
-    if (cols == NULL) {
-        return;
-    }
-
-    for (int c = 0; c < 5; c++) {
-        uint8_t bits = cols[c];
-
-        for (int r = 0; r < 7; r++) {
-            if ((bits & (1U << r)) != 0U) {
-                fill_rect(fb, x + c * scale, y + r * scale, scale, scale, color);
-            }
-        }
-    }
-}
-
-static void draw_text(uint16_t *fb, int x, int y, const char *s, int scale, uint16_t color)
-{
-    for (; *s != '\0'; s++) {
-        draw_char(fb, x, y, *s, scale, color);
-        x += 6 * scale;
-    }
-}
-
-static int text_width(const char *s, int scale)
-{
-    int n = (int)strlen(s);
-
-    return n > 0 ? n * 6 * scale - scale : 0;
-}
-
-static void draw_text_center(uint16_t *fb, int y, const char *s, int scale, uint16_t color)
-{
-    draw_text(fb, (DINO_SCREEN_W - text_width(s, scale)) / 2, y, s, scale, color);
-}
 
 /* ---------------- 游戏逻辑 ---------------- */
 
@@ -655,8 +488,8 @@ static void dino_logic(void)
 static void dino_render(uint16_t *fb)
 {
     /* 整屏铺底色：天空和地面同色，靠地平线分界 */
-    fill_rect(fb, 0, 0, DINO_SCREEN_W, DINO_SCREEN_H, C_SKY);
-    fill_rect(fb, 0, DINO_GROUND_Y, DINO_SCREEN_W, 1, C_LINE);
+    arcade_gfx_fill(fb, 0, 0, DINO_SCREEN_W, DINO_SCREEN_H, C_SKY);
+    arcade_gfx_fill(fb, 0, DINO_GROUND_Y, DINO_SCREEN_W, 1, C_LINE);
 
     /* 地面纹理：跟着滚动走的两段短线 */
     {
@@ -665,8 +498,8 @@ static void dino_render(uint16_t *fb)
         for (int i = -1; i <= DINO_SCREEN_W / 96 + 1; i++) {
             int x = i * 96 - off;
 
-            fill_rect(fb, x + 16, DINO_GROUND_Y + 9, 13, 2, C_LINE);
-            fill_rect(fb, x + 56, DINO_GROUND_Y + 21, 9, 2, C_LINE);
+            arcade_gfx_fill(fb, x + 16, DINO_GROUND_Y + 9, 13, 2, C_LINE);
+            arcade_gfx_fill(fb, x + 56, DINO_GROUND_Y + 21, 9, 2, C_LINE);
         }
     }
 
@@ -675,9 +508,9 @@ static void dino_render(uint16_t *fb)
         int x = g.cloud[i].x_q8 >> 8;
         int y = g.cloud[i].y;
 
-        fill_rect(fb, x + 7, y, 17, 5, C_CLOUD);
-        fill_rect(fb, x, y + 5, 30, 5, C_CLOUD);
-        fill_rect(fb, x + 11, y - 4, 9, 5, C_CLOUD);
+        arcade_gfx_fill(fb, x + 7, y, 17, 5, C_CLOUD);
+        arcade_gfx_fill(fb, x, y + 5, 30, 5, C_CLOUD);
+        arcade_gfx_fill(fb, x + 11, y - 4, 9, 5, C_CLOUD);
     }
 
     /* 障碍 */
@@ -692,7 +525,7 @@ static void dino_render(uint16_t *fb)
         int y = DINO_GROUND_Y - o->h;
         int scale = (o->w > OBS_SMALL_W) ? OBS_BIG_SCALE : 1;
 
-        draw_sprite(fb, x, y, CACTUS, OBS_SMALL_H, scale, C_INK);
+        arcade_gfx_sprite(fb, x, y, CACTUS, OBS_SMALL_H, scale, C_INK);
     }
 
     /* 恐龙：空中用固定的跳跃姿势，地面每 5 帧换一次腿 */
@@ -710,8 +543,8 @@ static void dino_render(uint16_t *fb)
             legs = DINO_LEGS_A;
         }
 
-        draw_sprite(fb, DINO_X, y, DINO_BODY, DINO_SPRITE_H - 6, 1, C_INK);
-        draw_sprite(fb, DINO_X, y + DINO_SPRITE_H - 6, legs, 6, 1, C_INK);
+        arcade_gfx_sprite(fb, DINO_X, y, DINO_BODY, DINO_SPRITE_H - 6, 1, C_INK);
+        arcade_gfx_sprite(fb, DINO_X, y + DINO_SPRITE_H - 6, legs, 6, 1, C_INK);
     }
 
     /* 分数：HI 在左上、当前分在右上（和 Chrome 那只一样的位置感） */
@@ -719,21 +552,21 @@ static void dino_render(uint16_t *fb)
         char buf[16];
 
         snprintf(buf, sizeof(buf), "HI %05u", (unsigned)g.best);
-        draw_text(fb, 8, 12, buf, 2, C_DIM);
+        arcade_gfx_text(fb, 8, 12, buf, 2, C_DIM);
 
         snprintf(buf, sizeof(buf), "%05u", (unsigned)g.score);
-        draw_text(fb, DINO_SCREEN_W - 8 - text_width(buf, 3), 8, buf, 3, C_INK);
+        arcade_gfx_text(fb, DINO_SCREEN_W - 8 - arcade_gfx_text_width(buf, 3), 8, buf, 3, C_INK);
     }
 
     if (g.state == ARCADE_DINO_DEAD) {
         char buf[24];
 
-        draw_text_center(fb, 96, "GAME OVER", 3, C_INK);
+        arcade_gfx_text_center(fb, 96, "GAME OVER", 3, C_INK);
 
         snprintf(buf, sizeof(buf), "SCORE %05u", (unsigned)g.score);
-        draw_text_center(fb, 130, buf, 2, C_INK);
+        arcade_gfx_text_center(fb, 130, buf, 2, C_INK);
 
-        draw_text_center(fb, 156, "PRESS TO RETRY", 1, C_DIM);
+        arcade_gfx_text_center(fb, 156, "PRESS TO RETRY", 1, C_DIM);
     }
 }
 

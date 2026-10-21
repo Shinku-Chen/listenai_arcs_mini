@@ -38,13 +38,19 @@
 #define ROM_DEMO_PATH  "@demo"
 
 /*
- * 列表最前面固定放一个「内置小游戏」：它是固件原生代码（arcade_dino.c），
+ * 列表最前面固定放一个「内置小游戏」：它是固件原生代码（arcade_jump.c），
  * 不读卡、不占 ROM 名额，所以即使没插 TF 卡、甚至一张 ROM 都没有，
- * 列表也不会是空的。
+ * 列表也不会是空的。小恐龙（arcade_dino.c）仍然编在固件里，但不占列表
+ * 名额，用 shell 命令 `arcade dino` 直接进。
  */
-#define ROM_BUILTIN_COUNT     1
-#define ROM_BUILTIN_DINO_PATH "@dino"
-#define ROM_BUILTIN_DINO_NAME "小恐龙（内置）"
+#define ROM_BUILTIN_COUNT  1
+
+static const struct {
+    const char *name;
+    const char *path;
+} k_builtins[ROM_BUILTIN_COUNT] = {
+    [ARCADE_BUILTIN_JUMP] = {"跳一跳（内置）", "@jump"},
+};
 
 struct arcade_rom_entry {
     char name[ROM_NAME_LEN];
@@ -217,6 +223,15 @@ bool arcade_rom_is_builtin(int index)
     return index >= 0 && index < ROM_BUILTIN_COUNT;
 }
 
+int arcade_rom_builtin_id(int index)
+{
+    if (!arcade_rom_is_builtin(index)) {
+        return -1;
+    }
+
+    return index;
+}
+
 const char *arcade_rom_name(int index)
 {
     if (index < 0 || index >= arcade_rom_count()) {
@@ -224,7 +239,7 @@ const char *arcade_rom_name(int index)
     }
 
     if (arcade_rom_is_builtin(index)) {
-        return ROM_BUILTIN_DINO_NAME;
+        return k_builtins[index].name;
     }
 
     return s_roms[index - ROM_BUILTIN_COUNT].name;
@@ -237,7 +252,7 @@ const char *arcade_rom_path(int index)
     }
 
     if (arcade_rom_is_builtin(index)) {
-        return ROM_BUILTIN_DINO_PATH;
+        return k_builtins[index].path;
     }
 
     return s_roms[index - ROM_BUILTIN_COUNT].path;
