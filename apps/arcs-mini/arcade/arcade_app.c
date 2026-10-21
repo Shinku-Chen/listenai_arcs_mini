@@ -1091,9 +1091,11 @@ static void arcade_task(void *arg)
                 }
                 s_dino_prev_pressed = pressed;
 
+                uint32_t rendered_before = arcade_dino_renders();
+
                 arcade_dino_tick();
                 arcade_frame_tick();
-                arcade_rate_tick(true);
+                arcade_rate_tick(arcade_dino_renders() != rendered_before);
             }
         }
 

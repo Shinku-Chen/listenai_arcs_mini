@@ -434,9 +434,28 @@ static void dino_spawn_obstacle(void)
         return;
     }
 
-    /* 速度越高越容易出大仙人掌（大的是小的 2 倍尺寸） */
+    /*
+     * 大仙人掌只在速度够高时才出。
+     *
+     * 这不是拍脑袋的难度曲线，是算出来的：恐龙跳过 44px 高的障碍时，
+     * 「脚底高于 44px」只有约 14.7 帧（起跳后第 6.1~20.8 帧）。而一个
+     * 20px 宽的大仙人掌扫过恐龙 16px 的命中盒需要 (20+16)/dx 帧——
+     * dx=2px/帧（120px/s）时要 18 帧，比 14.7 还长，**低速度下无论怎么跳都过不去**。
+     *
+     * 所以 200px/s（dx≈3.35，扫过 10 帧）以下只出小仙人掌；
+     * 之后概率缓缓升到 40%，和速度一起加难度。
+     */
     int speed_px = dino_speed_px_s();
-    bool big = (dino_rand() % 100U) < (uint32_t)(20 + speed_px / 8);
+    bool big = false;
+
+    if (speed_px >= 200) {
+        int chance = (speed_px - 200) / 3;
+
+        if (chance > 60) {
+            chance = 60;
+        }
+        big = (dino_rand() % 100U) < (uint32_t)chance;
+    }
 
     dino_obs_t *o = &g.obs[slot];
 
@@ -504,12 +523,23 @@ static bool dino_hit_test(void)
 static void dino_auto_jump(void)
 {
     /*
-     * 起跳时机用「还有几帧撞上」来算，和速度无关：
-     * 跳跃的第 6~20 帧恐龙高于 44px（大仙人掌高度），所以障碍还有
-     * 12 帧到达时起跳刚好能从它头顶过去。
+     * 注意：必须在空中直接返回。dino_do_jump() 在空中的语义是「加速下坠」，
+     * 而自动跳的触发条件在空中仍然成立 —— 不拦住就会每帧往下砸 900，
+     * 恐龙刚离地就被拍回地面（实测就是「auto=1 但第一根障碍就撞上」）。
+     */
+    if (g.airborne) {
+        return;
+    }
+
+    /*
+     * 起跳时机用「还有几帧撞上」算，和速度无关：
+     * 障碍扫过恐龙命中盒需要 (w+16)/dx 帧，必须在「脚底高于障碍顶部」的
+     * 窗口内完成。小仙人掌（22px 高）窗口很宽，提前 12 帧跳就够；
+     * 大仙人掌（44px 高）窗口只有 14.7 帧，得提前 8 帧跳、把它夹在峰值附近。
      */
     int dino_right = DINO_X + DINO_SPRITE_W;
     int32_t reach_q8 = ((int32_t)DINO_SCREEN_W << 8);   /* 找一个最近的 */
+    int32_t reach_w = 0;
 
     for (int i = 0; i < OBS_MAX; i++) {
         const dino_obs_t *o = &g.obs[i];
@@ -522,6 +552,7 @@ static void dino_auto_jump(void)
         }
         if (o->x_q8 < reach_q8) {
             reach_q8 = o->x_q8;
+            reach_w = o->w;
         }
     }
 
@@ -529,7 +560,8 @@ static void dino_auto_jump(void)
         return;
     }
 
-    int32_t trigger_q8 = (g.speed_q16 >> 8) * 12;   /* 12 帧的路程 */
+    int32_t frames = (reach_w > OBS_SMALL_W) ? 8 : 12;
+    int32_t trigger_q8 = (g.speed_q16 >> 8) * frames;
 
     if (reach_q8 - ((int32_t)dino_right << 8) <= trigger_q8) {
         dino_do_jump();
@@ -606,7 +638,6 @@ static void dino_logic(void)
     if (s_auto) {
         dino_auto_jump();
     }
-
     if (dino_hit_test()) {
         g.state = ARCADE_DINO_DEAD;
         g.dead_frames = 0;
