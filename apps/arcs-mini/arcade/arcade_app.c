@@ -153,18 +153,39 @@ static uint32_t s_lvgl_skip;
 #define ARCADE_GB_FRAME_US       16743U   /* GB 真实帧周期 */
 #define ARCADE_RENDER_EXTRA_INIT 4500U    /* 渲染额外开销初值（µs） */
 
+/*
+ * 渲染调度用「千分比相位累加器」，不用「信用够不够」判据。
+ *
+ * 为什么换：原来的判据是 credit >= 3/4 * 渲染额外开销，而 credit 只在一帧
+ * 耗时**低于**帧预算时才涨。一旦渲染成本 EMA 被某个长停帧（写卡 / 切页面，
+ * 几十毫秒）学成天价，门槛就抬到 credit 上限之上 —— 实测表现是 logic=58 /
+ * render=0（屏幕一直是白板），而且成天不渲染 → 成本 EMA 再也学不回来，死锁。
+ * 相位累加器由「目标渲染比例」驱动、比例有下限，渲染帧率不可能归零。
+ */
+#define ARCADE_RATIO_INIT        667U     /* 初始渲染比例（千分数）= 2/3 */
+#define ARCADE_RATIO_MIN         150U     /* 下限：任何情况至少 ~9fps 画面 */
+#define ARCADE_RATIO_MAX         1000U
+#define ARCADE_RENDER_GAP_MAX    12U      /* 连续这么多帧没画就强制画一帧（~200ms） */
+
 static bool s_skip_auto = true;                       /* 自动跳帧保速 */
 static arcade_render_mode_t s_skip_mech = ARCADE_RENDER_SKIP;  /* 跳过的实现方式 */
-static int32_t s_skip_credit_us;                      /* 渲染余量信用（µs） */
-static uint32_t s_render_extra_us = ARCADE_RENDER_EXTRA_INIT;
 static uint32_t s_render_cost_us = 18200;             /* 渲染帧耗时 EMA */
 static uint32_t s_skip_cost_us = 13700;               /* 跳过帧耗时 EMA */
+static uint32_t s_render_ratio = ARCADE_RATIO_INIT;   /* 目标渲染比例（千分数） */
+static uint32_t s_render_phase;                       /* 相位累加器（千分数） */
+static uint32_t s_render_gap;                         /* 连续未渲染帧数 */
+static uint32_t s_force_renders;                      /* 保底强制渲染次数（诊断用） */
+static bool s_ever_rendered;
+static uint32_t s_next_start_cyc;                     /* 下一帧的绝对起点（rdcycle） */
+static uint32_t s_behind_cnt;                         /* 连续落后帧数（喂 IDLE 用） */
 static bool s_last_render = true;
 static uint32_t s_logic_frames;
 static uint32_t s_render_frames;
 static uint32_t s_skipped_frames;
 static uint32_t s_logic_fps_x10;
 static uint32_t s_render_fps_x10;
+static uint32_t s_ui_us;                              /* LVGL handler 耗时 EMA（µs） */
+static uint32_t s_cost_us;                            /* 整帧工作耗时 EMA（µs，不含睡眠） */
 static TickType_t s_rate_tick;
 
 /* 最近若干帧的帧间隔（ms），用来回答「抖不抖」 */
@@ -343,11 +364,16 @@ static void arcade_start_selected(void)
     s_frame_us = 0;
     s_scale_down_cnt = 0;
     s_scale_up_cnt = 0;
-    /* 跳帧保速的信用与成本估计重新学（不同 ROM 的开销差很多） */
-    s_skip_credit_us = 0;
-    s_render_extra_us = ARCADE_RENDER_EXTRA_INIT;
+    /* 跳帧保速的成本估计 / 渲染比例重新学（不同 ROM 的开销差很多） */
     s_render_cost_us = 18200;
     s_skip_cost_us = 13700;
+    s_render_ratio = ARCADE_RATIO_INIT;
+    s_render_phase = 0;
+    s_render_gap = 0;
+    s_force_renders = 0;
+    s_ever_rendered = false;
+    s_next_start_cyc = arcade_cycles();
+    s_behind_cnt = 0;
     s_last_render = true;
     s_logic_frames = 0;
     s_render_frames = 0;
@@ -596,54 +622,88 @@ static void arcade_rate_tick(bool rendered)
     }
 }
 
-/* 这一帧要不要画？信用不够就跳（保留上一帧画面） */
+/* 渲染帧相对跳过帧的额外开销（µs） */
+static uint32_t arcade_render_extra_us(void)
+{
+    return (s_render_cost_us > s_skip_cost_us)
+               ? (s_render_cost_us - s_skip_cost_us) : 0U;
+}
+
+/*
+ * 这一帧要不要画？
+ *
+ * 相位累加器：每帧攒 s_render_ratio 份（千分数），攒满 1000 就渲染一帧并
+ * 扣掉 1000 —— 长期渲染比例精确等于 s_render_ratio，不漂移。
+ * 再叠两道保底：进入游戏的第一帧必须画（否则开局白板）；连续
+ * ARCADE_RENDER_GAP_MAX 帧没画时无条件画一帧（任何估算bug都不会导致白屏）。
+ */
 static bool arcade_should_render(void)
 {
     if (!s_skip_auto) {
         return true;
     }
 
-    /*
-     * 门槛取 render_extra 的 3/4：睡觉是按整 tick 向下取整的，留 1/4 的余量
-     * 才不会每次睡完都刚好差一点、永远轮不到渲染（实测那会把渲染帧率压到个位数）。
-     */
-    return s_skip_credit_us >= (int32_t)((s_render_extra_us * 3U) / 4U);
+    if (!s_ever_rendered) {
+        return true;
+    }
+
+    s_render_phase += s_render_ratio;
+    if (s_render_phase >= 1000U) {
+        s_render_phase -= 1000U;
+        return true;
+    }
+
+    if (++s_render_gap >= ARCADE_RENDER_GAP_MAX) {
+        s_force_renders++;
+        return true;
+    }
+
+    return false;
 }
 
 /*
- * 信用账：每帧进账一个 GB 帧周期（16.74ms），花掉这一帧的实测耗时。
- * 同时用 EMA 学会「画」与「不画」各自的成本差，作为下一帧的准入门槛。
+ * 成本学习 + 渲染比例自适应。
+ *
+ * 目标：帧起点间隔稳定在 GB 真实帧周期 16.743ms（音频与游戏速度才正常）。
+ * 平均每帧成本 ≈ 跳过成本 + 比例 × 额外开销，所以由实测成本直接解出比例：
+ *
+ *     比例 = (帧预算 - 跳过成本) / (渲染成本 - 跳过成本)
+ *
+ * 再慢速趋近（1/8），避免成本抖动带着渲染帧率一起跳。
+ * 特意**不**用「信用够不够」做判据：那会让成本估偏时渲染帧率直接归零。
  */
 static void arcade_skip_account(uint32_t cost_us, bool rendered)
 {
-    int32_t pace;
-    uint32_t extra;
+    int32_t target;
 
-    if (cost_us < 2000U) {
-        cost_us = 2000U;
-    } else if (cost_us > 100000U) {
-        /* 切页面 / 写卡那种长停帧不参与统计，否则 EMA 会被带飞 */
-        return;
+    /* 只吃「干净」的帧：写卡 / 切页面那种几十毫秒的长停帧会把成本学成天价 */
+    if (cost_us >= 4000U && cost_us <= 30000U) {
+        if (rendered) {
+            s_render_cost_us = (s_render_cost_us * 7U + cost_us) / 8U;
+        } else {
+            s_skip_cost_us = (s_skip_cost_us * 7U + cost_us) / 8U;
+        }
     }
 
-    if (rendered) {
-        s_render_cost_us = (s_render_cost_us * 7U + cost_us) / 8U;
+    if (s_render_cost_us <= s_skip_cost_us + 300U) {
+        target = (int32_t)ARCADE_RATIO_MAX;   /* 画不画几乎一样贵 → 全画 */
     } else {
-        s_skip_cost_us = (s_skip_cost_us * 7U + cost_us) / 8U;
+        target = (int32_t)(((int32_t)ARCADE_GB_FRAME_US - (int32_t)s_skip_cost_us) * 1000)
+                 / (int32_t)(s_render_cost_us - s_skip_cost_us);
     }
 
-    extra = (s_render_cost_us > s_skip_cost_us)
-                ? (s_render_cost_us - s_skip_cost_us) : 0U;
-    s_render_extra_us = (s_render_extra_us * 3U + extra) / 4U;
-
-    /* pace > 0 = 比 59.7Hz 节拍快，可以先花在渲染上；< 0 = 已经落后 */
-    pace = s_skip_credit_us + (int32_t)ARCADE_GB_FRAME_US - (int32_t)cost_us;
-    if (pace > (int32_t)(2U * ARCADE_GB_FRAME_US)) {
-        pace = (int32_t)(2U * ARCADE_GB_FRAME_US);
-    } else if (pace < -(int32_t)ARCADE_GB_FRAME_US) {
-        pace = -(int32_t)ARCADE_GB_FRAME_US;
+    if (target < (int32_t)ARCADE_RATIO_MIN) {
+        target = (int32_t)ARCADE_RATIO_MIN;
+    } else if (target > (int32_t)ARCADE_RATIO_MAX) {
+        target = (int32_t)ARCADE_RATIO_MAX;
     }
-    s_skip_credit_us = pace;
+
+    s_render_ratio = (s_render_ratio * 7U + (uint32_t)target) / 8U;
+    if (s_render_ratio < ARCADE_RATIO_MIN) {
+        s_render_ratio = ARCADE_RATIO_MIN;
+    } else if (s_render_ratio > ARCADE_RATIO_MAX) {
+        s_render_ratio = ARCADE_RATIO_MAX;
+    }
 }
 
 /*
@@ -752,6 +812,7 @@ static void arcade_task(void *arg)
     for (;;) {
         TickType_t start = xTaskGetTickCount();
         uint32_t frame_t0 = arcade_cycles();
+        uint32_t ui_t0 = 0;
         uint32_t idle;
 
         if (s_pending_action != 0xFF) {
@@ -774,6 +835,11 @@ static void arcade_task(void *arg)
                 arcade_stop_game();
             } else {
                 bool render = arcade_should_render();
+
+                if (render) {
+                    s_render_gap = 0;
+                    s_ever_rendered = true;
+                }
 
                 arcade_core_set_input(arcade_input_mask() | kbd);
                 /*
@@ -798,12 +864,21 @@ static void arcade_task(void *arg)
         if (s_mode == ARCADE_MODE_PLAY && !s_frozen &&
             !arcade_ui_player_message_visible()) {
             if ((s_lvgl_skip++ & 7U) == 0) {
+                ui_t0 = arcade_cycles();
                 idle = arcade_ui_handler();
             } else {
                 idle = 0;
+                ui_t0 = 0;
             }
         } else {
+            ui_t0 = arcade_cycles();
             idle = arcade_ui_handler();
+        }
+
+        if (ui_t0 != 0) {
+            uint32_t ui_us = arcade_cyc_to_us((uint32_t)(arcade_cycles() - ui_t0));
+
+            s_ui_us = (s_ui_us * 7U + ui_us) / 8U;
         }
 
         TickType_t spent = xTaskGetTickCount() - start;
@@ -814,6 +889,7 @@ static void arcade_task(void *arg)
          */
         if (s_mode == ARCADE_MODE_PLAY) {
             s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
+            s_cost_us = (s_cost_us * 7U + cost_us) / 8U;
             arcade_skip_account(cost_us, s_last_render);
         }
 
@@ -842,29 +918,39 @@ static void arcade_task(void *arg)
 
         if (s_mode == ARCADE_MODE_PLAY) {
             /*
-             * 跳帧保速的节拍控制：pace 是「领先于 59.7Hz 节拍的微秒数」。
-             * 领先部分先留给渲染（所以阈值至少是 render_extra），剩下的才睡——
-             * 这样既不会把渲染机会睡掉，也不会让逻辑跑快（逻辑快了音高就偏高）。
+             * 节拍控制：按 rdcycle 的**绝对**帧起点间隔锁 16.743ms。
+             *
+             * 用绝对时间而不是「累计信用」：tick 只有 1ms 粒度，睡 16 还是 17ms
+             * 都会让逻辑偏离 59.7fps（偏快 → 音高偏高，偏慢 → 偏低）。绝对节拍下
+             * 睡少的那部分下一帧自动补回来，长期平均正好 16.743ms。
              */
-            int32_t reserve = s_skip_auto ? (int32_t)((s_render_extra_us * 3U) / 4U) : 0;
-            int32_t ahead = s_skip_credit_us - reserve;
+            int32_t remain_us = (int32_t)((int32_t)(s_next_start_cyc - arcade_cycles()) /
+                                          (int32_t)ARCADE_CYC_PER_US);
 
-            if (ahead > 0) {
-                /* 向下取整到 tick：多睡就少一次渲染机会，少睡只是让 IDLE 少跑一会 */
-                uint32_t wait_ms = (uint32_t)ahead / 1000U;
-
-                if (wait_ms > 0) {
-                    vTaskDelay(pdMS_TO_TICKS(wait_ms));
-                    s_skip_credit_us -= (int32_t)(wait_ms * 1000U);
-                }
-                s_overrun_count = 0;
-            } else if (++s_overrun_count >= 8U) {
-                /* 一直超预算时也别把 IDLE 饿死：每 8 帧让一个 tick */
-                s_overrun_count = 0;
-                vTaskDelay(1);
-                s_skip_credit_us -= 1000;
-            } else {
+            if (remain_us >= 1000) {
+                /* 整毫秒睡掉；余数留在绝对节拍里，下一帧继续用 */
+                vTaskDelay(pdMS_TO_TICKS((uint32_t)remain_us / 1000U));
+                s_behind_cnt = 0;
+            } else if (remain_us > 0) {
+                /* 不足 1 tick：睡会多睡掉整 1ms，让出一次就够 */
                 taskYIELD();
+                s_behind_cnt = 0;
+            } else {
+                /* 已经落后：不睡。但连续落后够多时让 IDLE 喘一 tick（防饿死） */
+                if (++s_behind_cnt >= 16U) {
+                    s_behind_cnt = 0;
+                    vTaskDelay(1);
+                } else {
+                    taskYIELD();
+                }
+            }
+            s_overrun_count = 0;
+
+            /* 推进到下一帧的绝对起点；落后超过一整帧才重新对齐（否则会把债还掉） */
+            s_next_start_cyc += (uint32_t)ARCADE_GB_FRAME_US * ARCADE_CYC_PER_US;
+            if ((int32_t)(arcade_cycles() - s_next_start_cyc) >
+                (int32_t)ARCADE_GB_FRAME_US * (int32_t)ARCADE_CYC_PER_US) {
+                s_next_start_cyc = arcade_cycles();
             }
         } else if (cost_us < budget_us) {
             /* 不在玩游戏（列表 / 菜单）：按固定周期填满，不参与跳帧控制 */
@@ -984,15 +1070,27 @@ static int cmd_stat(int argc, char **argv)
                (unsigned)s_skipped_frames,
                s_skip_auto ? "auto" : "off",
                s_skip_mech == ARCADE_RENDER_DUMMY ? "dummy" : "full");
-    shellPrint(shell, "cost: render=%u.%ums skip=%u.%ums extra=%u.%ums credit=%d.%ums\r\n",
+    shellPrint(shell, "cost: render=%u.%ums skip=%u.%ums extra=%u.%ums\r\n",
                (unsigned)(s_render_cost_us / 1000),
                (unsigned)((s_render_cost_us / 100) % 10),
                (unsigned)(s_skip_cost_us / 1000),
                (unsigned)((s_skip_cost_us / 100) % 10),
-               (unsigned)(s_render_extra_us / 1000),
-               (unsigned)((s_render_extra_us / 100) % 10),
-               (int)(s_skip_credit_us / 1000),
-               (int)((s_skip_credit_us / 100) % 10));
+               (unsigned)(arcade_render_extra_us() / 1000),
+               (unsigned)((arcade_render_extra_us() / 100) % 10));
+    shellPrint(shell, "sched: ratio=%u.%u%% gap=%u forced=%u late=%dms\r\n",
+               (unsigned)(s_render_ratio / 10), (unsigned)(s_render_ratio % 10),
+               (unsigned)s_render_gap, (unsigned)s_force_renders,
+               s_mode == ARCADE_MODE_PLAY
+                   ? (int)((int32_t)(arcade_cycles() - s_next_start_cyc) /
+                           (int32_t)(ARCADE_CYC_PER_US * 1000U))
+                   : 0);
+    shellPrint(shell, "breakdown: emu=%u.%ums ui=%u.%ums loop=work=%u.%ums scale=%s msg=%d\r\n",
+               (unsigned)(arcade_gb_emu_us() / 1000),
+               (unsigned)((arcade_gb_emu_us() / 100) % 10),
+               (unsigned)(s_ui_us / 1000), (unsigned)((s_ui_us / 100) % 10),
+               (unsigned)s_cost_us / 1000, (unsigned)(s_cost_us / 100) % 10,
+               arcade_video_scale() == 1 ? "1x" : "1.5x",
+               arcade_ui_player_message_visible() ? 1 : 0);
     return 0;
 }
 
@@ -1950,18 +2048,22 @@ static int cmd_skip(int argc, char **argv)
             return 0;
         }
 
-        s_skip_credit_us = 0;
+        s_render_phase = 0;
+        s_render_gap = 0;
+        s_ever_rendered = false;
+        s_next_start_cyc = arcade_cycles();
     }
 
-    shellPrint(shell, "skip=%s 方式=%s  render≈%u.%ums skip≈%u.%ums extra≈%u.%ums\r\n",
+    shellPrint(shell, "skip=%s 方式=%s  render≈%u.%ums skip≈%u.%ums extra≈%u.%ums ratio=%u.%u%%\r\n",
                s_skip_auto ? "auto" : "off",
                s_skip_mech == ARCADE_RENDER_DUMMY ? "dummy" : "full",
                (unsigned)(s_render_cost_us / 1000),
                (unsigned)((s_render_cost_us / 100) % 10),
                (unsigned)(s_skip_cost_us / 1000),
                (unsigned)((s_skip_cost_us / 100) % 10),
-               (unsigned)(s_render_extra_us / 1000),
-               (unsigned)((s_render_extra_us / 100) % 10));
+               (unsigned)(arcade_render_extra_us() / 1000),
+               (unsigned)((arcade_render_extra_us() / 100) % 10),
+               (unsigned)(s_render_ratio / 10), (unsigned)(s_render_ratio % 10));
     return 0;
 }
 

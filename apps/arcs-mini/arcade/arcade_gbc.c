@@ -809,8 +809,23 @@ void arcade_gb_reset_perf(void)
     s_priv->perf_frames = 0;
 }
 
+/* 平均每帧的模拟器本体耗时（µs）。用来把循环总耗时拆成 emu / 其他两半。 */
+uint32_t arcade_gb_emu_us(void)
+{
+    uint32_t f;
+
+    if (s_priv == NULL || s_priv->perf_frames == 0) {
+        return 0;
+    }
+
+    f = s_priv->perf_frames;
+    return arcade_cyc_to_us(s_priv->perf_emu_cycles / f);
+}
+
 int arcade_gb_peek(char *out, uint32_t out_len, uint32_t addr, uint32_t len)
-{    uint32_t off = 0;
+{
+    uint32_t off = 0;
+
 
     if (s_priv == NULL || s_priv->emu == NULL || out == NULL || out_len < 16) {
         return -1;

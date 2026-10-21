@@ -79,4 +79,7 @@ arcade_render_mode_t arcade_gb_render_mode(void);
 /** 清零帧耗时统计 */
 void arcade_gb_reset_perf(void);
 
+/** 平均每帧的模拟器本体耗时（µs） */
+uint32_t arcade_gb_emu_us(void);
+
 #endif /* __ARCADE_GB_H__ */
