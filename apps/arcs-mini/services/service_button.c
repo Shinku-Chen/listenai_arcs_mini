@@ -43,6 +43,10 @@ static void miniapp_hold_timeout(TimerHandle_t timer)
 }
 #endif
 
+/* 需要原始事件（按下/松开）的界面：街机小游戏的「按住蓄力」就是靠它 */
+static service_button_raw_cb_t s_raw_cb;
+static void *s_raw_user;
+
 /* ---- 内部工具函数 ------------------------------------------------------- */
 
 /* 电源键只向应用发布最终点击次数和长按关机事件。 */
@@ -113,6 +117,19 @@ static voice_msg_button_action_t map_lisa_btn_event(lisa_btn_event_t lisa_event)
  */
 static void publish_button_event(uint8_t btn_id, lisa_btn_event_t action, bool from_gpio)
 {
+    /*
+     * 原始事件先转给订阅者：电源键默认只上报最终点击次数，而「按住蓄力」
+     * 必须在按下那一帧就知道，等 300ms 的多击窗口根本没法玩。
+     * 这里传的是已经映射好的 voice_msg 动作，订阅方不需要包含 lisa_btn.h。
+     */
+    if (from_gpio && s_raw_cb != NULL) {
+        voice_msg_button_action_t raw_action = map_lisa_btn_event(action);
+
+        if (raw_action != VOICE_MSG_BUTTON_ACTION_UNKNOWN) {
+            s_raw_cb(btn_id, (uint8_t)raw_action, s_raw_user);
+        }
+    }
+
 #ifndef CONFIG_MINIAPP
     (void)from_gpio;
 #endif
@@ -222,6 +239,12 @@ void app_usb_hid_mouse_left_click_from_isr(void)
 }
 
 /* ---- 公开 API ----------------------------------------------------------- */
+
+void service_button_set_raw_callback(service_button_raw_cb_t cb, void *user)
+{
+    s_raw_user = user;
+    s_raw_cb = cb;
+}
 
 int service_button_init(void)
 {
