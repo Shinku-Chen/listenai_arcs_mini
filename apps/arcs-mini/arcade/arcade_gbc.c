@@ -82,6 +82,11 @@ struct arcade_gbc_priv {
     /* 帧耗时拆分（cycle 累计）：emu=模拟器本体，blit=帧缓冲放大 */
     uint64_t perf_emu_cycles;
     uint32_t perf_frames;
+    /* 再按「渲染帧 / 跳过帧」拆一份：像素渲染的成本只能这样量出来 */
+    uint64_t perf_emu_cycles_render;
+    uint64_t perf_emu_cycles_skip;
+    uint32_t perf_render_frames;
+    uint32_t perf_skip_frames;
 };
 
 static struct arcade_gbc_priv *s_priv;
@@ -534,6 +539,13 @@ static void stats_sample(struct arcade_gbc_priv *p)
 }
 
 static arcade_render_mode_t s_render_mode = ARCADE_RENDER_FULL;
+/* 调试：渲染但**不**送屏（隔离「画像素」与「缩放+送屏」两段成本） */
+static bool s_present_disabled;
+
+void arcade_gb_set_present_enabled(bool on)
+{
+    s_present_disabled = !on;
+}
 
 static void apply_render_mode(Emulator *emu, arcade_render_mode_t mode);
 
@@ -610,9 +622,17 @@ void arcade_gb_run_frame(void)
     /* 缩放 + 送屏交给 video 模块的三级流水，这里只记模拟器本体耗时。
      * 屏上有 LVGL 提示文字时不缩放也不送帧，否则会把提示盖掉。
      * 跳帧时 fb 本来就是 NULL，end_frame(false) 会把 slot 直接还回去。 */
-    arcade_video_end_frame(fb != NULL && !arcade_ui_player_message_visible());
+    arcade_video_end_frame(!s_present_disabled && fb != NULL &&
+                           !arcade_ui_player_message_visible());
     p->perf_emu_cycles += (uint32_t)(t1 - t0);
     p->perf_frames++;
+    if (render) {
+        p->perf_emu_cycles_render += (uint32_t)(t1 - t0);
+        p->perf_render_frames++;
+    } else {
+        p->perf_emu_cycles_skip += (uint32_t)(t1 - t0);
+        p->perf_skip_frames++;
+    }
 
     stats_sample(p);
 
@@ -807,6 +827,27 @@ void arcade_gb_reset_perf(void)
 
     s_priv->perf_emu_cycles = 0;
     s_priv->perf_frames = 0;
+    s_priv->perf_emu_cycles_render = 0;
+    s_priv->perf_emu_cycles_skip = 0;
+    s_priv->perf_render_frames = 0;
+    s_priv->perf_skip_frames = 0;
+}
+
+/* 模拟器本体耗时：渲染帧 / 跳过帧 分开报（µs） */
+void arcade_gb_emu_split(uint32_t *render_us, uint32_t *skip_us)
+{
+    if (render_us != NULL) {
+        *render_us = (s_priv != NULL && s_priv->perf_render_frames != 0)
+                         ? arcade_cyc_to_us(s_priv->perf_emu_cycles_render /
+                                            s_priv->perf_render_frames)
+                         : 0U;
+    }
+    if (skip_us != NULL) {
+        *skip_us = (s_priv != NULL && s_priv->perf_skip_frames != 0)
+                       ? arcade_cyc_to_us(s_priv->perf_emu_cycles_skip /
+                                          s_priv->perf_skip_frames)
+                       : 0U;
+    }
 }
 
 /* 平均每帧的模拟器本体耗时（µs）。用来把循环总耗时拆成 emu / 其他两半。 */

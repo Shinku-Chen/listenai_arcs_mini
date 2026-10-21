@@ -1084,13 +1084,22 @@ static int cmd_stat(int argc, char **argv)
                    ? (int)((int32_t)(arcade_cycles() - s_next_start_cyc) /
                            (int32_t)(ARCADE_CYC_PER_US * 1000U))
                    : 0);
-    shellPrint(shell, "breakdown: emu=%u.%ums ui=%u.%ums loop=work=%u.%ums scale=%s msg=%d\r\n",
+    shellPrint(shell, "breakdown: emu=%u.%ums ui=%u.%ums loop=%u.%ums scale=%s msg=%d\r\n",
                (unsigned)(arcade_gb_emu_us() / 1000),
                (unsigned)((arcade_gb_emu_us() / 100) % 10),
                (unsigned)(s_ui_us / 1000), (unsigned)((s_ui_us / 100) % 10),
-               (unsigned)s_cost_us / 1000, (unsigned)(s_cost_us / 100) % 10,
+               (unsigned)(s_cost_us / 1000), (unsigned)((s_cost_us / 100) % 10),
                arcade_video_scale() == 1 ? "1x" : "1.5x",
                arcade_ui_player_message_visible() ? 1 : 0);
+    {
+        uint32_t emu_r = 0;
+        uint32_t emu_s = 0;
+
+        arcade_gb_emu_split(&emu_r, &emu_s);
+        shellPrint(shell, "emu: render=%u.%ums skip=%u.%ums\r\n",
+                   (unsigned)(emu_r / 1000), (unsigned)((emu_r / 100) % 10),
+                   (unsigned)(emu_s / 1000), (unsigned)((emu_s / 100) % 10));
+    }
     return 0;
 }
 
@@ -2020,6 +2029,31 @@ static int cmd_bg(int argc, char **argv)
 }
 
 /*
+ * arcade presents <0|1>：渲染但关掉送屏 / 打开送屏。
+ *
+ * 用来把「PPU 画像素」与「缩放 + SPI 送屏」两段成本拆开：
+ *   presents 1（默认）→ 一个渲染帧的完整成本
+ *   presents 0        → 画像素但不送屏的成本
+ * 两者之差就是送屏（含 blit 任务抢占给模拟器带来的损失）。
+ */
+static int cmd_presents(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+
+    if (argc < 1) {
+        shellPrint(shell, "用法: arcade presents <0|1>\r\n");
+        return 0;
+    }
+
+    arcade_gb_set_present_enabled(atoi(argv[0]) != 0);
+    shellPrint(shell, "present %s（跳帧的成本估计会重新学）\r\n",
+               atoi(argv[0]) != 0 ? "on" : "off");
+    arcade_video_reset_perf();
+    arcade_gb_reset_perf();
+    return 0;
+}
+
+/*
  * arcade skip <0|auto|full|dummy>：跳帧保速（逻辑/音频恒 59.7Hz，画面按需少画）。
  *
  *   0     关闭：每帧都渲染（帧率会被 PPU 拖到 ~55fps，音频跟着变慢）
@@ -2253,6 +2287,7 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"apu", cmd_apu, "开关模拟器 APU：apu <0|1>（量声音耗时）"},
     {"bg", cmd_bg, "开关 PPU 像素渲染：bg <0|1>（= skip 快捷方式，量画像素耗时）"},
     {"skip", cmd_skip, "跳帧保速：skip <0|auto|full|dummy>（逻辑/音频恒 59.7Hz）"},
+    {"presents", cmd_presents, "渲染但关/开送屏：presents <0|1>（拆分画像素 vs 送屏成本）"},
     {"pwrho1d", cmd_pwrho1d, "把 POWER_EN 锁到高：pwrho1d <0|1>（刷机调试用）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
 };

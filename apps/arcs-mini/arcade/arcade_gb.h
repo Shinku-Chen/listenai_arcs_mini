@@ -82,4 +82,7 @@ void arcade_gb_reset_perf(void);
 /** 平均每帧的模拟器本体耗时（µs） */
 uint32_t arcade_gb_emu_us(void);
 
+/** 调试：渲染但不送屏（隔离画像素 / 送屏两段成本） */
+void arcade_gb_set_present_enabled(bool on);
+
 #endif /* __ARCADE_GB_H__ */
