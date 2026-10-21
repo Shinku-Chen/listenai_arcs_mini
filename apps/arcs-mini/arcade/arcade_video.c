@@ -10,13 +10,23 @@
  *
  *   模拟器任务：把 160x144 的帧直接渲染进 src[0/1]（binjgb 的 frame_buffer
  *               换成指针，帧与帧交替），渲染完只投递索引，不做缩放
- *   缩放任务  ：src → RGB565 1.5 倍放大 → dst[0/1]（1.9ms/帧）
- *   送屏任务  ：lisa_display_write(dst)（SPI + DMA，阻塞 17.7ms/帧）
+ *   缩放任务  ：src → RGB565 1.5 倍放大 → dst[0..2]（1.7ms/帧）
+ *   送屏任务  ：lisa_display_write(dst)（SPI + DMA，阻塞 ~17.6ms/帧）
  *
  * 关键点：缩放（1.9ms）原来串在模拟器任务里，把 16.5ms 的模拟硬生生拖成
  * 18.4ms 的帧周期。拆成三级之后帧周期由最慢的一级决定（模拟 16.5ms /
  * 送屏 17.7ms），缩放被完全藏进流水线。各级之间用队列传递缓冲索引：
  * 队列空就说明下游还没消化完，上游等一等 —— 天然限流，不会撕裂、不会丢帧。
+ *
+ * 目标缓冲为什么是 3 块而不是 2 块：
+ *   2 块时，「一块在 DMA 上、一块在送屏队列里」就把两块都占住了，缩放任务
+ *   拿不到空块、只能一直攥着源缓冲等，模拟器随后在 begin_frame() 里被拖住。
+ *   实测这一等就是 2.9ms/渲染帧，渲染帧率从 33 掉到 17（presents 0 vs 1）。
+ *   3 块则任何时刻都有一块可写，送屏彻底从模拟路径上解耦。
+ *
+ * 模拟器那一侧**永不阻塞**：begin_frame() 用 0 超时取源缓冲，取不到就把
+ * 这一帧画到模拟器内部缓冲里（画面少一帧，逻辑一帧不落）。这是「逻辑/音频
+ * 不被送屏拖慢」的硬保证。
  */
 #include <stdio.h>
 #include <string.h>
@@ -64,11 +74,14 @@ static lv_color_t s_palette[4];
 static bool s_palette_ready;
 
 /* ---- 送屏管线 ---- */
-static lv_color_t *s_buf[2];
+#define PRESENT_BUF_CNT  3
+static lv_color_t *s_buf[PRESENT_BUF_CNT];
+static int s_buf_cnt;                       /* 实际分到的目标缓冲块数：2/3 */
 static uint32_t s_buf_bytes;
 
 /* ---- 源帧（模拟器渲染目标）双缓冲 ---- */
-static arcade_fbpixel_t *s_src[2];
+#define SRC_BUF_CNT  2
+static arcade_fbpixel_t *s_src[SRC_BUF_CNT];
 static int s_src_slots;                     /* 实际分到的块数：0/1/2 */
 static QueueHandle_t s_src_free_q;          /* 可以拿来渲染的源缓冲索引 */
 static QueueHandle_t s_src_q;               /* 待缩放的源缓冲索引 */
@@ -183,14 +196,18 @@ static bool present_start(void)
     }
 
     if (s_free_q == NULL) {
-        s_free_q = xQueueCreate(2, sizeof(int));
-        s_tx_q = xQueueCreate(2, sizeof(int));
+        if (s_buf_cnt <= 0) {
+            return false;
+        }
+
+        s_free_q = xQueueCreate((UBaseType_t)s_buf_cnt, sizeof(int));
+        s_tx_q = xQueueCreate((UBaseType_t)s_buf_cnt, sizeof(int));
         if (s_free_q == NULL || s_tx_q == NULL) {
             LISA_LOGE(TAG, "present queue create failed");
             return false;
         }
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < s_buf_cnt; i++) {
             xQueueSend(s_free_q, &i, 0);
         }
     }
@@ -238,25 +255,30 @@ int arcade_video_init(void)
 
     if (s_buf[0] == NULL) {
         size_t free_bytes = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        int want = PRESENT_BUF_CNT;
 
-        /* 两块 240x216 RGB565 ≈ 202KB；余量不够就只开一块（无并行送屏） */
-        if (free_bytes < need * 2 + 128 * 1024) {
+        /* 三块 240x216 RGB565 ≈ 304KB；PSRAM 紧就退回 2 块（渲染帧率会掉） */
+        while (want > 2 && free_bytes < need * (size_t)want + 128U * 1024U) {
+            want--;
+        }
+        if (free_bytes < need * (size_t)want + 96U * 1024U) {
             LISA_LOGE(TAG, "not enough psram for frame buffers (%u KB free)",
                       (unsigned)(free_bytes / 1024));
             return -1;
         }
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < want; i++) {
             s_buf[i] = (lv_color_t *)exram_malloc(4, need);
             if (s_buf[i] == NULL) {
                 LISA_LOGE(TAG, "framebuffer alloc failed (%u bytes)", (unsigned)need);
-                if (i == 1) {
-                    exram_free(s_buf[0]);
-                    s_buf[0] = NULL;
+                for (int j = 0; j < i; j++) {
+                    exram_free(s_buf[j]);
+                    s_buf[j] = NULL;
                 }
                 return -1;
             }
         }
+        s_buf_cnt = want;
         s_buf_bytes = (uint32_t)need;
     }
 
@@ -266,7 +288,7 @@ int arcade_video_init(void)
         size_t src_need = (size_t)SRC_WIDTH * SRC_HEIGHT * sizeof(arcade_fbpixel_t);
         int got = 0;
 
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < SRC_BUF_CNT; i++) {
             if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) < src_need + 96 * 1024) {
                 break;
             }
@@ -288,8 +310,8 @@ int arcade_video_init(void)
         s_spi_freq_backup = arcade_video_spi_freq();
     }
 
-    LISA_LOGI(TAG, "framebuffer %dx%d x2 at %p/%p", ARCADE_FB_WIDTH, ARCADE_FB_HEIGHT,
-              (void *)s_buf[0], (void *)s_buf[1]);
+    LISA_LOGI(TAG, "framebuffer %dx%d x%d at %p", ARCADE_FB_WIDTH, ARCADE_FB_HEIGHT,
+              s_buf_cnt, (void *)s_buf[0]);
 
     return 0;
 }
@@ -297,11 +319,13 @@ int arcade_video_init(void)
 void arcade_video_deinit(void)
 {
     /* 送屏任务不销毁（帧缓冲是静态生命周期），这里只释放缓冲 */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < SRC_BUF_CNT; i++) {
         if (s_src[i] != NULL) {
             exram_free(s_src[i]);
             s_src[i] = NULL;
         }
+    }
+    for (int i = 0; i < PRESENT_BUF_CNT; i++) {
         if (s_buf[i] != NULL) {
             exram_free(s_buf[i]);
             s_buf[i] = NULL;
@@ -337,7 +361,7 @@ void arcade_video_fill(int shade)
         shade = 3;
     }
 
-    for (int b = 0; b < 2; b++) {
+    for (int b = 0; b < PRESENT_BUF_CNT; b++) {
         if (s_buf[b] == NULL) {
             continue;
         }
@@ -537,9 +561,9 @@ static void blit_task(void *arg)
         }
 
         t0 = arcade_cycles();
-        if (xQueueReceive(s_free_q, &dst_idx, pdMS_TO_TICKS(200)) != pdTRUE) {
-            /* 两块目标缓冲都还在 SPI 上：这一帧丢掉，但源缓冲必须还回去，
-             * 否则模拟器任务会卡死在这一帧 */
+        if (xQueueReceive(s_free_q, &dst_idx, pdMS_TO_TICKS(100)) != pdTRUE) {
+            /* 所有目标缓冲都还在 SPI 上：这一帧丢掉，但源缓冲必须还回去，
+             * 否则模拟器任务会少一块可渲染的源缓冲 */
             s_perf_wait += (uint32_t)(arcade_cycles() - t0);
             xQueueSend(s_src_free_q, &src_idx, 0);
             continue;
@@ -549,11 +573,17 @@ static void blit_task(void *arg)
 
         blit_frame((uint16_t *)s_buf[dst_idx], s_src[src_idx]);
 
-        s_last = s_buf[dst_idx];
         s_perf_blit += (uint32_t)(arcade_cycles() - t1);
         s_perf_blit_frames++;
 
-        xQueueSend(s_tx_q, &dst_idx, 0);
+        if (xQueueSend(s_tx_q, &dst_idx, 0) != pdTRUE) {
+            /* 送屏队列满（不该发生，块数 ≥ 队列深度）：丢这一帧但绝不丢缓冲，
+             * 丢缓冲会让流水线永久少一块，几分钟后彻底停住 */
+            xQueueSend(s_free_q, &dst_idx, 0);
+        } else {
+            s_last = s_buf[dst_idx];
+        }
+
         xQueueSend(s_src_free_q, &src_idx, 0);
     }
 }
@@ -566,9 +596,9 @@ arcade_fbpixel_t *arcade_video_begin_frame(void)
         return NULL;
     }
 
-    if (xQueueReceive(s_src_free_q, &idx, pdMS_TO_TICKS(200)) != pdTRUE) {
-        /* 缩放任务还没把上一帧的源缓冲交回来（缩放真的跑不动了），
-         * 这一帧不缩放也不送屏，但模拟本身继续跑，不拖慢游戏 */
+    /* 0 超时：模拟器绝不等送屏流水线。取不到就把这一帧画到模拟器内部缓冲
+     * （画面少一帧），逻辑/音频一帧不落 —— 这是「速度优先」的硬保证。 */
+    if (xQueueReceive(s_src_free_q, &idx, 0) != pdTRUE) {
         return NULL;
     }
 
@@ -611,14 +641,14 @@ void arcade_video_present_now(void)
 
 void arcade_video_present_drain(void)
 {
-    int got[2];
+    int got[PRESENT_BUF_CNT];
     int n = 0;
 
     if (s_free_q == NULL || s_task == NULL) {
         return;
     }
 
-    while (n < 2 &&
+    while (n < s_buf_cnt &&
            xQueueReceive(s_free_q, &got[n], pdMS_TO_TICKS(500)) == pdTRUE) {
         n++;
     }

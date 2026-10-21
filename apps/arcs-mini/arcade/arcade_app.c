@@ -127,11 +127,31 @@ static bool s_period_auto = true;
 #define SCALE_DOWN_FRAMES   60U
 #define SCALE_UP_FRAMES     300U
 
+/*
+ * 渲染帧率下限（跳帧保速模式下生效）。
+ *
+ * 用户口径：速度优先（逻辑/音频必须 59.7fps），但画面能大就大、不能砦。
+ * 所以策略是分层的：
+ *   1) 先试 1.5x（大画面）；render 连续 2 秒 < 25fps → 降到 1x
+ *      （1x 送屏字节减半、缩放几乎不花时间，渲染帧率自然抬高）
+ *   2) 1x 还不到 25fps → 抬高渲染比例下限（每 秒 +3%，最高 45%），
+ *      但只有在逻辑仍 ≥ 59fps 时才抬
+ *   3) 1x 下 render 连续 5 秒 > 32fps → 试回 1.5x（带迟滞，不来回抖）
+ */
+#define RENDER_FLOOR_FPS    25U
+#define RENDER_CEIL_FPS     32U
+#define RENDER_FLOOR_STEP   30U      /* 比例下限每次调整的步长（千分数） */
+#define RENDER_FLOOR_MAX    450U     /* 比例下限上限（≈27fps） */
+
 static bool s_scale_auto = true;
 static uint32_t s_frame_us;          /* 帧周期 EMA（µs） */
 static uint32_t s_scale_down_cnt;
 static uint32_t s_scale_up_cnt;
 static uint32_t s_last_frame_cyc;
+/* 渲染下限控制器（1 秒一次采样） */
+static uint32_t s_floor_tick_cyc;    /* 上次采样的 rdcycle */
+static uint32_t s_floor_low_cnt;     /* 连续低于下限的秒数 */
+static uint32_t s_floor_high_cnt;    /* 连续高于上限的秒数 */
 /* PLAY 模式下把 LVGL 定时器降频后，用来数帧 */
 static uint32_t s_lvgl_skip;
 
@@ -172,6 +192,7 @@ static arcade_render_mode_t s_skip_mech = ARCADE_RENDER_SKIP;  /* 跳过的实�
 static uint32_t s_render_cost_us = 18200;             /* 渲染帧耗时 EMA */
 static uint32_t s_skip_cost_us = 13700;               /* 跳过帧耗时 EMA */
 static uint32_t s_render_ratio = ARCADE_RATIO_INIT;   /* 目标渲染比例（千分数） */
+static uint32_t s_ratio_floor = ARCADE_RATIO_MIN;     /* 自适应抬高的比例下限 */
 static uint32_t s_render_phase;                       /* 相位累加器（千分数） */
 static uint32_t s_render_gap;                         /* 连续未渲染帧数 */
 static uint32_t s_force_renders;                      /* 保底强制渲染次数（诊断用） */
@@ -368,10 +389,14 @@ static void arcade_start_selected(void)
     s_render_cost_us = 18200;
     s_skip_cost_us = 13700;
     s_render_ratio = ARCADE_RATIO_INIT;
+    s_ratio_floor = ARCADE_RATIO_MIN;
     s_render_phase = 0;
     s_render_gap = 0;
     s_force_renders = 0;
     s_ever_rendered = false;
+    s_floor_tick_cyc = 0;
+    s_floor_low_cnt = 0;
+    s_floor_high_cnt = 0;
     s_next_start_cyc = arcade_cycles();
     s_behind_cnt = 0;
     s_last_render = true;
@@ -692,17 +717,105 @@ static void arcade_skip_account(uint32_t cost_us, bool rendered)
                  / (int32_t)(s_render_cost_us - s_skip_cost_us);
     }
 
-    if (target < (int32_t)ARCADE_RATIO_MIN) {
-        target = (int32_t)ARCADE_RATIO_MIN;
+    if (target < (int32_t)s_ratio_floor) {
+        target = (int32_t)s_ratio_floor;
     } else if (target > (int32_t)ARCADE_RATIO_MAX) {
         target = (int32_t)ARCADE_RATIO_MAX;
     }
 
     s_render_ratio = (s_render_ratio * 7U + (uint32_t)target) / 8U;
-    if (s_render_ratio < ARCADE_RATIO_MIN) {
-        s_render_ratio = ARCADE_RATIO_MIN;
+    if (s_render_ratio < s_ratio_floor) {
+        s_render_ratio = s_ratio_floor;
     } else if (s_render_ratio > ARCADE_RATIO_MAX) {
         s_render_ratio = ARCADE_RATIO_MAX;
+    }
+}
+
+/*
+ * 渲染帧率下限 / 上限控制器（跳帧保速模式下每秒跑一次）。
+ *
+ * 判定只用「每秒采样」的真实 render/logic fps，不用 EMA，避免慢热。
+ * 必须在 arcade 任务里调（arcade_video_set_scale 会排空送屏流水线）。
+ */
+static void arcade_render_floor_tick(void)
+{
+    uint32_t now = arcade_cycles();
+    uint32_t render_x10;
+    uint32_t logic_x10;
+
+    if (s_floor_tick_cyc == 0) {
+        s_floor_tick_cyc = now;
+        return;
+    }
+    if (arcade_cyc_to_us((uint32_t)(now - s_floor_tick_cyc)) < 1000000U) {
+        return;
+    }
+    s_floor_tick_cyc = now;
+
+    render_x10 = s_render_fps_x10;
+    logic_x10 = s_logic_fps_x10;
+    /* 刚开局采样还没出来：不动 */
+    if (render_x10 == 0 || logic_x10 == 0) {
+        return;
+    }
+
+    if (render_x10 < RENDER_FLOOR_FPS * 10U) {
+        s_floor_high_cnt = 0;
+
+        if (arcade_video_scale() != 1) {
+            /* 第一层：先降分辨率（送屏字节减半） */
+            if (++s_floor_low_cnt >= 2U) {
+                s_floor_low_cnt = 0;
+                s_ratio_floor = ARCADE_RATIO_MIN;
+                arcade_video_set_scale(1);
+                LISA_LOGW(TAG, "render %u.%ufps < %ufps floor -> 1x",
+                          (unsigned)(render_x10 / 10U), (unsigned)(render_x10 % 10U),
+                          (unsigned)RENDER_FLOOR_FPS);
+            }
+            return;
+        }
+
+        /* 第二层：已经是 1x，抬高渲染比例下限（逻辑仍达标才抬） */
+        s_floor_low_cnt = 0;
+        if (logic_x10 >= 590U && s_ratio_floor + RENDER_FLOOR_STEP <= RENDER_FLOOR_MAX) {
+            uint32_t before = s_ratio_floor;
+
+            s_ratio_floor += RENDER_FLOOR_STEP;
+            if (s_ratio_floor > s_render_ratio) {
+                s_render_ratio = s_ratio_floor;
+            }
+            LISA_LOGW(TAG, "render %u.%ufps at 1x -> ratio floor %u%% -> %u%%",
+                      (unsigned)(render_x10 / 10U), (unsigned)(render_x10 % 10U),
+                      (unsigned)(before / 10U), (unsigned)(s_ratio_floor / 10U));
+        }
+        return;
+    }
+
+    s_floor_low_cnt = 0;
+
+    /* 逻辑被抬高后的下限拖慢了：把下限退回去（速度永远优先于画面） */
+    if (logic_x10 < 590U && s_ratio_floor > ARCADE_RATIO_MIN) {
+        s_ratio_floor = (s_ratio_floor > ARCADE_RATIO_MIN + RENDER_FLOOR_STEP)
+                            ? (s_ratio_floor - RENDER_FLOOR_STEP)
+                            : ARCADE_RATIO_MIN;
+        return;
+    }
+
+    /* 1x 下画面已经富余：试回 1.5x（连续 5 秒才切，带迟滞） */
+    if (arcade_video_scale() == 1) {
+        if (render_x10 > RENDER_CEIL_FPS * 10U) {
+            if (++s_floor_high_cnt >= 5U) {
+                s_floor_high_cnt = 0;
+                s_ratio_floor = ARCADE_RATIO_MIN;
+                arcade_video_set_scale(2);
+                LISA_LOGI(TAG, "render %u.%ufps 富余 -> 试回 1.5x",
+                          (unsigned)(render_x10 / 10U), (unsigned)(render_x10 % 10U));
+            }
+        } else {
+            s_floor_high_cnt = 0;
+        }
+    } else {
+        s_floor_high_cnt = 0;
     }
 }
 
@@ -735,14 +848,11 @@ static void arcade_auto_scale_tick(void)
     }
 
     /*
-     * 跳帧保速下，渲染帧率已经被解耦出来 ——— 降分辨率换不来速度，只会变小画面，
-     * 所以直接钉 1.5x（用户口径：速度优先，但画面能大就大）。
+     * 跳帧保速下，帧周期已经被节拍锁死在 16.74ms，不能再用它判断画面好不好。
+     * 改用渲染帧率判：达不到下限就降分辨率，富余了再升回去。
      */
     if (s_skip_auto) {
-        if (arcade_video_scale() == 1) {
-            s_scale_up_cnt = 0;
-            arcade_video_set_scale(2);
-        }
+        arcade_render_floor_tick();
         return;
     }
 
@@ -1077,8 +1187,9 @@ static int cmd_stat(int argc, char **argv)
                (unsigned)((s_skip_cost_us / 100) % 10),
                (unsigned)(arcade_render_extra_us() / 1000),
                (unsigned)((arcade_render_extra_us() / 100) % 10));
-    shellPrint(shell, "sched: ratio=%u.%u%% gap=%u forced=%u late=%dms\r\n",
+    shellPrint(shell, "sched: ratio=%u.%u%% floor=%u.%u%% gap=%u forced=%u late=%dms\r\n",
                (unsigned)(s_render_ratio / 10), (unsigned)(s_render_ratio % 10),
+               (unsigned)(s_ratio_floor / 10), (unsigned)(s_ratio_floor % 10),
                (unsigned)s_render_gap, (unsigned)s_force_renders,
                s_mode == ARCADE_MODE_PLAY
                    ? (int)((int32_t)(arcade_cycles() - s_next_start_cyc) /
@@ -1877,7 +1988,13 @@ static int cmd_scale(int argc, char **argv)
             s_frame_us = 0;
             s_scale_down_cnt = 0;
             s_scale_up_cnt = 0;
-            shellPrint(shell, "缩放: 自动（优先 1.5x，帧率不够就掉 1x）\r\n");
+            /* 交还自动：下限控制器从干净状态重新学 */
+            s_floor_tick_cyc = 0;
+            s_floor_low_cnt = 0;
+            s_floor_high_cnt = 0;
+            s_ratio_floor = ARCADE_RATIO_MIN;
+            shellPrint(shell, "缩放: 自动（优先 1.5x，render 不足 %ufps 就掉 1x）\r\n",
+                       (unsigned)RENDER_FLOOR_FPS);
             return 0;
         }
 
