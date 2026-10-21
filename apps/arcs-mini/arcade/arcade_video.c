@@ -50,6 +50,12 @@
 #define SRC_WIDTH   160
 #define SRC_HEIGHT  144
 
+/* 面板是 240x240；模拟器只用到 240x216（源画面比例限制），内置小游戏用满 */
+#define FULL_WIDTH   240
+#define FULL_HEIGHT  240
+/* 目标缓冲按「最大可能」分配：全屏直写要 240x240，缩放最多 240x216 */
+#define DST_BUF_BYTES ((size_t)FULL_WIDTH * FULL_HEIGHT * sizeof(uint16_t))
+
 /* 送屏任务优先级：高于模拟器任务（4），低于音频任务（6） */
 #define PRESENT_TASK_PRIO    5
 #define PRESENT_TASK_STACK   3072
@@ -87,6 +93,9 @@ static QueueHandle_t s_src_free_q;          /* 可以拿来渲染的源缓冲索
 static QueueHandle_t s_src_q;               /* 待缩放的源缓冲索引 */
 static int s_src_cur = -1;                  /* 本帧正在渲染的源索引，-1 = 没取到 */
 static int s_scale = SCALE_1_5X;
+/* 全屏直写模式（arcade_video_use_fullscreen）：几何 240x240、不走缩放任务 */
+static bool s_full;
+static int s_full_idx = -1;
 static int s_stride = ARCADE_FB_WIDTH;      /* 一行多少像素（u16） */
 static int s_fb_w = ARCADE_FB_WIDTH;
 static int s_fb_h = ARCADE_FB_HEIGHT;
@@ -131,6 +140,15 @@ static void palette_prepare(void)
 /* 缩放比例变化时重算几何：缓冲首地址不变，只是行宽和送屏矩形不同 */
 static void geometry_update(void)
 {
+    if (s_full) {
+        s_stride = FULL_WIDTH;
+        s_fb_w = FULL_WIDTH;
+        s_fb_h = FULL_HEIGHT;
+        s_rect_x = 0;
+        s_rect_y = 0;
+        return;
+    }
+
     if (s_scale == SCALE_1X) {
         s_stride = SRC_WIDTH;
         s_fb_w = SRC_WIDTH;
@@ -248,7 +266,7 @@ static bool present_start(void)
 
 int arcade_video_init(void)
 {
-    size_t need = (size_t)ARCADE_FB_WIDTH * ARCADE_FB_HEIGHT * sizeof(lv_color_t);
+    size_t need = DST_BUF_BYTES;
 
     palette_prepare();
     geometry_update();
@@ -332,6 +350,8 @@ void arcade_video_deinit(void)
         }
     }
     s_src_slots = 0;
+    s_full = false;
+    s_full_idx = -1;
     s_last = NULL;
 }
 
@@ -623,8 +643,78 @@ void arcade_video_end_frame(bool present)
     }
 }
 
-void arcade_video_present_now(void)
+/* ---------------- 全屏直写（内置小游戏） ---------------- */
+
+void arcade_video_use_fullscreen(bool on)
 {
+    if (s_full == on) {
+        return;
+    }
+
+    /* 几何是送屏任务共用的，必须等流水线清空再改，否则在途那一帧会按旧
+     * 几何（240x216 居中）送出去，屏上留一块没被盖住的横条。 */
+    if (s_task != NULL) {
+        arcade_video_present_drain();
+    }
+
+    s_full = on;
+    s_full_idx = -1;
+    geometry_update();
+
+    LISA_LOGI(TAG, "fullscreen %s (%dx%d)", on ? "on" : "off", s_fb_w, s_fb_h);
+}
+
+uint16_t *arcade_video_acquire_full(void)
+{
+    int idx;
+
+    if (!s_full || s_buf[0] == NULL || !present_start()) {
+        return NULL;
+    }
+
+    /* 上一帧还没提交（调用方没调 submit_full），不能又拿一块 */
+    if (s_full_idx >= 0) {
+        return NULL;
+    }
+
+    /* 0 超时：三块缓冲都在送屏时这一帧就不画了，绝不阻塞游戏循环 */
+    if (xQueueReceive(s_free_q, &idx, 0) != pdTRUE) {
+        return NULL;
+    }
+
+    s_full_idx = idx;
+    return (uint16_t *)s_buf[idx];
+}
+
+void arcade_video_submit_full(void)
+{
+    int idx = s_full_idx;
+
+    if (idx < 0) {
+        return;
+    }
+
+    s_full_idx = -1;
+    s_perf_frames++;
+    s_last = s_buf[idx];
+
+    if (xQueueSend(s_tx_q, &idx, 0) != pdTRUE) {
+        /* 送屏队列满：丢这一帧但绝不丢缓冲 */
+        xQueueSend(s_free_q, &idx, 0);
+    }
+}
+
+int arcade_video_full_width(void)
+{
+    return FULL_WIDTH;
+}
+
+int arcade_video_full_height(void)
+{
+    return FULL_HEIGHT;
+}
+
+void arcade_video_present_now(void){
     int idx;
 
     if (s_buf[0] == NULL || !present_start()) {

@@ -4,6 +4,7 @@ listenai_library_sources(
     arcade_app.c
     arcade_audio.c
     arcade_core.c
+    arcade_dino.c
     arcade_input.c
     arcade_rom.c
     arcade_save.c

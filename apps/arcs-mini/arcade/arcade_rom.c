@@ -37,6 +37,15 @@
 /* 内置演示 ROM 的虚拟路径，arcade_gb.c 看到它就改用内嵌数据 */
 #define ROM_DEMO_PATH  "@demo"
 
+/*
+ * 列表最前面固定放一个「内置小游戏」：它是固件原生代码（arcade_dino.c），
+ * 不读卡、不占 ROM 名额，所以即使没插 TF 卡、甚至一张 ROM 都没有，
+ * 列表也不会是空的。
+ */
+#define ROM_BUILTIN_COUNT     1
+#define ROM_BUILTIN_DINO_PATH "@dino"
+#define ROM_BUILTIN_DINO_NAME "小恐龙（内置）"
+
 struct arcade_rom_entry {
     char name[ROM_NAME_LEN];
     char path[ROM_PATH_LEN];
@@ -171,18 +180,18 @@ static void rom_add_demo_if_empty(void)
 int arcade_rom_scan(void)
 {
     if (s_count >= 0) {
-        return s_count;
+        return s_count + ROM_BUILTIN_COUNT;
     }
 
     if (!rom_ensure_table()) {
         s_count = 0;
-        return s_count;
+        return s_count + ROM_BUILTIN_COUNT;
     }
 
     if (!rom_collect()) {
         s_count = 0;
         rom_add_demo_if_empty();
-        return s_count;
+        return s_count + ROM_BUILTIN_COUNT;
     }
 
     rom_add_demo_if_empty();
@@ -193,12 +202,19 @@ int arcade_rom_scan(void)
         LISA_LOGI(TAG, "  [%02d] %s (%u bytes)", i, s_roms[i].path, (unsigned)s_roms[i].size);
     }
 
-    return s_count;
+    return s_count + ROM_BUILTIN_COUNT;
 }
 
 int arcade_rom_count(void)
 {
-    return s_count > 0 ? s_count : 0;
+    int n = s_count > 0 ? s_count : 0;
+
+    return n + ROM_BUILTIN_COUNT;
+}
+
+bool arcade_rom_is_builtin(int index)
+{
+    return index >= 0 && index < ROM_BUILTIN_COUNT;
 }
 
 const char *arcade_rom_name(int index)
@@ -207,7 +223,11 @@ const char *arcade_rom_name(int index)
         return NULL;
     }
 
-    return s_roms[index].name;
+    if (arcade_rom_is_builtin(index)) {
+        return ROM_BUILTIN_DINO_NAME;
+    }
+
+    return s_roms[index - ROM_BUILTIN_COUNT].name;
 }
 
 const char *arcade_rom_path(int index)
@@ -216,7 +236,11 @@ const char *arcade_rom_path(int index)
         return NULL;
     }
 
-    return s_roms[index].path;
+    if (arcade_rom_is_builtin(index)) {
+        return ROM_BUILTIN_DINO_PATH;
+    }
+
+    return s_roms[index - ROM_BUILTIN_COUNT].path;
 }
 
 uint32_t arcade_rom_size(int index)
@@ -225,7 +249,11 @@ uint32_t arcade_rom_size(int index)
         return 0;
     }
 
-    return s_roms[index].size;
+    if (arcade_rom_is_builtin(index)) {
+        return 0;
+    }
+
+    return s_roms[index - ROM_BUILTIN_COUNT].size;
 }
 
 bool arcade_rom_scanned(void)

@@ -69,6 +69,29 @@ arcade_fbpixel_t *arcade_video_begin_frame(void);
  */
 void arcade_video_end_frame(bool present);
 
+/**
+ * 全屏直写模式（内置小游戏用，如小恐龙）。
+ *
+ * 和模拟器那条路一样复用「目标缓冲 + 送屏队列」这套三块缓冲的流水线，
+ * 区别只是几何：全屏模式下一帧覆盖整个 240x240 面板，也不需要缩放任务
+ * （调用方直接往返回的缓冲里画）。
+ *
+ * 用法：use_fullscreen(true) → 每帧 acquire_full() → 画 → submit_full()。
+ * acquire_full() 返回 NULL 表示三块缓冲都在 SPI/队列上，调用方跳过这一帧的
+ * 绘制即可（面板上还留着上一帧，逻辑照常向前跑）。
+ */
+void arcade_video_use_fullscreen(bool on);
+
+/** 取一块空闲的 240x240 RGB565 缓冲；NULL = 这帧不画 */
+uint16_t *arcade_video_acquire_full(void);
+
+/** 把 acquire_full() 拿到的缓冲交给送屏任务 */
+void arcade_video_submit_full(void);
+
+/** 全屏缓冲的宽高（固定 240x240） */
+int arcade_video_full_width(void);
+int arcade_video_full_height(void);
+
 /** 把当前缓冲内容立即送屏一次（`arcade fb fill` 自检用） */
 void arcade_video_present_now(void);
 

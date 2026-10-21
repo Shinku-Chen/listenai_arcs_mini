@@ -26,6 +26,7 @@
 #include "arcade_app.h"
 #include "arcade_audio.h"
 #include "arcade_core.h"
+#include "arcade_dino.h"
 #include "arcade_gb.h"
 #include "arcade_input.h"
 #include "arcade_rom.h"
@@ -56,6 +57,7 @@
 typedef enum {
     ARCADE_MODE_LIST = 0,
     ARCADE_MODE_PLAY,
+    ARCADE_MODE_DINO,     /* 内置小游戏（原生，不走模拟器） */
 } arcade_mode_t;
 
 typedef enum {
@@ -68,12 +70,16 @@ typedef enum {
     ARCADE_REQ_FB_FILL,
     ARCADE_REQ_FB_RESUME,
     ARCADE_REQ_SPI,
+    ARCADE_REQ_DINO,          /* 进入内置小游戏 */
+    ARCADE_REQ_DINO_RESET,    /* 重开一局 */
 } arcade_req_t;
 
 static arcade_mode_t s_mode = ARCADE_MODE_LIST;
 static int s_sel;
 /* 按键任务写、模拟器任务读，必须 volatile，否则可能被优化成只读一次的循环 */
 static volatile uint8_t s_pending_action = 0xFF;
+/* 内置小游戏：上一帧「跳跃键是否按下」，用来做边沿触发 */
+static bool s_dino_prev_pressed;
 
 static volatile arcade_req_t s_req;
 static volatile int s_req_arg;
@@ -345,6 +351,71 @@ static void arcade_show_list(void)
     arcade_ui_list_refresh(s_sel);
 }
 
+static const char *arcade_mode_name(void)
+{
+    switch (s_mode) {
+    case ARCADE_MODE_PLAY:
+        return "play";
+    case ARCADE_MODE_DINO:
+        return "dino";
+    default:
+        return "list";
+    }
+}
+
+/* 是否在「游戏页」（模拟器 / 内置小游戏）：帧节拍与 LVGL 降频都按这个判 */
+static bool arcade_in_game(void)
+{
+    return s_mode == ARCADE_MODE_PLAY || s_mode == ARCADE_MODE_DINO;
+}
+
+/*
+ * 内置小游戏（小恐龙）。
+ *
+ * 它不走模拟器，也就不需要 ROM / 存档 / 音频链路，只需要显示、节拍和按键：
+ *   - arcade_video 切成全屏直写几何（240x240，无缩放任务）
+ *   - arcade_dino 每帧自己取一块缓冲画完提交
+ * 退出时反过来：先让 dino 停手，再把几何换回模拟器的 240x216，最后清空流水线
+ * 并刷回 LVGL 的列表页。
+ */
+static void arcade_start_dino(void)
+{
+    /* 从模拟器直接切过来时先把模拟器停掉（两者不能同时占着显示流水线） */
+    if (arcade_core_running()) {
+        arcade_audio_set_active(false);
+        arcade_core_stop();
+    }
+
+    arcade_ui_show_player();
+    arcade_ui_player_message(NULL);
+
+    arcade_video_use_fullscreen(true);
+    arcade_dino_enter();
+
+    s_mode = ARCADE_MODE_DINO;
+    s_frames = 0;
+    s_fps_tick = xTaskGetTickCount();
+    s_fps_x10 = 0;
+    s_logic_frames = 0;
+    s_render_frames = 0;
+    s_skipped_frames = 0;
+    s_rate_tick = 0;
+    s_next_start_cyc = arcade_cycles();
+    s_behind_cnt = 0;
+
+    LISA_LOGI(TAG, "dino started");
+}
+
+static void arcade_stop_dino(void)
+{
+    arcade_dino_leave();
+    arcade_video_use_fullscreen(false);
+    arcade_video_present_drain();
+    arcade_show_list();
+
+    LISA_LOGI(TAG, "dino stopped");
+}
+
 static void arcade_start_selected(void)
 {
     const char *path = arcade_rom_path(s_sel);
@@ -352,6 +423,12 @@ static void arcade_start_selected(void)
     if (path == NULL) {
         arcade_ui_show_list();
         arcade_ui_list_set_hint("没有可运行的 ROM");
+        return;
+    }
+
+    /* 列表最前面是固件内置的小游戏，不需要 ROM */
+    if (arcade_rom_is_builtin(s_sel)) {
+        arcade_start_dino();
         return;
     }
 
@@ -411,6 +488,11 @@ static void arcade_start_selected(void)
 
 static void arcade_stop_game(void)
 {
+    if (s_mode == ARCADE_MODE_DINO) {
+        arcade_stop_dino();
+        return;
+    }
+
     arcade_audio_set_active(false);
     arcade_core_stop();
     /* 先把在途的游戏帧送完，否则最后一帧会盖掉 LVGL 刚画好的列表页 */
@@ -442,8 +524,7 @@ static void arcade_handle_action(uint8_t action)
 {
     int count = arcade_rom_count();
 
-    LISA_LOGI(TAG, "action=%d mode=%s", (int)action,
-              s_mode == ARCADE_MODE_LIST ? "list" : "play");
+    LISA_LOGI(TAG, "action=%d mode=%s", (int)action, arcade_mode_name());
 
     if (s_mode == ARCADE_MODE_LIST) {
         switch (action) {
@@ -471,7 +552,25 @@ static void arcade_handle_action(uint8_t action)
         return;
     }
 
-    /* 游戏页 */
+    /* 内置小游戏：单击 = 起跳 / 死亡后重开，长按 = 退出 */
+    if (s_mode == ARCADE_MODE_DINO) {
+        switch (action) {
+        case VOICE_MSG_BUTTON_ACTION_CLICK:
+        case VOICE_MSG_BUTTON_ACTION_DOUBLE_CLICK:
+            /* 通过 arcade_input 转一道，和 shell 注入的按键走同一条路 */
+            arcade_input_tap(ARCADE_KEY_A);
+            break;
+        case VOICE_MSG_BUTTON_ACTION_LONG_HOLD:
+            LISA_LOGI(TAG, "long press, leave dino");
+            arcade_stop_game();
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
+    /* 模拟器游戏页 */
     switch (action) {
     case VOICE_MSG_BUTTON_ACTION_CLICK:
         arcade_input_tap(ARCADE_KEY_A);
@@ -515,6 +614,12 @@ static void arcade_handle_request(void)
     case ARCADE_REQ_EXIT:
         arcade_stop_game();
         break;
+    case ARCADE_REQ_DINO:
+        arcade_start_dino();
+        break;
+    case ARCADE_REQ_DINO_RESET:
+        arcade_dino_reset();
+        break;
     case ARCADE_REQ_RESCAN:
         arcade_rescan();
         break;
@@ -551,10 +656,10 @@ static void arcade_handle_request(void)
 
 /* ------------- 主循环 ------------- */
 
-/* 记一帧的间隔（ms tick）；只统计播放状态的帧 */
+/* 记一帧的间隔（ms tick）；只统计游戏状态的帧 */
 static void frame_stat_push(TickType_t spent)
 {
-    if (s_mode != ARCADE_MODE_PLAY) {
+    if (!arcade_in_game()) {
         return;
     }
 
@@ -963,6 +1068,33 @@ static void arcade_task(void *arg)
                 arcade_rate_tick(render);
                 arcade_auto_scale_tick();
             }
+        } else if (s_mode == ARCADE_MODE_DINO && !s_frozen) {
+            /*
+             * 内置小游戏：也是 60Hz 逻辑 + 可能跳过的渲染，只是渲染由 dino
+             * 自己取缓冲（取不到就跳过这一帧），所以不需要 arcade_should_render()
+             * 那套比例控制。按键走和模拟器同一条路：读 arcade_input 的点位图，
+             * 只在「按下」的边沿触发一次跳跃。
+             */
+            bool kbd_exit = false;
+            uint32_t kbd = arcade_input_take_keyboard(&kbd_exit);
+
+            if (kbd_exit) {
+                LISA_LOGI(TAG, "ESC from keyboard, leave dino");
+                arcade_stop_game();
+            } else {
+                uint32_t mask = arcade_input_mask() | kbd;
+                bool pressed = (mask & (ARCADE_KEY_A | ARCADE_KEY_UP |
+                                        ARCADE_KEY_START)) != 0U;
+
+                if (pressed && !s_dino_prev_pressed) {
+                    arcade_dino_click();
+                }
+                s_dino_prev_pressed = pressed;
+
+                arcade_dino_tick();
+                arcade_frame_tick();
+                arcade_rate_tick(true);
+            }
         }
 
         /*
@@ -971,7 +1103,7 @@ static void arcade_task(void *arg)
          * 判脏区、再调驱动的 flush），所以播放中降到每 8 帧一次；
          * 有暂停/提示文字盖在画面上时照旧每帧跑。
          */
-        if (s_mode == ARCADE_MODE_PLAY && !s_frozen &&
+        if (arcade_in_game() && !s_frozen &&
             !arcade_ui_player_message_visible()) {
             if ((s_lvgl_skip++ & 7U) == 0) {
                 ui_t0 = arcade_cycles();
@@ -1001,6 +1133,10 @@ static void arcade_task(void *arg)
             s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
             s_cost_us = (s_cost_us * 7U + cost_us) / 8U;
             arcade_skip_account(cost_us, s_last_render);
+        } else if (s_mode == ARCADE_MODE_DINO) {
+            /* 小游戏的整帧耗时单独记（arcade perf 能直接看到） */
+            s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
+            s_cost_us = (s_cost_us * 7U + cost_us) / 8U;
         }
 
         frame_stat_push(spent);
@@ -1011,10 +1147,10 @@ static void arcade_task(void *arg)
          * 4.5%），四舍五入到最近的 tick 才能压在 59.7fps 附近。
          */
         uint32_t period = s_period_ms;
-        uint32_t budget_us = (s_mode == ARCADE_MODE_PLAY && s_period_auto)
+        uint32_t budget_us = (arcade_in_game() && s_period_auto)
                                  ? ARCADE_GB_FRAME_US : (period * 1000U);
 
-        if (s_mode != ARCADE_MODE_PLAY) {
+        if (!arcade_in_game()) {
             /* 不在玩游戏时把步长复位 */
             if (s_period_auto) {
                 s_period_ms = CONFIG_ARCADE_FRAME_PERIOD_MS;
@@ -1026,7 +1162,7 @@ static void arcade_task(void *arg)
             }
         }
 
-        if (s_mode == ARCADE_MODE_PLAY) {
+        if (arcade_in_game()) {
             /*
              * 节拍控制：按 rdcycle 的**绝对**帧起点间隔锁 16.743ms。
              *
@@ -1156,7 +1292,7 @@ static int cmd_stat(int argc, char **argv)
     (void)argv;
 
     shellPrint(shell, "mode=%s rom=%s sel=%d count=%d fps=%d.%d input=0x%02X\r\n",
-               s_mode == ARCADE_MODE_LIST ? "list" : "play",
+               arcade_mode_name(),
                arcade_core_running() ? (arcade_rom_name(s_sel) ? arcade_rom_name(s_sel) : "?") : "-",
                s_sel, arcade_rom_count(), (int)(s_fps_x10 / 10), (int)(s_fps_x10 % 10),
                (unsigned)arcade_input_mask());
@@ -1692,7 +1828,7 @@ static int cmd_fb(int argc, char **argv)
 
     shellPrint(shell, "frozen=%d mode=%s\r\n%s\r\n",
                s_frozen ? 1 : 0,
-               s_mode == ARCADE_MODE_LIST ? "list" : "play",
+               arcade_mode_name(),
                s_fb_report);
     return 0;
 }
@@ -1780,21 +1916,17 @@ static int cmd_peek(int argc, char **argv)
  * 还是屏上已经不是游戏画面了。格宽 3px、高 6px 是按终端字符 1:2 的长宽比
  * 挑的，刚好保持 GB 160x144 的比例。
  */
-static int cmd_shot(int argc, char **argv)
+static void arcade_fb_ascii(Shell *shell)
 {
-    Shell *shell = shellGetCurrent();
     lv_color_t *fb = arcade_video_get_fb();
     static const char k_ch[4] = {' ', '.', ':', '#'};
     char line[96];
     int fb_w = arcade_video_fb_width();
     int fb_h = arcade_video_fb_height();
 
-    (void)argc;
-    (void)argv;
-
     if (fb == NULL) {
         shellPrint(shell, "fb=(null)\r\n");
-        return 0;
+        return;
     }
 
     for (int row = 0; row < 36; row++) {
@@ -1833,7 +1965,14 @@ static int cmd_shot(int argc, char **argv)
         line[off] = '\0';
         shellPrint(shell, "%s\r\n", line);
     }
+}
 
+static int cmd_shot(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    arcade_fb_ascii(shellGetCurrent());
     return 0;
 }
 
@@ -1949,7 +2088,7 @@ static int cmd_perf(int argc, char **argv)
     arcade_video_perf(line, sizeof(line));
     shellPrint(shell, "fps=%d.%d mode=%s sysclk=%u MHz scale=%s %s frame≈%u.%ums\r\n",
                (int)(s_fps_x10 / 10), (int)(s_fps_x10 % 10),
-               s_mode == ARCADE_MODE_LIST ? "list" : "play",
+               arcade_mode_name(),
                (unsigned)(SystemCoreClock / 1000000U),
                arcade_video_scale() == 1 ? "1x" : "1.5x",
                s_scale_auto ? "auto" : "manual",
@@ -2375,8 +2514,103 @@ static int cmd_pad(int argc, char **argv)
     return 0;
 }
 
-static const struct listen_cmd_t g_arcade_cmds[] = {
-    {"stat", cmd_stat, "打印模拟器状态与帧率"},
+/*
+ * arcade dino [...]: 内置小游戏「小恐龙」
+ *
+ *   arcade dino              进入游戏（等价于在列表里选第一项）
+ *   arcade dino stat         状态：fps / 分数 / 高度 / 障碍
+ *   arcade dino jump         手动跳一次（等价于按一下键）
+ *   arcade dino reset        重开一局
+ *   arcade dino auto <0|1>   自动跳（无人值守压测）
+ *   arcade dino shot         帧缓冲 ASCII 图（看有没有画面）
+ *   arcade dino exit         退出回列表
+ */
+static int cmd_dino(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    const char *sub = argc >= 1 ? argv[0] : NULL;
+
+    if (sub == NULL) {
+        if (arcade_request(ARCADE_REQ_DINO, 0) != 0) {
+            shellPrint(shell, "请求超时\r\n");
+            return 0;
+        }
+        shellPrint(shell, "小恐龙: 已进入（单击跳跃，长按退出）\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "stat") == 0) {
+        if (!arcade_dino_active()) {
+            shellPrint(shell, "当前没在玩小恐龙（mode=%s）\r\n", arcade_mode_name());
+            return 0;
+        }
+
+        shellPrint(shell, "state=%s score=%u best=%u speed=%dpx/s y=%d air=%d obs=%d\r\n",
+                   arcade_dino_state() == ARCADE_DINO_DEAD ? "dead" : "run",
+                   (unsigned)arcade_dino_score(), (unsigned)arcade_dino_best(),
+                   arcade_dino_speed_px(), arcade_dino_height(),
+                   arcade_dino_airborne() ? 1 : 0, arcade_dino_obstacle_count());
+
+        int n = arcade_dino_obstacle_count();
+        int off = 0;
+        char buf_dino_obs[96];
+
+        buf_dino_obs[0] = '\0';
+        for (int i = 0; i < n && off < 90; i++) {
+            off += snprintf(buf_dino_obs + off, sizeof(buf_dino_obs) - (size_t)off, " %d",
+                            arcade_dino_obstacle_x(i));
+        }
+        shellPrint(shell, "obs_x=%s\r\n", n > 0 ? buf_dino_obs : "(无)");
+
+        shellPrint(shell, "logic=%u.%u render=%u.%u fps frames=%u renders=%u skips=%u\r\n",
+                   (unsigned)(arcade_dino_logic_fps_x10() / 10),
+                   (unsigned)(arcade_dino_logic_fps_x10() % 10),
+                   (unsigned)(arcade_dino_render_fps_x10() / 10),
+                   (unsigned)(arcade_dino_render_fps_x10() % 10),
+                   (unsigned)arcade_dino_frames(), (unsigned)arcade_dino_renders(),
+                   (unsigned)arcade_dino_skips());
+        shellPrint(shell, "auto=%d\r\n", arcade_dino_auto() ? 1 : 0);
+        return 0;
+    }
+
+    if (strcmp(sub, "jump") == 0) {
+        arcade_dino_click();
+        shellPrint(shell, "jump\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "reset") == 0) {
+        (void)arcade_request(ARCADE_REQ_DINO_RESET, 0);
+        shellPrint(shell, "已重开\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "auto") == 0) {
+        if (argc < 2) {
+            shellPrint(shell, "auto=%d\r\n", arcade_dino_auto() ? 1 : 0);
+            return 0;
+        }
+        arcade_dino_set_auto(atoi(argv[1]) != 0);
+        shellPrint(shell, "auto=%d\r\n", arcade_dino_auto() ? 1 : 0);
+        return 0;
+    }
+
+    if (strcmp(sub, "shot") == 0) {
+        arcade_fb_ascii(shell);
+        return 0;
+    }
+
+    if (strcmp(sub, "exit") == 0) {
+        (void)arcade_request(ARCADE_REQ_EXIT, 0);
+        shellPrint(shell, "已返回列表\r\n");
+        return 0;
+    }
+
+    shellPrint(shell, "用法: arcade dino [stat|jump|reset|auto <0|1>|shot|exit]\r\n");
+    return 0;
+}
+
+static const struct listen_cmd_t g_arcade_cmds[] = {    {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
     {"rescan", cmd_rescan, "重新扫描 TF 卡"},
     {"play", cmd_play, "载入指定序号的 ROM"},
@@ -2407,6 +2641,7 @@ static const struct listen_cmd_t g_arcade_cmds[] = {
     {"presents", cmd_presents, "渲染但关/开送屏：presents <0|1>（拆分画像素 vs 送屏成本）"},
     {"pwrho1d", cmd_pwrho1d, "把 POWER_EN 锁到高：pwrho1d <0|1>（刷机调试用）"},
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
+    {"dino", cmd_dino, "内置小游戏小恐龙：dino [stat|jump|reset|auto <0|1>|shot|exit]"},
 };
 
 static int cmd_arcade_help(Shell *shell)
