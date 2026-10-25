@@ -9,6 +9,24 @@ config APPLICATION_ARCADE
 
 if APPLICATION_ARCADE
 
+config ARCADE_APP_EATONLY
+    bool "Single-app firmware: only keep the eat-what slot machine"
+    default n
+    help
+      Build a single-application firmware: the device boots straight into the
+      built-in "eat what today" slot machine (arcade_eat.c) and nothing else.
+
+      With this enabled the GB/GBC emulator (binjgb / Peanut-GB), the ROM
+      scanner, the save-RAM writer and the other built-in mini games (dino,
+      jump) are not compiled into the image.  The full-feature build is
+      unaffected: leave this off and everything stays available.
+
+      Interaction in this mode:
+        - hold the key  -> the next picture group rolls (groups alternate
+                           strictly: 1st hold = group 1, 2nd = group 2, ...)
+        - release       -> freeze on the current frame (that is the result)
+        - any hold time -> never exits and never powers off
+
 config ARCADE_ROM_DIR
     string "ROM directory on the SD card"
     default "/SD:/roms"

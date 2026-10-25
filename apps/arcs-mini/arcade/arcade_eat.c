@@ -1,10 +1,12 @@
 /*
  * 内置小游戏：「今天吃啥」老虎机。
  *
- * 两颗按钮级需求：
+ * 用户需求：
  *   1. 按住 → 图片快速循环滚动（老虎机）
  *   2. 松手 → 立刻定格，屏上那帧就是结果
- *   （外加：每次按下等概率抽「去处盘 / 菜品盘」两种类型，并在该类型里随机起点）
+ *   3. 两组素材**严格交替**：第 1 次按住 → 第一组（去处盘），松手定格；
+ *      第 2 次按住 → 第二组（菜品盘）；第 3 次又回第一组……组内起始帧随机
+ *   4. 长按**不退出、不关机**（单应用固件里这颗键只负责抽签）
  *
  * 素材是两套索引色帧序列（见 arcade/assets/ + tools/prepare_eat_what.py）：
  *   每帧 = 256 色 RGB565 调色板(512B) + 160x160 像素索引(25600B)
@@ -40,18 +42,27 @@
 #define EAT_STEP_MS    17      /* 每逻辑帧累积的时间（≈16.7ms，和跳一跳一致） */
 #define EAT_ROLL_MS    60      /* 每 60ms 换一帧 ≈ 16.7 fps 的滚动感 */
 /*
- * 长按退出用「自己数的时间」而不是按键驱动的 LONG_HOLD：那个在 1600ms
- * 就报，而「按住滚动、想清楚了再松手」很容易超过 1.6 秒，会被误退出。
- * 这里改成一直数到 3 秒才退，滚动过程就不受限制了。
+ * 长按退出的毫秒数。
+ *
+ * 单应用固件（CONFIG_ARCADE_APP_EATONLY=y）里根本没有「列表页」可以退回，
+ * 而且用户明确要求「长按不关机」——所以这个值设成永远到不了的上限，
+ * 滚动过程想按多久就按多久。全功能固件里仍然保留「按住 3 秒回列表」。
+ *
+ * 为什么自己数而不用驱动给的 LONG_HOLD：那个在 1600ms 就报，
+ * 「按住滚动、想清楚了再松手」很容易超过 1.6 秒，会被误退出。
  */
+#if CONFIG_ARCADE_APP_EATONLY
+#define EAT_EXIT_HOLD_MS 0xFFFFFFFFU
+#else
 #define EAT_EXIT_HOLD_MS 3000
+#endif
 
 #define RGB565(r, g, b) ARCADE_GFX_RGB565(r, g, b)
 
-#define C_BAR_BG   RGB565( 34,  38,  48)
 #define C_BAR_FG   RGB565(242, 178,  58)
 #define C_STRIP    RGB565(238,  92,  70)
 #define C_INK      RGB565( 20,  22,  28)
+#define C_DIM      RGB565(140, 146, 160)
 
 /* ---------------- 状态 ---------------- */
 
@@ -84,6 +95,9 @@ static arcade_eat_pick_t s_log[ARCADE_EAT_LOG_MAX];
 static uint32_t s_log_head;
 static uint32_t s_draws;
 static uint32_t s_hist[2];
+/* 下一次按下抽哪一组：0 = 去处盘(g1)，1 = 菜品盘(g2)。
+ * 严格交替，开机从 0 开始（第一次按住永远是第一组）。 */
+static uint8_t s_next_type;
 
 /* 自己的一份 fps 统计（`arcade eat stat` 用） */
 static uint32_t s_logic_frames;
@@ -197,14 +211,16 @@ static void eat_begin_roll(void)
         return;
     }
 
-    /* 等概率抽类型；某一套素材缺失时退化成另一套 */
-    g.type = (uint8_t)((eat_rand() >> 8) & 1U);
+    /* 严格交替：这一次抽 s_next_type，下一次就是另一组。
+     * 某一套素材缺失时退化成另一套（保证按下去一定有画面）。 */
+    g.type = s_next_type;
     if (s_frames[g.type] == 0) {
-        g.type ^= 1U;
+        g.type = (uint8_t)(g.type ^ 1U);
     }
     if (s_frames[g.type] == 0) {
         return;
     }
+    s_next_type = (uint8_t)(g.type ^ 1U);
 
     g.frame = (uint16_t)(eat_rand() % (uint32_t)s_frames[g.type]);
     g.hold_ms = 0;
@@ -243,7 +259,11 @@ static void eat_logic(void)
         return;
     }
 
-    /* 按住超过 3 秒还没松手 = 想退出（自己数，不用驱动的 1.6s LONG_HOLD） */
+    /*
+     * 按住超过 3 秒还没松手 = 想退出（自己数，不用驱动的 1.6s LONG_HOLD）。
+     * 单应用固件里 EAT_EXIT_HOLD_MS 是 0xFFFFFFFF，这段永远不成立——
+     * 用户要求「长按不关机」，按住多久都继续转。
+     */
     if (g.hold_ms >= EAT_EXIT_HOLD_MS) {
         s_exit_req = true;
         return;
@@ -297,21 +317,38 @@ static void eat_draw_blank(uint16_t *fb)
     arcade_gfx_text_center(fb, 148, "arcade eat", 1, C_BAR_FG);
 }
 
-static void eat_hint_bar(uint16_t *fb, const char *text)
+/*
+ * 待机画面。
+ *
+ * 刻意不铺素材首帧：素材底部的文字（店名/菜名）会被提示条盖住，
+ * 而且开机第一眼应该是「怎么玩」，不是某一张还没抽中的图。
+ * 中文字库没编进这个固件（只有 5x7 点阵 ASCII），所以提示用英文短句。
+ * NEXT 那一行就是「下次按下会抽第几组」。
+ */
+static void eat_idle_screen(uint16_t *fb)
 {
-    const int h = 18;
-
-    arcade_gfx_fill(fb, 0, EAT_DST - h, EAT_DST, h, C_BAR_BG);
-    arcade_gfx_text_center(fb, EAT_DST - h + 6, text, 1, C_BAR_FG);
+    arcade_gfx_fill(fb, 0, 0, EAT_DST, EAT_DST, C_INK);
+    arcade_gfx_text_center(fb, 58, "EAT  WHAT ?", 3, C_BAR_FG);
+    arcade_gfx_text_center(fb, 120, "HOLD  THE  KEY", 2, C_BAR_FG);
+    arcade_gfx_text_center(fb, 168, "RELEASE TO STOP", 1, C_DIM);
+    arcade_gfx_text_center(fb, 188,
+                           s_next_type == 0 ? "NEXT 1 : PLACE" : "NEXT 2 : DISH",
+                           1, C_DIM);
 }
 
 static void eat_render(uint16_t *fb)
 {
-    const uint8_t *fr = frame_ptr(g.type, g.frame);
-
     if (!s_geom_ready) {
         eat_prepare_geom();
     }
+
+    /* 待机：什么都不铺素材，只显示「按住 / 松开」和下一组 */
+    if (g.state == ARCADE_EAT_IDLE) {
+        eat_idle_screen(fb);
+        return;
+    }
+
+    const uint8_t *fr = frame_ptr(g.type, g.frame);
 
     if (fr == NULL) {
         eat_draw_blank(fb);
@@ -323,9 +360,6 @@ static void eat_render(uint16_t *fb)
     if (g.state == ARCADE_EAT_ROLLING) {
         /* 滚动中：屏幕最下面一条细红条，表示「还在转」 */
         arcade_gfx_fill(fb, 0, EAT_DST - 4, EAT_DST, 4, C_STRIP);
-    } else if (g.state == ARCADE_EAT_IDLE && s_draws == 0) {
-        /* 待机海报：只在第一次抽之前提示一下怎么玩，之后屏上就是结果 */
-        eat_hint_bar(fb, "HOLD KEY");
     }
 }
 
@@ -341,6 +375,7 @@ void arcade_eat_enter(void)
     g.state = ARCADE_EAT_IDLE;
     g.type = 0;
     g.frame = 0;
+    s_next_type = 0;   /* 开机第一次按住 = 第一组（去处盘），之后严格交替 */
 
     s_active = true;
     s_press_req = false;
@@ -451,6 +486,7 @@ void arcade_eat_reset(void)
     g.hold_ms = 0;
     g.roll_acc = 0;
     g.advances = 0;
+    s_next_type = 0;
 
     s_draws = 0;
     s_hist[0] = 0;
@@ -541,6 +577,11 @@ int arcade_eat_type(void)
 int arcade_eat_frame(void)
 {
     return (int)g.frame;
+}
+
+int arcade_eat_next_type(void)
+{
+    return (int)s_next_type;
 }
 
 int arcade_eat_frame_count(int type)

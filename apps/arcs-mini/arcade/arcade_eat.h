@@ -11,10 +11,13 @@
  * 240x240 全屏直写（arcade_video 的全屏模式），不走模拟器也不走 LVGL。
  *
  * 交互（按键用**原始事件**，不走多击判定窗口，否则按住/松手都要等几百毫秒）：
- *   - 按住（PRESS_DOWN） → 立刻随机抽「去处盘」或「菜品盘」，从随机一帧起滚
+ *   - 按住（PRESS_DOWN） → 立刻从随机一帧开始滚动「本次该抽的那一组」
  *   - 松手（SHORT_UP / LONG_UP） → 立刻定格，屏上那帧就是结果
- *   - 再按一次           → 重新抽
- *   - 按住 3 秒不松手     → 请求退出回列表（arcade_eat_exit_requested）
+ *   - 再按一次           → 抽另一组
+ *   - 两组**严格交替**：开机第一次是 g1（去处盘 PLACE），第二次 g2（菜品盘
+ *     DISH），第三次又回 g1……重启后重新从 g1 开始。组内起始帧仍然随机。
+ *   - 长按**不会退出**："今天吃啥"单应用固件里没有任何长按退出/关机路径
+ *     （CONFIG_ARCADE_APP_EATONLY=y，见 eat_logic() 里的编译开关）
  */
 
 typedef enum {
@@ -71,7 +74,8 @@ void arcade_eat_reset(void);
 /**
  * 按住超过 3 秒还没松手 → 返回 true（读一次就清掉）。
  * 用自己数的时间而不是按键驱动的 LONG_HOLD（那个 1600ms 就报，会和
- * 「按住滚动」撞车）。上层拿到 true 就退出回列表。
+ * 「按住滚动」撞车）。全功能固件里上层拿到 true 就退出回列表；
+ * 单应用固件（CONFIG_ARCADE_APP_EATONLY=y）里这个逻辑整段关掉，长按永远不退出。
  */
 bool arcade_eat_exit_requested(void);
 
@@ -83,6 +87,9 @@ int arcade_eat_frame_count(int type);        /* 该类型的总帧数 */
 int arcade_eat_hold_ms_cur(void);            /* 本次按住了多久 */
 uint32_t arcade_eat_draws(void);             /* 进入后一共抽了多少次 */
 uint32_t arcade_eat_hist(int type);          /* 该类型被抽中多少次 */
+
+/** 下次按下会抽哪一组（0 = 去处盘, 1 = 菜品盘），待机画面据此提示 */
+int arcade_eat_next_type(void);
 
 /** 第 i 次抽取的结果（i 从 0 开始，只保留最近 ARCADE_EAT_LOG_MAX 次） */
 bool arcade_eat_log(uint32_t i, arcade_eat_pick_t *out);
