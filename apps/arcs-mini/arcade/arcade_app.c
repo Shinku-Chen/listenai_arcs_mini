@@ -27,6 +27,7 @@
 #include "arcade_audio.h"
 #include "arcade_core.h"
 #include "arcade_dino.h"
+#include "arcade_eat.h"
 #include "arcade_jump.h"
 #include "arcade_gb.h"
 #include "arcade_input.h"
@@ -60,6 +61,7 @@ typedef enum {
     ARCADE_MODE_PLAY,
     ARCADE_MODE_DINO,     /* 内置小游戏「小恐龙」（原生，不走模拟器） */
     ARCADE_MODE_JUMP,     /* 内置小游戏「跳一跳」（原生） */
+    ARCADE_MODE_EAT,      /* 内置小游戏「今天吃啥」（原生，老虎机） */
 } arcade_mode_t;
 
 typedef enum {
@@ -77,6 +79,10 @@ typedef enum {
     ARCADE_REQ_JUMP,          /* 进入内置小游戏「跳一跳」 */
     ARCADE_REQ_JUMP_RESET,    /* 跳一跳重开一局 */
     ARCADE_REQ_JUMP_CHARGE,   /* 跳一跳：按住 arg 毫秒后松手 */
+    ARCADE_REQ_EAT,           /* 进入内置小游戏「今天吃啥」 */
+    ARCADE_REQ_EAT_RESET,     /* 今天吃啥回到待机 */
+    ARCADE_REQ_EAT_HOLD,      /* 今天吃啥：按住 arg 毫秒后松手 */
+    ARCADE_REQ_EAT_AUTO,      /* 今天吃啥：自动连抽 arg 次 */
 } arcade_req_t;
 
 static arcade_mode_t s_mode = ARCADE_MODE_LIST;
@@ -86,6 +92,7 @@ static volatile uint8_t s_pending_action = 0xFF;
 /* 内置小游戏：「上一帧跳跃键是否按下」，用来做边沿触发 */
 static bool s_dino_prev_pressed;
 static bool s_jump_prev_pressed;
+static bool s_eat_prev_pressed;
 
 /*
  * 物理按键的原始事件队列（service_button 的 raw 回调 → arcade 主循环）。
@@ -379,6 +386,8 @@ static const char *arcade_mode_name(void)
         return "dino";
     case ARCADE_MODE_JUMP:
         return "jump";
+    case ARCADE_MODE_EAT:
+        return "eat";
     default:
         return "list";
     }
@@ -388,7 +397,7 @@ static const char *arcade_mode_name(void)
 static bool arcade_in_game(void)
 {
     return s_mode == ARCADE_MODE_PLAY || s_mode == ARCADE_MODE_DINO ||
-           s_mode == ARCADE_MODE_JUMP;
+           s_mode == ARCADE_MODE_JUMP || s_mode == ARCADE_MODE_EAT;
 }
 
 /*
@@ -428,22 +437,34 @@ static void arcade_raw_button_drain(void)
 
         s_raw_tail = (uint8_t)((s_raw_tail + 1U) % ARCADE_RAW_Q_LEN);
 
-        if (s_mode != ARCADE_MODE_JUMP || !arcade_jump_active()) {
-            continue;
-        }
-
-        switch ((voice_msg_button_action_t)ev) {
-        case VOICE_MSG_BUTTON_ACTION_PRESS_DOWN:
-            arcade_jump_press();
-            break;
-        /* 短按松开 / 长按（>800ms 的蓄力）松开，都是「松手起跳」 */
-        case VOICE_MSG_BUTTON_ACTION_SHORT_UP:
-        case VOICE_MSG_BUTTON_ACTION_LONG_UP:
-        case VOICE_MSG_BUTTON_ACTION_LONG_HOLD_UP:
-            arcade_jump_release();
-            break;
-        default:
-            break;
+        if (s_mode == ARCADE_MODE_JUMP && arcade_jump_active()) {
+            switch ((voice_msg_button_action_t)ev) {
+            case VOICE_MSG_BUTTON_ACTION_PRESS_DOWN:
+                arcade_jump_press();
+                break;
+            /* 短按松开 / 长按（>800ms 的蓄力）松开，都是「松手起跳」 */
+            case VOICE_MSG_BUTTON_ACTION_SHORT_UP:
+            case VOICE_MSG_BUTTON_ACTION_LONG_UP:
+            case VOICE_MSG_BUTTON_ACTION_LONG_HOLD_UP:
+                arcade_jump_release();
+                break;
+            default:
+                break;
+            }
+        } else if (s_mode == ARCADE_MODE_EAT && arcade_eat_active()) {
+            switch ((voice_msg_button_action_t)ev) {
+            case VOICE_MSG_BUTTON_ACTION_PRESS_DOWN:
+                arcade_eat_press();
+                break;
+            /* 松手（不管短按还是长按松开）立刻定格 */
+            case VOICE_MSG_BUTTON_ACTION_SHORT_UP:
+            case VOICE_MSG_BUTTON_ACTION_LONG_UP:
+            case VOICE_MSG_BUTTON_ACTION_LONG_HOLD_UP:
+                arcade_eat_release();
+                break;
+            default:
+                break;
+            }
         }
     }
 }
@@ -537,6 +558,47 @@ static void arcade_stop_jump(void)
     LISA_LOGI(TAG, "jump stopped");
 }
 
+/*
+ * 内置小游戏（今天吃啥）。同样是全屏直写 + 原始按键事件。
+ */
+static void arcade_start_eat(void)
+{
+    if (arcade_core_running()) {
+        arcade_audio_set_active(false);
+        arcade_core_stop();
+    }
+
+    arcade_ui_show_player();
+    arcade_ui_player_message(NULL);
+
+    arcade_video_use_fullscreen(true);
+    arcade_eat_enter();
+
+    s_mode = ARCADE_MODE_EAT;
+    s_eat_prev_pressed = false;
+    s_frames = 0;
+    s_fps_tick = xTaskGetTickCount();
+    s_fps_x10 = 0;
+    s_logic_frames = 0;
+    s_render_frames = 0;
+    s_skipped_frames = 0;
+    s_rate_tick = 0;
+    s_next_start_cyc = arcade_cycles();
+    s_behind_cnt = 0;
+
+    LISA_LOGI(TAG, "eat started");
+}
+
+static void arcade_stop_eat(void)
+{
+    arcade_eat_leave();
+    arcade_video_use_fullscreen(false);
+    arcade_video_present_drain();
+    arcade_show_list();
+
+    LISA_LOGI(TAG, "eat stopped");
+}
+
 static void arcade_start_selected(void)
 {
     const char *path = arcade_rom_path(s_sel);
@@ -550,6 +612,9 @@ static void arcade_start_selected(void)
     /* 列表最前面是固件内置的小游戏，不需要 ROM */
     if (arcade_rom_is_builtin(s_sel)) {
         switch (arcade_rom_builtin_id(s_sel)) {
+        case ARCADE_BUILTIN_EAT:
+            arcade_start_eat();
+            break;
         case ARCADE_BUILTIN_JUMP:
             arcade_start_jump();
             break;
@@ -623,6 +688,11 @@ static void arcade_stop_game(void)
 
     if (s_mode == ARCADE_MODE_JUMP) {
         arcade_stop_jump();
+        return;
+    }
+
+    if (s_mode == ARCADE_MODE_EAT) {
+        arcade_stop_eat();
         return;
     }
 
@@ -716,6 +786,16 @@ static void arcade_handle_action(uint8_t action)
         return;
     }
 
+    /*
+     * 今天吃啥：按下/松开走 service_button 的原始事件
+     * （arcade_raw_button_drain）。这里什么也不做：
+     * 退出用的是「自己数到 3 秒」而不是 LONG_HOLD（驱动 1600ms 就报，会和
+     * 「按住滚动」撞车），在下面主循环里看 arcade_eat_exit_requested()。
+     */
+    if (s_mode == ARCADE_MODE_EAT) {
+        return;
+    }
+
     /* 模拟器游戏页 */
     switch (action) {
     case VOICE_MSG_BUTTON_ACTION_CLICK:
@@ -774,6 +854,22 @@ static void arcade_handle_request(void)
         break;
     case ARCADE_REQ_JUMP_CHARGE:
         arcade_jump_charge(arg);
+        break;
+    case ARCADE_REQ_EAT:
+        /* 从别的游戏页直接切过来时先收掉它，否则两套逻辑会同时往帧缓冲上画 */
+        if (arcade_in_game() && s_mode != ARCADE_MODE_EAT) {
+            arcade_stop_game();
+        }
+        arcade_start_eat();
+        break;
+    case ARCADE_REQ_EAT_RESET:
+        arcade_eat_reset();
+        break;
+    case ARCADE_REQ_EAT_HOLD:
+        arcade_eat_hold(arg);
+        break;
+    case ARCADE_REQ_EAT_AUTO:
+        arcade_eat_auto(arg);
         break;
     case ARCADE_REQ_RESCAN:
         arcade_rescan();
@@ -1286,6 +1382,41 @@ static void arcade_task(void *arg)
                 arcade_frame_tick();
                 arcade_rate_tick(arcade_jump_renders() != rendered_before);
             }
+        } else if (s_mode == ARCADE_MODE_EAT && !s_frozen) {
+            /*
+             * 今天吃啥：按住滚动、松手定格。物理键走原始事件
+             * （arcade_raw_button_drain）；这里多出来的一条是给 USB 键盘 /
+             * 调试注入用的（它们没有原始事件，只能看点位图的边沿）。
+             */
+            bool kbd_exit = false;
+            uint32_t kbd = arcade_input_take_keyboard(&kbd_exit);
+
+            if (kbd_exit) {
+                LISA_LOGI(TAG, "ESC from keyboard, leave eat");
+                arcade_stop_game();
+            } else {
+                uint32_t mask = arcade_input_mask() | kbd;
+                bool pressed = (mask & (ARCADE_KEY_A | ARCADE_KEY_UP |
+                                        ARCADE_KEY_START)) != 0U;
+
+                if (pressed && !s_eat_prev_pressed) {
+                    arcade_eat_press();
+                } else if (!pressed && s_eat_prev_pressed) {
+                    arcade_eat_release();
+                }
+                s_eat_prev_pressed = pressed;
+
+                uint32_t rendered_before = arcade_eat_renders();
+
+                arcade_eat_tick();
+                if (arcade_eat_exit_requested()) {
+                    LISA_LOGI(TAG, "hold 3s, leave eat");
+                    arcade_stop_game();
+                } else {
+                    arcade_frame_tick();
+                    arcade_rate_tick(arcade_eat_renders() != rendered_before);
+                }
+            }
         }
 
         /*
@@ -1324,7 +1455,8 @@ static void arcade_task(void *arg)
             s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
             s_cost_us = (s_cost_us * 7U + cost_us) / 8U;
             arcade_skip_account(cost_us, s_last_render);
-        } else if (s_mode == ARCADE_MODE_DINO || s_mode == ARCADE_MODE_JUMP) {
+        } else if (s_mode == ARCADE_MODE_DINO || s_mode == ARCADE_MODE_JUMP ||
+                   s_mode == ARCADE_MODE_EAT) {
             /* 小游戏的整帧耗时单独记（arcade perf 能直接看到） */
             s_work_ema = (s_work_ema * 7U + (cost_us / 1000U)) / 8U;
             s_cost_us = (s_cost_us * 7U + cost_us) / 8U;
@@ -2901,6 +3033,157 @@ static int cmd_jump(int argc, char **argv)
     return 0;
 }
 
+/*
+ * arcade eat [...]: 内置小游戏「今天吃啥」
+ *
+ *   arcade eat              进入（等价于在列表里选第一项）
+ *   arcade eat stat         状态：类型 / 帧 / 抽了多少次 / fps / 原始事件
+ *   arcade eat hold <ms>    模拟「按住 ms 毫秒后松手」
+ *   arcade eat auto <n>     自动连抽 n 次，打印每次的类型与最终帧（验证分布）
+ *   arcade eat reset        回到待机
+ *   arcade eat shot         帧缓冲 ASCII 图（看有没有画面）
+ *   arcade eat exit         退出回列表
+ */
+static int cmd_eat(int argc, char **argv)
+{
+    Shell *shell = shellGetCurrent();
+    const char *sub = argc >= 1 ? argv[0] : NULL;
+
+    if (sub == NULL) {
+        if (arcade_request(ARCADE_REQ_EAT, 0) != 0) {
+            shellPrint(shell, "请求超时\r\n");
+            return 0;
+        }
+        shellPrint(shell, "今天吃啥: 已进入（按住滚动、松手定格，长按退出）\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "stat") == 0) {
+        static const char *const k_state[] = {"idle", "rolling", "result"};
+        uint8_t st = (uint8_t)arcade_eat_state();
+
+        if (!arcade_eat_active()) {
+            shellPrint(shell, "当前没在玩今天吃啥（mode=%s）\r\n", arcade_mode_name());
+            return 0;
+        }
+
+        shellPrint(shell,
+                   "state=%s type=%s frame=%d/%d hold=%dms draws=%u\r\n",
+                   st < sizeof(k_state) / sizeof(k_state[0]) ? k_state[st] : "?",
+                   arcade_eat_type() == 0 ? "PLACE" : "DISH", arcade_eat_frame(),
+                   arcade_eat_frame_count(arcade_eat_type()),
+                   arcade_eat_hold_ms_cur(), (unsigned)arcade_eat_draws());
+        shellPrint(shell, "hist: PLACE=%u DISH=%u (frames %d/%d)\r\n",
+                   (unsigned)arcade_eat_hist(0), (unsigned)arcade_eat_hist(1),
+                   arcade_eat_frame_count(0), arcade_eat_frame_count(1));
+        shellPrint(shell, "logic=%u.%u render=%u.%u fps frames=%u renders=%u skips=%u\r\n",
+                   (unsigned)(arcade_eat_logic_fps_x10() / 10),
+                   (unsigned)(arcade_eat_logic_fps_x10() % 10),
+                   (unsigned)(arcade_eat_render_fps_x10() / 10),
+                   (unsigned)(arcade_eat_render_fps_x10() % 10),
+                   (unsigned)arcade_eat_frames(), (unsigned)arcade_eat_renders(),
+                   (unsigned)arcade_eat_skips());
+        shellPrint(shell, "raw=%u last=%u\r\n", (unsigned)s_raw_evt_cnt,
+                   (unsigned)s_raw_evt_last);
+        return 0;
+    }
+
+    if (strcmp(sub, "hold") == 0) {
+        int ms = argc >= 2 ? atoi(argv[1]) : 400;
+
+        if (!arcade_eat_active()) {
+            shellPrint(shell, "先 arcade eat 进入（mode=%s）\r\n", arcade_mode_name());
+            return 0;
+        }
+
+        if (arcade_request(ARCADE_REQ_EAT_HOLD, ms) != 0) {
+            shellPrint(shell, "请求超时\r\n");
+            return 0;
+        }
+        shellPrint(shell, "hold %dms -> state=%d type=%s frame=%d\r\n", ms,
+                   (int)arcade_eat_state(),
+                   arcade_eat_type() == 0 ? "PLACE" : "DISH", arcade_eat_frame());
+        return 0;
+    }
+
+    if (strcmp(sub, "auto") == 0) {
+        int n = argc >= 2 ? atoi(argv[1]) : 0;
+
+        if (n <= 0) {
+            shellPrint(shell, "auto: pending=%d done=%d\r\n",
+                       arcade_eat_auto_pending() ? 1 : 0, arcade_eat_auto_done());
+            return 0;
+        }
+
+        if (n > ARCADE_EAT_LOG_MAX) {
+            n = ARCADE_EAT_LOG_MAX;
+        }
+
+        if (!arcade_eat_active()) {
+            shellPrint(shell, "先 arcade eat 进入（mode=%s）\r\n", arcade_mode_name());
+            return 0;
+        }
+
+        if (arcade_request(ARCADE_REQ_EAT_AUTO, n) != 0) {
+            shellPrint(shell, "请求超时\r\n");
+            return 0;
+        }
+
+        /* 每次按住 150~550ms，n 次最多 n * 0.8 秒，留足余量等它抽完 */
+        for (int waited = 0; waited < 45000 && arcade_eat_auto_pending(); waited += 50) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        int done = arcade_eat_auto_done();
+        uint32_t total = arcade_eat_draws();
+        uint32_t kept = total < ARCADE_EAT_LOG_MAX ? total : ARCADE_EAT_LOG_MAX;
+        uint32_t show = (uint32_t)done < kept ? (uint32_t)done : kept;
+        uint32_t c0 = 0;
+        uint32_t c1 = 0;
+
+        for (uint32_t k = 0; k < show; k++) {
+            arcade_eat_pick_t p;
+
+            if (!arcade_eat_log(kept - show + k, &p)) {
+                break;
+            }
+            if (p.type == 0) {
+                c0++;
+            } else {
+                c1++;
+            }
+            shellPrint(shell, "  [%02u] %s frame=%u/%d\r\n", (unsigned)(k + 1U),
+                       p.type == 0 ? "PLACE" : "DISH", (unsigned)p.frame,
+                       arcade_eat_frame_count(p.type));
+        }
+
+        shellPrint(shell, "auto %d: PLACE=%u DISH=%u pending=%d\r\n", done,
+                   (unsigned)c0, (unsigned)c1,
+                   arcade_eat_auto_pending() ? 1 : 0);
+        return 0;
+    }
+
+    if (strcmp(sub, "reset") == 0) {
+        (void)arcade_request(ARCADE_REQ_EAT_RESET, 0);
+        shellPrint(shell, "已回到待机\r\n");
+        return 0;
+    }
+
+    if (strcmp(sub, "shot") == 0) {
+        arcade_fb_ascii(shell);
+        return 0;
+    }
+
+    if (strcmp(sub, "exit") == 0) {
+        (void)arcade_request(ARCADE_REQ_EXIT, 0);
+        shellPrint(shell, "已返回列表\r\n");
+        return 0;
+    }
+
+    shellPrint(shell, "用法: arcade eat [stat|hold <ms>|auto <n>|reset|shot|exit]\r\n");
+    return 0;
+}
+
 static const struct listen_cmd_t g_arcade_cmds[] = {    {"stat", cmd_stat, "打印模拟器状态与帧率"},
     {"list", cmd_list, "列出 TF 卡中的 ROM"},
     {"rescan", cmd_rescan, "重新扫描 TF 卡"},
@@ -2934,6 +3217,7 @@ static const struct listen_cmd_t g_arcade_cmds[] = {    {"stat", cmd_stat, "打�
     {"membench", cmd_membench, "量 PSRAM / SRAM 带宽"},
     {"dino", cmd_dino, "内置小游戏小恐龙：dino [stat|jump|reset|auto <0|1>|shot|exit]"},
     {"jump", cmd_jump, "内置小游戏跳一跳：jump [stat|charge <ms>|auto <0|1>|reset|shot|exit]"},
+    {"eat", cmd_eat, "内置小游戏今天吃啥：eat [stat|hold <ms>|auto <n>|reset|shot|exit]"},
 };
 
 static int cmd_arcade_help(Shell *shell)

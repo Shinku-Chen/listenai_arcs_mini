@@ -4,8 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* 内置小游戏编号（arcade_rom_builtin_id 的返回值） */
-#define ARCADE_BUILTIN_JUMP 0
+/* 内置小游戏编号（arcade_rom_builtin_id 的返回值），顺序即列表顺序 */
+#define ARCADE_BUILTIN_EAT  0   /* 今天吃啥（老虎机抽签） */
+#define ARCADE_BUILTIN_JUMP 1   /* 跳一跳 */
 
 int arcade_rom_scan(void);
 int arcade_rom_count(void);

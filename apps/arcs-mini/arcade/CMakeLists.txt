@@ -5,6 +5,7 @@ listenai_library_sources(
     arcade_audio.c
     arcade_core.c
     arcade_dino.c
+    arcade_eat.c
     arcade_gfx.c
     arcade_input.c
     arcade_jump.c
@@ -79,3 +80,28 @@ if(NOT ARCADE_DEMO_GEN_RET EQUAL 0)
 endif()
 
 listenai_library_sources(${ARCADE_DEMO_ROM_OUT})
+
+# ---- 内置小游戏「今天吃啥」的帧素材 ------------------------------------------
+# assets/*.bin 是 tools/prepare_eat_what.py 裁好的索引帧序列（160x160，每帧
+# 512B RGB565 调色板 + 25600B 索引，41 帧共约 1.02MB）。这里在配置阶段把它
+# 转成一个 C 数组参与编译，固件里就不用再搞一套文件系统读取。
+set(ARCADE_EAT_ASSET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/assets)
+set(ARCADE_EAT_C ${CMAKE_CURRENT_BINARY_DIR}/generated/arcade_eat_assets.c)
+set(ARCADE_EAT_H ${CMAKE_CURRENT_BINARY_DIR}/generated/arcade_eat_assets.h)
+
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
+execute_process(
+    COMMAND ${PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_eat_what_assets.py
+            ${ARCADE_EAT_ASSET_DIR}/eat_what_g1.bin
+            ${ARCADE_EAT_ASSET_DIR}/eat_what_g2.bin
+            ${ARCADE_EAT_C} ${ARCADE_EAT_H}
+    RESULT_VARIABLE ARCADE_EAT_GEN_RET
+)
+
+if(NOT ARCADE_EAT_GEN_RET EQUAL 0)
+    message(FATAL_ERROR "arcade: eat-what assets generation failed")
+endif()
+
+listenai_include_directories(${CMAKE_CURRENT_BINARY_DIR}/generated)
+listenai_library_sources(${ARCADE_EAT_C})

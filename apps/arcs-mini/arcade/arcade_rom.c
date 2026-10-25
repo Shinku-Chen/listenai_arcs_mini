@@ -38,17 +38,20 @@
 #define ROM_DEMO_PATH  "@demo"
 
 /*
- * 列表最前面固定放一个「内置小游戏」：它是固件原生代码（arcade_jump.c），
- * 不读卡、不占 ROM 名额，所以即使没插 TF 卡、甚至一张 ROM 都没有，
- * 列表也不会是空的。小恐龙（arcade_dino.c）仍然编在固件里，但不占列表
- * 名额，用 shell 命令 `arcade dino` 直接进。
+ * 列表最前面固定放「内置小游戏」：它们是固件原生代码（arcade_eat.c /
+ * arcade_jump.c），不读卡、不占 ROM 名额，所以即使没插 TF 卡、甚至一张 ROM
+ * 都没有，列表也不会是空的。小恐龙（arcade_dino.c）仍然编在固件里，但不占
+ * 列表名额，用 shell 命令 `arcade dino` 直接进。
+ *
+ * 数组下标就是 ARCADE_BUILTIN_*，顺序即列表顺序。
  */
-#define ROM_BUILTIN_COUNT  1
+#define ROM_BUILTIN_COUNT  2
 
 static const struct {
     const char *name;
     const char *path;
 } k_builtins[ROM_BUILTIN_COUNT] = {
+    [ARCADE_BUILTIN_EAT] = {"今天吃啥（内置）", "@eat"},
     [ARCADE_BUILTIN_JUMP] = {"跳一跳（内置）", "@jump"},
 };
 
