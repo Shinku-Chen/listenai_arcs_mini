@@ -5,8 +5,9 @@ listenai_include_directories(
 )
 
 # ---- 内置小游戏「今天吃啥」的帧素材 ------------------------------------------
-# assets/*.bin 是 tools/prepare_eat_what.py 裁好的索引帧序列（160x160，每帧
-# 512B RGB565 调色板 + 25600B 索引，41 帧共约 1.02MB）。这里在配置阶段把它
+# assets/*.bin 是 tools/prepare_eat_what.py 转好的索引帧序列（200x200 原生尺寸，
+# 每帧 512B RGB565 调色板 + 40000B 索引，41 帧共约 1.58MB）。像素索引与源素材
+# 一一对应、不重采样不重新量化，固件里 1:1 居中贴到 240x240。这里在配置阶段把它
 # 转成一个 C 数组参与编译，固件里就不用再搞一套文件系统读取。
 set(ARCADE_EAT_ASSET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/assets)
 set(ARCADE_EAT_C ${CMAKE_CURRENT_BINARY_DIR}/generated/arcade_eat_assets.c)

@@ -9,12 +9,20 @@
  *   4. 长按**不退出、不关机**（单应用固件里这颗键只负责抽签）
  *
  * 素材是两套索引色帧序列（见 arcade/assets/ + tools/prepare_eat_what.py）：
- *   每帧 = 256 色 RGB565 调色板(512B) + 160x160 像素索引(25600B)
- * 屏上按 1.5 倍最近邻放大到 240x240 —— 和模拟器切 1.5 倍时同一个比例，
- * 于是 160*3 = 240*2，横向每个源像素正好出 1.5 个目标像素，可以按
- * 「2 个源像素 → 3 个目标像素」成组写，省掉一次索引查表。
+ *   每帧 = 256 色 RGB565 调色板(512B) + 200x200 像素索引(40000B)
+ * 屏是 240x240，素材**按 1:1 居中显示**（四周各 20 px 黑边），固件里不做任何
+ * 缩放。
  *
- * 画面直接写 arcade_video 的 240x240 全屏缓冲（不走 LVGL，也不走模拟器）。
+ * 为什么坚持 1:1：
+ *   上一版素材是 160x160、固件里又做 1.5 倍最近邻放大到 240x240。非整数倍
+ *   缩放会让同一个源像素在某些位置占 1 个目标像素、某些位置占 2 个，字和边缘
+ *   都会发虚；再加上素材准备阶段用 LANCZOS 从 200 重采样到 160、再用
+ *   MEDIANCUT 重新量化，等于「先模糊一次、再放大一次」。用户反馈「图片有点
+ *   模糊」就是这两层叠出来的。现在素材按源尺寸 200x200 直通（只把调色板
+ *   888→565、索引一个字节不动），屏上 1:1 贴，从源到面板没有任何插值。
+ *
+ * 画面直接写 arcade_video 的 240x240 全屏缓冲（不走 LVGL，也不走模拟器），
+ * 每帧整块 240x240 全量送屏 —— 不做隔行、不做分块交错、不做降采样。
  */
 #include <stdio.h>
 #include <string.h>
@@ -32,11 +40,21 @@
 
 #define TAG "arcade-eat"
 
-/* 素材几何：160x160 索引帧 → 240x240 目标（1.5 倍） */
+/* 素材几何：ARCADE_EAT_RES x ARCADE_EAT_RES 索引帧，1:1 居中贴到 240x240 */
 #define EAT_SRC        ARCADE_EAT_RES
 #define EAT_DST        ARCADE_GFX_W
 #define EAT_PALETTE    (256 * 2)
 #define EAT_FRAME      ARCADE_EAT_FRAME_BYTES
+/* 与面板的边距（200 → 上下左右各 20 px 黑边）。素材比屏大就直接报错，
+ * 绝不做降采样——降采样就是模糊。 */
+#define EAT_OFF        ((EAT_DST - EAT_SRC) / 2)
+
+#if (EAT_SRC > EAT_DST)
+#error "arcade eat: 素材比面板还大，需要重新生成素材（不要靠缩放硬塞）"
+#endif
+
+/* 32 位成对写要求：源宽偶数、左边距偶数（这样每行起始地址 4 字节对齐） */
+#define EAT_PAIRWISE   (((EAT_SRC) % 2) == 0 && ((EAT_OFF) % 2) == 0)
 
 /* 逻辑步长 / 滚动速度 */
 #define EAT_STEP_MS    17      /* 每逻辑帧累积的时间（≈16.7ms，和跳一跳一致） */
@@ -108,10 +126,6 @@ static uint32_t s_render_fps_x10;
 static TickType_t s_rate_tick;
 static uint32_t s_rate_logic;
 static uint32_t s_rate_render;
-
-/* 目标行 → 源行（1.5 倍最近邻：src = dst * 2 / 3） */
-static uint8_t s_row[EAT_DST];
-static bool s_geom_ready;
 
 /* 两套素材的帧数（进游戏时算一次） */
 static int s_frames[2];
@@ -278,34 +292,43 @@ static void eat_logic(void)
 
 /* ---------------- 渲染 ---------------- */
 
-static void eat_prepare_geom(void)
-{
-    for (int y = 0; y < EAT_DST; y++) {
-        s_row[y] = (uint8_t)((y * 2) / 3);
-    }
-
-    s_geom_ready = true;
-}
-
-/* 把一帧 160x160 索引图按 1.5 倍最近邻铺满 240x240 */
+/*
+ * 把一帧 EAT_SRC x EAT_SRC 索引图 1:1 居中贴到 240x240。
+ *
+ * 每行就是「索引 → 调色板」查表 + 原样写，不做任何水平/垂直缩放。
+ * 32 位成对写（两个像素拼一个 store），比逐像素 16 位写省一半 store。
+ */
 static void eat_blit(uint16_t *fb, const uint8_t *fr)
 {
     const uint16_t *pal = (const uint16_t *)(const void *)fr;
     const uint8_t *src = fr + EAT_PALETTE;
 
-    for (int y = 0; y < EAT_DST; y++) {
-        const uint8_t *sp = src + (int)s_row[y] * EAT_SRC;
-        uint16_t *dp = fb + y * EAT_DST;
+#if (EAT_OFF > 0)
+    /* 四条黑边：不给缩放留任何借口 */
+    arcade_gfx_fill(fb, 0, 0, EAT_DST, EAT_OFF, 0);
+    arcade_gfx_fill(fb, 0, EAT_OFF + EAT_SRC, EAT_DST,
+                    EAT_DST - EAT_OFF - EAT_SRC, 0);
+    arcade_gfx_fill(fb, 0, EAT_OFF, EAT_OFF, EAT_SRC, 0);
+    arcade_gfx_fill(fb, EAT_OFF + EAT_SRC, EAT_OFF,
+                    EAT_DST - EAT_OFF - EAT_SRC, EAT_SRC, 0);
+#endif
 
-        /* 2 个源像素 → 3 个目标像素，横向一次搞定 */
+    for (int y = 0; y < EAT_SRC; y++) {
+        const uint8_t *sp = src + (size_t)y * EAT_SRC;
+        uint16_t *dp = fb + (size_t)(y + EAT_OFF) * EAT_DST + EAT_OFF;
+
+#if EAT_PAIRWISE
         for (int k = 0; k < EAT_SRC / 2; k++) {
-            uint16_t a = pal[sp[2 * k]];
-            uint16_t b = pal[sp[2 * k + 1]];
+            uint32_t a = pal[sp[2 * k]];
+            uint32_t b = pal[sp[2 * k + 1]];
 
-            dp[3 * k] = a;
-            dp[3 * k + 1] = b;
-            dp[3 * k + 2] = b;
+            ((uint32_t *)(void *)dp)[k] = a | (b << 16);
         }
+#else
+        for (int x = 0; x < EAT_SRC; x++) {
+            dp[x] = pal[sp[x]];
+        }
+#endif
     }
 }
 
@@ -338,10 +361,6 @@ static void eat_idle_screen(uint16_t *fb)
 
 static void eat_render(uint16_t *fb)
 {
-    if (!s_geom_ready) {
-        eat_prepare_geom();
-    }
-
     /* 待机：什么都不铺素材，只显示「按住 / 松开」和下一组 */
     if (g.state == ARCADE_EAT_IDLE) {
         eat_idle_screen(fb);
@@ -403,11 +422,8 @@ void arcade_eat_enter(void)
         g.rng = 0x9E3779B9U;
     }
 
-    if (!s_geom_ready) {
-        eat_prepare_geom();
-    }
-
-    LISA_LOGI(TAG, "enter (g1=%d frames, g2=%d frames)", s_frames[0], s_frames[1]);
+    LISA_LOGI(TAG, "enter (g1=%d frames, g2=%d frames, %dx%d 1:1 at +%d,+%d)",
+              s_frames[0], s_frames[1], EAT_SRC, EAT_SRC, EAT_OFF, EAT_OFF);
 }
 
 void arcade_eat_leave(void)

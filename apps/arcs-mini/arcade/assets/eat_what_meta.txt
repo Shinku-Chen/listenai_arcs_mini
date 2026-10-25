@@ -1,0 +1,6 @@
+# 由 tools/prepare_eat_what.py 生成，勿手改
+res=200
+palette=512
+frame=40512
+frames_g1=20
+frames_g2=21
