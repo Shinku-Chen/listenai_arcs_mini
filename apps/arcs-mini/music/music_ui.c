@@ -27,8 +27,10 @@
 #include <lvgl.h>
 
 #include "lisa_ui_fonts.h"
+#include "lisa_ui_assets.h" /* 配网二维码（与助手固件用的是同一张图） */
 #include "lisa_ui_nav_scr.h"
 #include "sysutils.h"
+#include "sys_wifi.h"
 #include "listen_system.h"
 
 #include "music_app.h"
@@ -99,6 +101,7 @@ static lv_obj_t *s_lbl_hint;
 
 /* 导航页 */
 static lv_obj_t *s_page_menu;
+static lv_obj_t *s_lbl_menu_pos;
 static lv_obj_t *s_menu_row[MUSIC_UI_ROWS];
 static lv_obj_t *s_menu_name[MUSIC_UI_ROWS];
 static lv_obj_t *s_menu_value[MUSIC_UI_ROWS];
@@ -120,6 +123,11 @@ static lv_obj_t *s_page_login;
 static lv_obj_t *s_qr;
 static lv_obj_t *s_lbl_qr_hint;
 static lv_obj_t *s_lbl_logon;
+
+/* 配网页（单应用固件自带，进出同样用 HIDDEN 切换） */
+static lv_obj_t *s_page_netcfg;
+static lv_obj_t *s_lbl_netcfg_state;
+static lv_obj_t *s_lbl_netcfg_hint;
 
 static lv_timer_t *s_timer;
 
@@ -286,6 +294,10 @@ static void build_menu(lv_obj_t *root)
     ui_page_title(s_page_menu, "网易云音乐");
     ui_page_hint(s_page_menu, "单击选择 双击确认 三击返回");
 
+    /* 登录后条目会多出「我的歌单」并滚动，右侧标一下当前位置 */
+    s_lbl_menu_pos = ui_label(s_page_menu, "", C_MUTED_DIM, &lv_font_chinese_16);
+    lv_obj_align(s_lbl_menu_pos, LV_ALIGN_TOP_RIGHT, -12, 3);
+
     for (int i = 0; i < MUSIC_UI_ROWS; ++i) {
         const int y = ROW_Y0 + i * ROW_H;
 
@@ -352,6 +364,26 @@ static void build_login(lv_obj_t *root)
     lv_obj_align(s_lbl_logon, LV_ALIGN_TOP_MID, 0, 186);
 
     ui_page_hint(s_page_login, "双击刷新 三击返回");
+}
+
+static void build_netcfg(lv_obj_t *root)
+{
+    s_page_netcfg = ui_page(root);
+    ui_page_title(s_page_netcfg, "蓝牙配网");
+
+    lv_obj_t *qr = lv_img_create(s_page_netcfg);
+    lv_img_set_src(qr, &png_ble_netcfg_bind_qr_png);
+    lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 30);
+
+    s_lbl_netcfg_state = ui_label(s_page_netcfg, "未连接", C_RED, &lv_font_chinese_16);
+    lv_obj_align(s_lbl_netcfg_state, LV_ALIGN_TOP_MID, 0, 182);
+
+    /* 底部提示：只有「已配过网、用户主动进来重配」时才显示；
+     * 未配网时页面是锁死的，写「三击返回」会误导。 */
+    s_lbl_netcfg_hint = ui_label(s_page_netcfg, "重新配网 · 三击返回", C_MUTED_DIM,
+                                &lv_font_chinese_16);
+    lv_obj_align(s_lbl_netcfg_hint, LV_ALIGN_TOP_MID, 0, 204);
+    lv_obj_add_flag(s_lbl_netcfg_hint, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* ==================== 刷新 ==================== */
@@ -481,14 +513,45 @@ static void refresh_player(const music_ui_model_t *m)
 
 static void refresh_menu(const music_ui_model_t *m)
 {
+    char text[16];
+
+    if (m->menu_count > MUSIC_UI_ROWS) {
+        snprintf(text, sizeof(text), "%u/%u", (unsigned)m->menu_index + 1u,
+                 (unsigned)m->menu_count);
+        ui_set_text(s_lbl_menu_pos, text);
+    } else {
+        ui_set_text(s_lbl_menu_pos, "");
+    }
+
     for (int i = 0; i < MUSIC_UI_ROWS; ++i) {
-        const bool selected = ((uint8_t)i == m->menu_index);
+        const uint8_t index = (uint8_t)(m->menu_window + i);
+
+        if (index >= m->menu_count) {
+            lv_obj_add_flag(s_menu_row[i], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_clear_flag(s_menu_row[i], LV_OBJ_FLAG_HIDDEN);
+
+        const bool selected = (index == m->menu_index);
 
         ui_set_bg(s_menu_row[i], selected ? C_CARD_TOP : C_PANEL);
         ui_set_text(s_menu_name[i], m->menu_name[i]);
         ui_set_text(s_menu_value[i], m->menu_value[i]);
         ui_set_color(s_menu_name[i], selected ? C_AMBER : C_TEXT);
         ui_set_color(s_menu_value[i], selected ? C_AMBER : C_MUTED_DIM);
+    }
+}
+
+static void refresh_netcfg(const music_ui_model_t *m)
+{
+    ui_set_text(s_lbl_netcfg_state, m->net_ok ? "已连接" : "未连接");
+    ui_set_color(s_lbl_netcfg_state, m->net_ok ? C_GREEN : C_RED);
+
+    /* 已配过网（用户主动进来重配）才提示可以退出 */
+    if (sys_wifi_has_ap()) {
+        lv_obj_clear_flag(s_lbl_netcfg_hint, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_lbl_netcfg_hint, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -573,6 +636,7 @@ static void refresh(void)
         lv_obj_add_flag(s_page_list, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_page_lyric, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_page_login, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_page_netcfg, LV_OBJ_FLAG_HIDDEN);
         switch ((music_page_t)m->page) {
         case MUSIC_PAGE_MENU:
             lv_obj_clear_flag(s_page_menu, LV_OBJ_FLAG_HIDDEN);
@@ -585,6 +649,9 @@ static void refresh(void)
             break;
         case MUSIC_PAGE_LOGIN:
             lv_obj_clear_flag(s_page_login, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case MUSIC_PAGE_NETCFG:
+            lv_obj_clear_flag(s_page_netcfg, LV_OBJ_FLAG_HIDDEN);
             break;
         case MUSIC_PAGE_PLAYER:
         default:
@@ -607,6 +674,9 @@ static void refresh(void)
         break;
     case MUSIC_PAGE_LOGIN:
         refresh_login(m);
+        break;
+    case MUSIC_PAGE_NETCFG:
+        refresh_netcfg(m);
         break;
     case MUSIC_PAGE_PLAYER:
     default:
@@ -642,6 +712,7 @@ static void build(void)
     build_list(s_scr);
     build_lyric(s_scr);
     build_login(s_scr);
+    build_netcfg(s_scr);
 
     s_rendered_page = 0xFF;
     s_clock_sec = 0xFF;
@@ -671,9 +742,13 @@ static void destroy(void)
 
     s_page_player = NULL;
     s_page_menu = NULL;
+    s_lbl_menu_pos = NULL;
     s_page_list = NULL;
     s_page_lyric = NULL;
     s_page_login = NULL;
+    s_page_netcfg = NULL;
+    s_lbl_netcfg_state = NULL;
+    s_lbl_netcfg_hint = NULL;
     s_lbl_net = NULL;
     s_lbl_vol = NULL;
     s_lbl_clock = NULL;
@@ -779,8 +854,17 @@ int music_ui_init(void)
 
     if (ret != 0) {
         LOGE("register nav screen failed: %d", ret);
+        return ret;
     }
-    return ret;
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+    /* 单应用固件：音乐页是整个 UI，注册成导航栈默认页（等价于 open + push + show）。
+     * 全功能固件里默认页是 radio 页，音乐页靠 nav_to 抢前台。 */
+    if (lisa_ui_nav_scr_default_set(&s_music_nav_scr) != 0) {
+        LOGE("music_ui_set_default failed");
+        return -1;
+    }
+#endif
+    return 0;
 }
 
 int music_ui_screen_id(void)

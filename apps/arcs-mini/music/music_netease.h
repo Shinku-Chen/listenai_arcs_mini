@@ -73,6 +73,20 @@ typedef struct {
     int64_t ids[MUSIC_SONG_MAX];  /* 只要前几个，用来逐个查详情 */
 } music_playlist_t;
 
+/* 登录用户自己的歌单（最多 MUSIC_USER_PLAYLIST_MAX 个，够了就不再要） */
+#define MUSIC_USER_PLAYLIST_MAX 12
+
+typedef struct {
+    int64_t id;
+    char name[MUSIC_NAME_MAX];
+    int track_count;
+} music_user_playlist_t;
+
+typedef struct {
+    int count;
+    music_user_playlist_t items[MUSIC_USER_PLAYLIST_MAX];
+} music_user_playlist_list_t;
+
 /* 关键词搜索（明文 GET /api/search/get）。keyword 是 UTF-8。 */
 int music_netease_search(const char *keyword, int limit, music_song_list_t *out);
 
@@ -90,6 +104,20 @@ int music_netease_playlist(int64_t playlist_id, music_playlist_t *out);
  * 拿到 key 后二维码内容就是 https://music.163.com/login?codekey=<key>。
  */
 int music_netease_qr_start(char *key, size_t key_size);
+
+/*
+ * 取当前登录账号（EAPI /api/nuser/account/get，需要 cookie）。
+ * 未登录 / cookie 失效时服务端返回 code=200 但 account/profile 都是 null，
+ * 这种情况统一返回 MUSIC_ERR_UNAVAILABLE。
+ * uid_out 必填；nickname 可传 NULL。
+ */
+int music_netease_account(int64_t *uid_out, char *nickname, size_t nickname_size);
+
+/*
+ * 取登录用户自己的歌单（EAPI /api/user/playlist，需要 cookie）。
+ * 未登录时服务端会给 uid=0 的默认列表，所以调用前必须先确认已经登录。
+ */
+int music_netease_user_playlists(int64_t uid, music_user_playlist_list_t *out);
 
 /* 扫码登录轮询状态（保守照搬客户端语义） */
 typedef enum {

@@ -22,6 +22,7 @@
 #include "lisa_log.h"
 
 #include "app_player.h"
+#include "esp_heap_caps.h"
 #include "lisa_kv.h"
 #include "lisa_ui_invoke.h"
 #include "service_volume.h"
@@ -36,6 +37,12 @@
 #include "music_netease.h"
 #include "music_ui.h"
 #include "voice_msg.h"
+
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+/* 单应用固件：关机 / 蓝牙配网都自己接管（没有 radio 模块帮忙） */
+#include "app_ble_common.h"
+#include "power_manager.h"
+#endif
 
 /* ==================== 配置 ==================== */
 
@@ -63,6 +70,15 @@
 
 #define MUSIC_VOLUME_STEP 5
 
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+/* 单应用固件里没有 radio 模块，开机按键保护要自己管：
+ * 用户是「长按功能键 3 s」开机的，松手那一下会被按键驱动识别成 CLICK / LONG_HOLD，
+ * 不忽略就会「刚开机就切歌」甚至「刚开机又关机」。 */
+#define MUSIC_BOOT_KEY_GUARD_MS 6000
+
+static void music_netcfg_enter(void);
+#endif
+
 #define MUSIC_KV_KEY_COOKIE "music.cookie"
 
 /* shell 结果行：SHELL_PRINT_BUFFER 是 128，留一点余量 */
@@ -79,9 +95,23 @@ static const struct {
     {"飙升榜", 19723756},
 };
 #define MUSIC_PLAYLIST_COUNT ((uint8_t)(sizeof(s_playlists) / sizeof(s_playlists[0])))
-#define MUSIC_MENU_LYRIC     MUSIC_PLAYLIST_COUNT
-#define MUSIC_MENU_LOGIN     (MUSIC_PLAYLIST_COUNT + 1)
-#define MUSIC_MENU_COUNT     (MUSIC_PLAYLIST_COUNT + 2)
+
+/*
+ * 导航页条目。登录后「我的歌单」会动态插在最前面，所以条目数不是编译期常量：
+ *   [我的歌单 …] + 热歌榜 / 新歌榜 / 飙升榜 + 歌词 + 扫码登录
+ * 未登录时（无 cookie）就只有后面 5 条，和一屏的高度恰好一致。
+ */
+typedef enum {
+    MUSIC_ITEM_MY = 0, /* 登录用户自己的歌单（index 指向 s_state.my） */
+    MUSIC_ITEM_CHART,  /* 官方榜单（index 指向 s_playlists） */
+    MUSIC_ITEM_LYRIC,
+    MUSIC_ITEM_LOGIN,
+} music_item_kind_t;
+
+typedef struct {
+    uint8_t kind;  /* music_item_kind_t */
+    uint8_t index;
+} music_item_t;
 
 /* ==================== 请求 ==================== */
 
@@ -94,6 +124,7 @@ typedef enum {
     MUSIC_REQ_LYRIC,     /* 只重拉歌词 */
     MUSIC_REQ_QR_START,  /* 申请二维码 */
     MUSIC_REQ_QR_POLL,   /* 手动查询一次登录状态 */
+    MUSIC_REQ_ACCOUNT,   /* 登录后取账号信息 + 我的歌单 */
     MUSIC_REQ_SEARCH,    /* shell：搜索 */
     MUSIC_REQ_CHAIN,     /* shell：全链路 */
 } music_req_kind_t;
@@ -140,9 +171,17 @@ typedef struct {
     char cookie[512];
     char qr_url[MUSIC_QR_URL_MAX];
 
+    /* 登录账号 + 「我的歌单」（扫码成功后才会有内容） */
+    int64_t uid;
+    bool account_loaded;
+    bool account_pending; /* 开机恢复过 cookie，联网后要补拉账号/我的歌单 */
+    char nickname[MUSIC_NAME_MAX];
+    music_user_playlist_list_t my;
+
     /* 杂项 */
     volatile bool net_ok;
     bool busy;
+    uint32_t boot_ms;
     char detail[MUSIC_SUB_MAX];
 } music_state_t;
 
@@ -150,6 +189,8 @@ static music_state_t s_state __psram_bss__;
 static music_song_t s_songs[MUSIC_SONGS_MAX] __psram_bss__;
 /* 详情接口的输出缓冲：10 首 * ~370 字节，不能放 6 KB 的工作线程栈里 */
 static music_song_list_t s_song_buf __psram_bss__;
+/* 接口输出缓冲：登录账号 / 我的歌单（12 个 × 76 字节，不能放 8 KB 工作线程栈） */
+static music_user_playlist_list_t s_my_buf __psram_bss__;
 static char s_lyric_text[MUSIC_LYRIC_MAX][MUSIC_LYRIC_LINE] __psram_bss__;
 static char s_lrc_raw[MUSIC_LRC_CAP] __psram_bss__;
 
@@ -161,10 +202,12 @@ static TaskHandle_t s_task;
 static struct {
     volatile music_req_kind_t kind;
     uint8_t arg;
+    int64_t playlist_id; /* MUSIC_REQ_PLAYLIST：要加载的歌单 id */
     volatile bool busy;
     volatile bool next_pending;
     int err;
     char keyword[MUSIC_NAME_MAX];
+    char title[MUSIC_TITLE_MAX]; /* MUSIC_REQ_PLAYLIST：列表标题 */
     int line_count;
     char lines[MUSIC_LOG_LINES][MUSIC_LOG_LINE];
 } s_req __psram_bss__;
@@ -210,6 +253,47 @@ static const music_song_t *music_song_locked(uint8_t index)
         return NULL;
     }
     return &s_songs[index];
+}
+
+/* ==================== 导航页条目 ==================== */
+
+/* 条目总数（锁内调用）：未登录 = 3 榜单 + 歌词 + 扫码登录 = 5 */
+static uint8_t music_menu_count_locked(void)
+{
+    return (uint8_t)(s_state.my.count + MUSIC_PLAYLIST_COUNT + 2u);
+}
+
+/* 把菜单下标翻译成具体条目（锁内调用） */
+static bool music_menu_item_locked(uint8_t index, music_item_t *out)
+{
+    uint8_t rest;
+
+    if (out == NULL) {
+        return false;
+    }
+    if (index < s_state.my.count) {
+        out->kind = MUSIC_ITEM_MY;
+        out->index = index;
+        return true;
+    }
+    rest = (uint8_t)(index - s_state.my.count);
+    if (rest < MUSIC_PLAYLIST_COUNT) {
+        out->kind = MUSIC_ITEM_CHART;
+        out->index = rest;
+        return true;
+    }
+    rest = (uint8_t)(rest - MUSIC_PLAYLIST_COUNT);
+    if (rest == 0) {
+        out->kind = MUSIC_ITEM_LYRIC;
+        out->index = 0;
+        return true;
+    }
+    if (rest == 1) {
+        out->kind = MUSIC_ITEM_LOGIN;
+        out->index = 0;
+        return true;
+    }
+    return false;
 }
 
 /* ==================== shell 结果行 ==================== */
@@ -618,12 +702,12 @@ static void music_play_prev(void)
 }
 
 /* 工作线程：加载歌单（详情拿 id 列表 → 详情接口拿歌名/歌手/封面） */
-static void music_load_playlist(uint8_t menu_index)
+static void music_load_playlist(int64_t playlist_id, const char *title)
 {
     music_playlist_t playlist;
     int err;
 
-    if (menu_index >= MUSIC_PLAYLIST_COUNT) {
+    if (playlist_id <= 0) {
         s_req.err = MUSIC_ERR_PARAM;
         return;
     }
@@ -633,7 +717,7 @@ static void music_load_playlist(uint8_t menu_index)
     music_set_detail("正在加载歌单 …");
     music_unlock();
 
-    err = music_netease_playlist(s_playlists[menu_index].id, &playlist);
+    err = music_netease_playlist(playlist_id, &playlist);
     if (err != MUSIC_OK) {
         LOGW("playlist failed: %d(%s)", err, music_err_text(err));
         music_lock();
@@ -663,16 +747,19 @@ static void music_load_playlist(uint8_t menu_index)
     memcpy(s_songs, s_song_buf.items, (size_t)s_song_buf.count * sizeof(music_song_t));
     s_state.count = (uint8_t)s_song_buf.count;
     s_state.list_index = 0;
-    s_state.playlist_id = s_playlists[menu_index].id;
-    snprintf(s_state.list_title, sizeof(s_state.list_title), "%s", s_playlists[menu_index].name);
+    s_state.playlist_id = playlist_id;
+    snprintf(s_state.list_title, sizeof(s_state.list_title), "%s",
+             (title != NULL && title[0] != '\0') ? title : playlist.name);
     music_set_detail(NULL);
     music_unlock();
 
-    LOGI("playlist %s loaded: %u songs", s_playlists[menu_index].name,
+    LOGI("playlist %s(%lld) loaded: %u songs", playlist.name, (long long)playlist_id,
          (unsigned)s_song_buf.count);
 }
 
 /* ==================== 扫码登录 ==================== */
+
+static void music_fetch_account(void);
 
 static void music_qr_start(void)
 {
@@ -736,6 +823,8 @@ static void music_qr_poll_once(void)
             /* KV 写 flash 不能在持锁时做（要几十毫秒，会拖住渲染抽帧） */
             music_netease_set_cookie(s_state.cookie);
             (void)lisa_kv_set_string(MUSIC_KV_KEY_COOKIE, s_state.cookie);
+            /* 登录态生效后立刻取账号 + 我的歌单，导航页顶部就会出现它们 */
+            music_fetch_account();
         } else {
             /* 少数情况下 803 不带 Set-Cookie：别假装登录成功 */
             music_set_detail("登录返回成功但没拿到 cookie");
@@ -755,13 +844,68 @@ static void music_qr_poll_once(void)
     music_unlock();
 }
 
+/*
+ * 工作线程：取登录账号 + 我的歌单。
+ * 调用时机：扫码 803 成功后、开机恢复 cookie 后（网络已就绪）。
+ * cookie 失效时服务端回 code=200 但 account/profile 为 null，按“未登录”处理。
+ */
+static void music_fetch_account(void)
+{
+    int64_t uid = 0;
+    char nickname[MUSIC_NAME_MAX];
+    int err;
+
+    nickname[0] = '\0';
+    err = music_netease_account(&uid, nickname, sizeof(nickname));
+    if (err != MUSIC_OK) {
+        music_lock();
+        s_state.uid = 0;
+        s_state.my.count = 0;
+        s_state.account_loaded = false;
+        s_state.menu_index = 0;
+        /* 有 cookie 才叫“失效”，从未登录就别给用户看红字 */
+        music_set_detail((s_state.cookie[0] != '\0') ? "登录态已失效，可重新扫码" : NULL);
+        music_unlock();
+        LOGW("account fetch failed: %d(%s)", err, music_err_text(err));
+        return;
+    }
+
+    music_lock();
+    s_state.uid = uid;
+    snprintf(s_state.nickname, sizeof(s_state.nickname), "%s", nickname);
+    music_unlock();
+
+    memset(&s_my_buf, 0, sizeof(s_my_buf));
+    err = music_netease_user_playlists(uid, &s_my_buf);
+
+    music_lock();
+    memset(&s_state.my, 0, sizeof(s_state.my));
+    if (err == MUSIC_OK) {
+        memcpy(&s_state.my, &s_my_buf, sizeof(s_state.my));
+    }
+    s_state.account_loaded = true;
+    if (s_state.menu_index >= music_menu_count_locked()) {
+        s_state.menu_index = 0;
+    }
+    music_set_detail(NULL);
+    music_unlock();
+
+    LOGI("account %s uid=%lld playlists=%d (err=%d)", nickname, (long long)uid,
+         (int)s_state.my.count, err);
+    log_line("account %s uid=%lld playlists=%d", nickname, (long long)uid,
+             (int)s_state.my.count);
+}
+
 /* ==================== 工作线程 ==================== */
 
 static void music_execute(void)
 {
     switch (s_req.kind) {
     case MUSIC_REQ_PLAYLIST:
-        music_load_playlist(s_req.arg);
+        music_load_playlist(s_req.playlist_id, s_req.title);
+        break;
+    case MUSIC_REQ_ACCOUNT:
+        music_fetch_account();
         break;
     case MUSIC_REQ_PLAY:
         s_req.err = music_play_index(s_req.arg, false);
@@ -887,17 +1031,48 @@ static void music_tick(void)
 {
     sys_network_status_t status;
     bool net_ok = false;
+    bool net_up_event = false;
 
     if (sys_network_get_status(&status) == 0) {
         net_ok = status.connected;
     }
+    net_up_event = (net_ok && !s_state.net_ok);
     s_state.net_ok = net_ok;
 
-    /* 开机进页：只有配过网才抢默认页，否则让 radio 的配网二维码留在前台 */
-    if (!s_state.started && sys_wifi_has_ap()) {
+    /* 开机进页只做一次 */
+    if (!s_state.started) {
         s_state.started = true;
-        LISA_UI_INVOKE_UI_ARG_NONE({ music_ui_show(); });
-        LOGI("music page is the front page now (net=%d)", (int)net_ok);
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+        /* 单应用固件：音乐页是唯一页面。没配过网就直接停在配网页并开始广播，
+         * 配网成功后（下面 net_up_event）自动回播放页。 */
+        if (!sys_wifi_has_ap()) {
+            LOGI("no saved wifi, boot into netcfg page");
+            music_netcfg_enter();
+        }
+#else
+        /* 全功能固件：只有配过网才抢默认页，否则让 radio 的配网二维码留在前台 */
+        if (sys_wifi_has_ap()) {
+            LISA_UI_INVOKE_UI_ARG_NONE({ music_ui_show(); });
+            LOGI("music page is the front page now (net=%d)", (int)net_ok);
+        }
+#endif
+    }
+
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+    /* 配网成功：离开配网页回播放页 */
+    if (net_up_event && (music_page_t)s_state.page == MUSIC_PAGE_NETCFG) {
+        music_lock();
+        s_state.page = MUSIC_PAGE_PLAYER;
+        music_set_detail(NULL);
+        music_unlock();
+        LOGI("provisioned, back to player page");
+    }
+#endif
+
+    /* 开机恢复了 cookie：等网络就绪后补拉一次账号 + 我的歌单 */
+    if (s_state.account_pending && net_ok) {
+        s_state.account_pending = false;
+        music_fetch_account();
     }
 
     if (music_player != NULL) {
@@ -994,7 +1169,10 @@ bool music_app_get_model(music_ui_model_t *out)
     snprintf(out->detail, sizeof(out->detail), "%s", s_state.detail);
     snprintf(out->list_title, sizeof(out->list_title), "%s", s_state.list_title);
     snprintf(out->qr_url, sizeof(out->qr_url), "%s", s_state.qr_url);
-    snprintf(out->logon, sizeof(out->logon), "%s", (s_state.cookie[0] != '\0') ? "已登录" : "未登录");
+    snprintf(out->logon, sizeof(out->logon), "%s",
+             (s_state.cookie[0] == '\0')
+                 ? "未登录"
+                 : (s_state.nickname[0] != '\0' ? s_state.nickname : "已登录"));
 
     const music_song_t *song = music_song_locked(s_state.current);
     if (song != NULL) {
@@ -1008,22 +1186,58 @@ bool music_app_get_model(music_ui_model_t *out)
         snprintf(out->album, sizeof(out->album), "热歌榜 · 新歌榜 · 飙升榜");
     }
 
-    /* 导航页：3 个推荐歌单 + 歌词 + 扫码登录 */
-    for (uint8_t i = 0; i < MUSIC_MENU_COUNT; i++) {
-        if (i < MUSIC_PLAYLIST_COUNT) {
-            snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "%s", s_playlists[i].name);
-            if (s_state.playlist_id == s_playlists[i].id && s_state.count > 0) {
+    /* 导航页：我的歌单（已登录时插在最前）+ 3 个榜单 + 歌词 + 扫码登录，一屏 5 条滚动 */
+    const uint8_t menu_count = music_menu_count_locked();
+    uint8_t menu_window = (uint8_t)(s_state.menu_index / MUSIC_UI_ROWS * MUSIC_UI_ROWS);
+
+    if (menu_count > MUSIC_UI_ROWS && menu_window + MUSIC_UI_ROWS > menu_count) {
+        menu_window = (uint8_t)(menu_count - MUSIC_UI_ROWS);
+    }
+    out->menu_count = menu_count;
+    out->menu_window = menu_window;
+    for (uint8_t i = 0; i < MUSIC_UI_ROWS; i++) {
+        const uint8_t index = (uint8_t)(menu_window + i);
+        music_item_t item;
+
+        if (index >= menu_count || !music_menu_item_locked(index, &item)) {
+            continue;
+        }
+        switch (item.kind) {
+        case MUSIC_ITEM_MY: {
+            const music_user_playlist_t *my = &s_state.my.items[item.index];
+
+            snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "%s", my->name);
+            if (s_state.playlist_id == my->id && s_state.count > 0) {
+                snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%u 首",
+                         (unsigned)s_state.count);
+            } else if (my->track_count > 0) {
+                snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%d 首",
+                         my->track_count);
+            }
+            break;
+        }
+        case MUSIC_ITEM_CHART: {
+            const uint8_t chart = item.index;
+
+            snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "%s", s_playlists[chart].name);
+            if (s_state.playlist_id == s_playlists[chart].id && s_state.count > 0) {
                 snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%u 首",
                          (unsigned)s_state.count);
             }
-        } else if (i == MUSIC_MENU_LYRIC) {
+            break;
+        }
+        case MUSIC_ITEM_LYRIC:
             snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "歌词");
             snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%s",
                      (s_state.lyric_count > 0) ? "有" : "无");
-        } else {
+            break;
+        default:
             snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "扫码登录");
             snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%s",
-                     (s_state.cookie[0] != '\0') ? "已登录" : "未登录");
+                     (s_state.cookie[0] != '\0')
+                         ? (s_state.nickname[0] != '\0' ? s_state.nickname : "已登录")
+                         : "未登录");
+            break;
         }
     }
 
@@ -1169,18 +1383,41 @@ static void music_toggle_play(void)
 
 static void music_menu_enter(void)
 {
+    music_item_t item;
+    int64_t playlist_id = 0;
+    char title[MUSIC_TITLE_MAX] = {0};
+    bool ok;
+
     music_lock();
-    const uint8_t index = s_state.menu_index;
+    ok = music_menu_item_locked(s_state.menu_index, &item);
+    if (ok) {
+        switch (item.kind) {
+        case MUSIC_ITEM_MY:
+            playlist_id = s_state.my.items[item.index].id;
+            snprintf(title, sizeof(title), "%s", s_state.my.items[item.index].name);
+            break;
+        case MUSIC_ITEM_CHART:
+            playlist_id = s_playlists[item.index].id;
+            snprintf(title, sizeof(title), "%s", s_playlists[item.index].name);
+            break;
+        default:
+            break;
+        }
+    }
     music_unlock();
 
-    if (index < MUSIC_PLAYLIST_COUNT) {
+    if (!ok) {
+        return;
+    }
+    if (item.kind == MUSIC_ITEM_MY || item.kind == MUSIC_ITEM_CHART) {
         s_state.page = MUSIC_PAGE_SONGLIST;
         s_req.kind = MUSIC_REQ_PLAYLIST;
-        s_req.arg = index;
+        s_req.playlist_id = playlist_id;
+        snprintf(s_req.title, sizeof(s_req.title), "%s", title);
         (void)xSemaphoreGive(s_signal);
         return;
     }
-    if (index == MUSIC_MENU_LYRIC) {
+    if (item.kind == MUSIC_ITEM_LYRIC) {
         s_state.page = MUSIC_PAGE_LYRIC;
         return;
     }
@@ -1200,11 +1437,26 @@ static void music_back(void)
     case MUSIC_PAGE_MENU:
     case MUSIC_PAGE_LYRIC:
     case MUSIC_PAGE_LOGIN:
+    case MUSIC_PAGE_NETCFG:
     case MUSIC_PAGE_PLAYER:
     default:
         s_state.page = MUSIC_PAGE_PLAYER;
         break;
     }
+}
+
+/*
+ * 蓝牙配网页：屏幕换成配网二维码，并开始广播。
+ * 单应用固件（没有 radio 模块）由音乐页自己提供这个入口（五/六/七击）。
+ */
+static void music_netcfg_enter(void)
+{
+    music_lock();
+    s_state.page = MUSIC_PAGE_NETCFG;
+    music_set_detail(NULL);
+    music_unlock();
+    app_ble_netcfg_adv_start_delayed();
+    LOGI("ble netcfg requested by button");
 }
 
 bool music_app_handle_action(int action)
@@ -1213,12 +1465,54 @@ bool music_app_handle_action(int action)
         return false;
     }
 
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+    /* 开机按键保护：长按开机时松手那一下会被当成 CLICK/LONG_HOLD */
+    if ((uint32_t)(music_now_ms() - s_state.boot_ms) < MUSIC_BOOT_KEY_GUARD_MS) {
+        LOGI("ignore button %d during boot guard", action);
+        return true;
+    }
+
+    /* 未配网时锁在配网页：只允许关机（长按）和重新发起配网（5/6/7） */
+    if ((music_page_t)s_state.page == MUSIC_PAGE_NETCFG && !sys_wifi_has_ap()) {
+        if (action != VOICE_MSG_BUTTON_ACTION_LONG_HOLD &&
+            action != VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK &&
+            action != VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK &&
+            action != VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK) {
+            LOGI("netcfg page locked until provisioned (action=%d)", action);
+            return true;
+        }
+    }
+
+    switch (action) {
+    case VOICE_MSG_BUTTON_ACTION_LONG_HOLD:
+        /* 长按 = 关机：单应用固件里没有 radio 的系统语义，自己来 */
+        LOGI("power button long hold, shutting down");
+        power_shutdown();
+        return true;
+    case VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK:
+    case VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK:
+    case VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK:
+        music_netcfg_enter();
+        return true;
+    default:
+        break;
+    }
+#endif
+
     switch (action) {
     case VOICE_MSG_BUTTON_ACTION_CLICK:
         switch ((music_page_t)s_state.page) {
-        case MUSIC_PAGE_MENU:
-            s_state.menu_index = (uint8_t)((s_state.menu_index + 1u) % MUSIC_MENU_COUNT);
+        case MUSIC_PAGE_MENU: {
+            /* 条目数随登录态变化（我的歌单是动态的），所以模数要取实时值 */
+            music_lock();
+            const uint8_t menu_count = music_menu_count_locked();
+            music_unlock();
+
+            if (menu_count > 0) {
+                s_state.menu_index = (uint8_t)((s_state.menu_index + 1u) % menu_count);
+            }
             break;
+        }
         case MUSIC_PAGE_SONGLIST:
             if (s_state.count > 0) {
                 s_state.list_index = (uint8_t)((s_state.list_index + 1u) % s_state.count);
@@ -1272,13 +1566,13 @@ bool music_app_handle_action(int action)
         return true;
 
     case VOICE_MSG_BUTTON_ACTION_LONG_HOLD:
-        /* 关机交给 radio 的系统语义 */
+        /* 长按 = 关机（全功能固件里由 radio 的系统语义执行） */
         return false;
 
     case VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK:
-        /* 配网交给 radio（它会把自己切到配网页） */
+        /* 配网：单应用固件已在上面的分支处理，全功能固件交给 radio */
         return false;
 
     default:
@@ -1318,6 +1612,13 @@ static int music_submit(music_req_kind_t kind, uint8_t arg, const char *keyword)
     return 0;
 }
 
+static int music_submit_list(int64_t playlist_id, const char *title)
+{
+    s_req.playlist_id = playlist_id;
+    snprintf(s_req.title, sizeof(s_req.title), "%s", (title != NULL) ? title : "");
+    return music_submit(MUSIC_REQ_PLAYLIST, 0, NULL);
+}
+
 static void music_print_lines(Shell *shell)
 {
     for (int i = 0; i < s_req.line_count; i++) {
@@ -1355,6 +1656,7 @@ static int music_cmd_ui(const char *name)
         {"songlist", MUSIC_PAGE_SONGLIST},
         {"lyric", MUSIC_PAGE_LYRIC},
         {"login", MUSIC_PAGE_LOGIN},
+        {"netcfg", MUSIC_PAGE_NETCFG},
     };
 
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
@@ -1400,6 +1702,13 @@ static int music_cmd(int argc, char *argv[])
         shellPrint(shell, "  qr=%u logon=%s art=%d detail=%s\n", (unsigned)s_state.qr_state,
                    s_state.cookie[0] != '\0' ? "yes" : "no", s_state.art.length,
                    s_state.detail[0] != '\0' ? s_state.detail : "-");
+        shellPrint(shell, "  uid=%lld nick=%s my=%d menu=%u/%u\n", (long long)s_state.uid,
+                   s_state.nickname[0] != '\0' ? s_state.nickname : "-",
+                   (int)s_state.my.count, (unsigned)s_state.menu_index,
+                   (unsigned)music_menu_count_locked());
+        shellPrint(shell, "  psram free=%u sram free=%u\n",
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         return 0;
     }
 
@@ -1443,8 +1752,11 @@ static int music_cmd(int argc, char *argv[])
         case 6:
             ret = music_submit(MUSIC_REQ_QR_POLL, 0, NULL);
             break;
+        case 7:
+            ret = music_submit(MUSIC_REQ_ACCOUNT, 0, NULL);
+            break;
         default:
-            shellPrint(shell, "usage: music api <1..6>\n");
+            shellPrint(shell, "usage: music api <1..7>\n");
             return -1;
         }
     } else if (strcmp(sub, "search") == 0) {
@@ -1456,7 +1768,48 @@ static int music_cmd(int argc, char *argv[])
             shellPrint(shell, "usage: music playlist <0..%d>\n", (int)MUSIC_PLAYLIST_COUNT - 1);
             return -1;
         }
-        ret = music_submit(MUSIC_REQ_PLAYLIST, (uint8_t)index, NULL);
+        ret = music_submit_list(s_playlists[index].id, s_playlists[index].name);
+    } else if (strcmp(sub, "my") == 0) {
+        /* 登录后自己的歌单（order 与导航页顶部一致） */
+        const int index = (argc >= 3) ? atoi(argv[2]) : 0;
+
+        if (index < 0 || index >= (int)s_state.my.count) {
+            shellPrint(shell, "music: my playlists=%d (login first?)\n", (int)s_state.my.count);
+            return -1;
+        }
+        ret = music_submit_list(s_state.my.items[index].id, s_state.my.items[index].name);
+    } else if (strcmp(sub, "account") == 0) {
+        ret = music_submit(MUSIC_REQ_ACCOUNT, 0, NULL);
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+    } else if (strcmp(sub, "key") == 0) {
+        /* 单应用固件里按键全归音乐页，这里直接注入一个动作（真机验收用） */
+        static const struct {
+            const char *name;
+            int action;
+        } keys[] = {
+            {"click", VOICE_MSG_BUTTON_ACTION_CLICK},
+            {"double", VOICE_MSG_BUTTON_ACTION_DOUBLE_CLICK},
+            {"triple", VOICE_MSG_BUTTON_ACTION_TRIPLE_CLICK},
+            {"quad", VOICE_MSG_BUTTON_ACTION_QUADRUPLE_CLICK},
+            {"five", VOICE_MSG_BUTTON_ACTION_QUINTUPLE_CLICK},
+            {"six", VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK},
+            {"seven", VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK},
+            {"long", VOICE_MSG_BUTTON_ACTION_LONG_HOLD},
+        };
+        const char *name = (argc >= 3) ? argv[2] : "click";
+
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+            if (strcmp(name, keys[i].name) == 0) {
+                shellPrint(shell, "music: key %s -> %d, page=%u\n", name, keys[i].action,
+                           (unsigned)s_state.page);
+                (void)music_app_handle_action(keys[i].action);
+                shellPrint(shell, "  page=%u now\n", (unsigned)s_state.page);
+                return 0;
+            }
+        }
+        shellPrint(shell, "usage: music key click|double|triple|quad|five|six|seven|long\n");
+        return -1;
+#endif
     } else if (strcmp(sub, "play") == 0) {
         const int index = (argc >= 3) ? atoi(argv[2]) : 0;
 
@@ -1492,8 +1845,8 @@ static int music_cmd(int argc, char *argv[])
         }
         return 0;
     } else {
-        shellPrint(shell, "usage: music [stat|stop|ui <page>|api <n>|search|playlist|play|"
-                          "next|prev|lyrics|login start|poll|chain|song]\n");
+        shellPrint(shell, "usage: music [stat|stop|ui <page>|api <n>|search|playlist|my|account|"
+                          "key|play|next|prev|lyrics|login start|poll|chain|song]\n");
         return -1;
     }
 
@@ -1516,7 +1869,7 @@ static int music_cmd(int argc, char *argv[])
 SHELL_EXPORT_CMD(SHELL_CMD_PERMISSION(0) | SHELL_CMD_TYPE(SHELL_TYPE_CMD_MAIN) |
                      SHELL_CMD_DISABLE_RETURN,
                  music, music_cmd,
-                 music [stat|stop|ui|api|search|playlist|play|next|prev|lyrics|login|chain|song]);
+                 music [stat|stop|ui|api|search|playlist|my|account|key|play|next|prev|lyrics|login|chain|song]);
 
 /* ==================== 初始化 ==================== */
 
@@ -1528,9 +1881,28 @@ static void music_restore_kv(void)
         snprintf(s_state.cookie, sizeof(s_state.cookie), "%s", value);
         lisa_kv_free(value);
         music_netease_set_cookie(s_state.cookie);
+        /* 登录态是持久的：等网络就绪后补拉账号 + 我的歌单 */
+        s_state.account_pending = true;
         LOGI("restored login cookie (%u bytes)", (unsigned)strlen(s_state.cookie));
     }
 }
+
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+/* 按键消息回调（订阅 VOICE_MSG_BUTTON_CHANGE；全功能固件里这条路由 radio 转发） */
+static void music_on_button(void *unused, uint32_t msg_id, void *data, uint32_t len,
+                           void *user_data)
+{
+    (void)unused;
+    (void)msg_id;
+    (void)user_data;
+
+    const voice_msg_button_evt_t *evt = (const voice_msg_button_evt_t *)data;
+    if (evt == NULL || len < sizeof(*evt) || evt->button_id != 0) {
+        return;
+    }
+    (void)music_app_handle_action((int)evt->action);
+}
+#endif
 
 int music_app_init(void)
 {
@@ -1570,6 +1942,12 @@ int music_app_init(void)
     }
 
     s_state.inited = true;
+    s_state.boot_ms = music_now_ms();
+
+#ifdef CONFIG_NETEASE_MUSIC_ONLY
+    /* 单应用固件：按键由音乐页自己订阅（全功能固件里由 radio 转发过来） */
+    (void)voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, music_on_button, NULL);
+#endif
 
     if (music_ui_init() != 0) {
         LOGE("music_ui_init failed");

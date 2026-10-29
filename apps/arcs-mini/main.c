@@ -47,13 +47,18 @@ int main(int argc, char **argv)
         lisa_ui_lvgl_run();
     }
 
-    /* 电台把自己注册成导航栈的默认页面（整个 UI 就是它）并开始播放 */
+    /* 电台把自己注册成导航栈的默认页面（整个 UI 就是它）并开始播放。
+     * 网易云单应用固件（CONFIG_NETEASE_MUSIC_ONLY）不编译电台，默认页��音乐页。 */
+#ifdef CONFIG_RADIO
     {
         extern int radio_app_init(void);
         if (radio_app_init() != 0) {
             LOGE("radio init failed");
         }
     }
+#else
+    LOGI("radio module disabled, music page takes the whole UI");
+#endif
 
     /* 网易云音乐（里程碑 2）：起工作线程 + 注册导航 id 93 的音乐页，
      * 并把前台页面从电台页接管过来（配过网才会真的抢页，未配网时

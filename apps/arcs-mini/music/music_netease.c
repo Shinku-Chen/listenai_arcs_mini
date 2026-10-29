@@ -697,6 +697,108 @@ int music_netease_qr_poll(const char *key, int *state, char *cookie_out, size_t 
     return MUSIC_OK;
 }
 
+int music_netease_account(int64_t *uid_out, char *nickname, size_t nickname_size)
+{
+    music_http_resp_t resp;
+    cJSON *root;
+    const cJSON *profile;
+    const cJSON *account;
+    int ret;
+
+    if (uid_out == NULL) {
+        return MUSIC_ERR_PARAM;
+    }
+    *uid_out = 0;
+    if (nickname != NULL && nickname_size > 0) {
+        nickname[0] = '\0';
+    }
+
+    ret = eapi_post("/api/nuser/account/get", "{}", &resp);
+    if (ret != MUSIC_OK) {
+        music_http_resp_free(&resp);
+        return ret;
+    }
+    root = parse_eapi_root(&resp);
+    music_http_resp_free(&resp);
+    if (root == NULL) {
+        return MUSIC_ERR_JSON;
+    }
+
+    profile = cJSON_GetObjectItemCaseSensitive(root, "profile");
+    account = cJSON_GetObjectItemCaseSensitive(root, "account");
+    if (cJSON_IsObject(profile)) {
+        *uid_out = json_i64(cJSON_GetObjectItemCaseSensitive(profile, "userId"));
+        if (nickname != NULL && nickname_size > 0) {
+            copy_text(nickname, nickname_size, json_text(profile, "nickname"));
+        }
+    }
+    if (*uid_out <= 0 && cJSON_IsObject(account)) {
+        *uid_out = json_i64(cJSON_GetObjectItemCaseSensitive(account, "id"));
+    }
+    cJSON_Delete(root);
+
+    /* 未登录时服务端照样返回 200，只是 account/profile 为 null */
+    return (*uid_out > 0) ? MUSIC_OK : MUSIC_ERR_UNAVAILABLE;
+}
+
+int music_netease_user_playlists(int64_t uid, music_user_playlist_list_t *out)
+{
+    char json[128];
+    music_http_resp_t resp;
+    cJSON *root;
+    const cJSON *list;
+    const cJSON *item;
+    int ret;
+
+    if (uid < 0 || out == NULL) {
+        return MUSIC_ERR_PARAM;
+    }
+    memset(out, 0, sizeof(*out));
+
+    snprintf(json, sizeof(json), "{\"uid\":%lld,\"limit\":%d,\"offset\":0}", (long long)uid,
+             MUSIC_USER_PLAYLIST_MAX);
+
+    ret = eapi_post("/api/user/playlist", json, &resp);
+    if (ret != MUSIC_OK) {
+        music_http_resp_free(&resp);
+        return ret;
+    }
+    root = parse_eapi_root(&resp);
+    music_http_resp_free(&resp);
+    if (root == NULL) {
+        return MUSIC_ERR_JSON;
+    }
+
+    list = cJSON_GetObjectItemCaseSensitive(root, "playlist");
+    if (!cJSON_IsArray(list)) {
+        cJSON_Delete(root);
+        return MUSIC_ERR_JSON;
+    }
+    cJSON_ArrayForEach(item, list) {
+        music_user_playlist_t *slot;
+
+        if (out->count >= MUSIC_USER_PLAYLIST_MAX) {
+            break;
+        }
+        if (!cJSON_IsObject(item)) {
+            continue;
+        }
+        slot = &out->items[out->count];
+        slot->id = json_i64(cJSON_GetObjectItemCaseSensitive(item, "id"));
+        if (slot->id <= 0) {
+            continue;
+        }
+        copy_text(slot->name, sizeof(slot->name), json_text(item, "name"));
+        slot->track_count = (int)json_i64(cJSON_GetObjectItemCaseSensitive(item, "trackCount"));
+        if (slot->name[0] == '\0') {
+            snprintf(slot->name, sizeof(slot->name), "歌单 %lld", (long long)slot->id);
+        }
+        out->count++;
+    }
+    cJSON_Delete(root);
+    return MUSIC_OK;
+}
+
 int music_netease_lyric(int64_t id, char *lrc, size_t lrc_size)
 {
     char url[160];

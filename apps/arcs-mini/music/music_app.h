@@ -10,18 +10,19 @@
  *
  * 页面（都是同一个 nav screen 里的子页，用 HIDDEN 切换）：
  *   PLAYER   播放页：封面 / 歌名 / 歌手 / 进度 / 当前歌词 / 提示
- *   MENU     导航页：3 个推荐歌单 + 歌词 + 扫码登录
+ *   MENU     导航页：我的歌单（登录后）+ 3 个推荐歌单 + 歌词 + 扫码登录
  *   SONGLIST 歌曲列表（最多 10 首，两行式）
  *   LYRIC    歌词页（当前行 + 上下各两行）
  *   LOGIN    扫码登录（二维码 + 轮询状态）
+ *   NETCFG   蓝牙配网页（单应用固件自带，等价于原来 radio 的配网页）
  *
  * 按键（单键，与电量键系统语义保持一致）：
  *   单击 PLAYER=下一首 / MENU=下移 / SONGLIST=下移 / LYRIC=下一首 / LOGIN=刷新二维码
  *   双击 PLAYER=播放暂停 / MENU=进入 / SONGLIST=播放选中 / LYRIC=播放暂停 / LOGIN=立即查询
  *   三击 PLAYER=进导航页 / 子页=回上一级（SONGLIST→MENU，其余→PLAYER）
  *   四击 同三击
- *   长按 关机（交给 radio 的系统语义处理，music 不消费）
- *   5/6/7 击 交给 radio 进 BLE 配网页
+ *   长按 关机（单应用固件里由本模块调 power_shutdown()，否则交给 radio）
+ *   5/6/7 击 蓝牙配网页（单应用固件里由本模块处理，否则交给 radio）
  */
 #ifndef __MUSIC_APP_H__
 #define __MUSIC_APP_H__
@@ -42,12 +43,15 @@ typedef enum {
     MUSIC_PAGE_SONGLIST,
     MUSIC_PAGE_LYRIC,
     MUSIC_PAGE_LOGIN,
+    MUSIC_PAGE_NETCFG, /* 蓝牙配网（单应用固件自带，不再依赖 radio 模块） */
 } music_page_t;
 
 /* 界面每帧读取的快照 */
 typedef struct {
     uint8_t page;        /* music_page_t */
     uint8_t menu_index;  /* 导航页选中项 */
+    uint8_t menu_window; /* 导航页窗口起点（登录后多出「我的歌单」，条目超过一屏） */
+    uint8_t menu_count;  /* 导航页条目总数 */
     uint8_t list_index;  /* 歌曲列表选中项 */
     uint8_t list_window; /* 歌曲列表窗口起点 */
     uint8_t net_ok;

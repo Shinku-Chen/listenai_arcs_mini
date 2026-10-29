@@ -10,8 +10,15 @@
 
 #include "music_http.h"
 
-/* 响应缓冲上限：搜索接口实测 9.8 KB，歌单详情会更大，24 KB 足够里程碑 1 */
-#define MUSIC_HTTP_RESP_CAP (24 * 1024)
+/*
+ * 响应缓冲上限。
+ *
+ * 实测：搜索约 9.8 KB；歌单详情（/api/v6/playlist/detail）不同榜单差异很大：
+ *   新歌榜 20.6 KB、飙升榜 21.7 KB、热歌榜 38.1 KB（200 个 trackIds + 歌单元信息）。
+ * 原 24 KB 会把热歌榜截断 → JSON 解不动（表现为“歌单加载失败”），所以抬到 72 KB。
+ * 这份缓冲是临时的（请求结束即 free），PSRAM 堆还有 3 MB 量级，不值得再省。
+ */
+#define MUSIC_HTTP_RESP_CAP (72 * 1024)
 /* 无 Content-Length（分块）时的读块大小 */
 #define MUSIC_HTTP_READ_CHUNK 2048
 /* HTTPCUsr 的 nTimeout 单位是秒 */
