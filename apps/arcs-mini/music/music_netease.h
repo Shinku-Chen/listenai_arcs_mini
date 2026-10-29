@@ -154,6 +154,9 @@ void music_netease_set_cookie(const char *cookie);
 /* 当前是否已经拿到 MUSIC_U（登录态） */
 bool music_netease_has_login(void);
 
+/* MUSIC_U 令牌长度（调试用：0 表示没拿到，正常值 300~1800） */
+size_t music_netease_login_token_len(void);
+
 /* 把内部 cookie jar 拷出来（给 KV 持久化用），返回 strlen */
 size_t music_netease_cookie_copy(char *out, size_t out_size);
 

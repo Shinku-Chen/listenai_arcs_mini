@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define TAG "music.netease"
 #include "lisa_log.h"
@@ -8,6 +9,8 @@
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "mbedtls/aes.h"
+#include "mbedtls/base64.h"
+#include "mbedtls/bignum.h"
 #include "mbedtls/md5.h"
 #include "sysutils.h"
 
@@ -24,18 +27,33 @@
 /* 搜索关键词编码后的最大长度 */
 #define MUSIC_KEYWORD_ENCODED_MAX 256
 
-/*
- * EAPI 的登录态**不在 Cookie 头里**：真实客户端把 cookie 塞进 params 的
- * header 字段（{"header":{"os":"pc",...,"MUSIC_U":"..."}}）。
- * 只发 Cookie 头对 /eapi/ 网关不可靠 —— 未登录时它照样 code=200，只是
- * account/profile 为 null，看起来像“登录没生效”。
- */
-#define MUSIC_EAPI_HEADER_PREFIX                                                             \
-    "{\"header\":{\"os\":\"pc\",\"appver\":\"8.9.70\",\"osver\":\"10\",\"deviceId\"" \
-    ":\"arcsmini\",\"requestId\":\"0\""
+/* cookie 里 __csrf 的最大长度 */
+#define MUSIC_CSRF_MAX 64
 
-/* Cookie 头只在 jar 很短时才加：httpclient 的上下行头部共用 2048 字节预算 */
-#define MUSIC_COOKIE_HEADER_MAX 480
+/*
+ * 客户端身份。网易云把登录令牌（MUSIC_U）跟**签发时的请求身份**绑在一起：
+ * 扫码轮询时如果 EAPI header 里没有 os/appver/deviceId 这些字段，服务端照样
+ * 回 803 并下发 cookie，但之后拿这条 cookie 去查账号只会得到
+ * {"code":200,"account":null,"profile":null} —— 和“没登录”一模一样。
+ * 所以每次请求都要带同一套身份，deviceId 形状照真实客户端用 MAC 地址。
+ */
+#define MUSIC_DEVICE_ID     "a8:9c:ed:3f:21:07"
+#define MUSIC_CLIENT_APPVER "3.1.17.204416"
+#define MUSIC_CLIENT_OSVER  "Microsoft-Windows-10-Professional-build-19045-64bit"
+
+/*
+ * Cookie 头缓冲上限：整条 jar 都要塞进去。
+ * MUSIC_U 单个值就 500~1800 字节，旧的 480 字节上限导致登录后**根本不发
+ * Cookie 头**，明文 /api/ 退路也直接返回参数非法。
+ */
+#define MUSIC_COOKIE_HEADER_MAX (MUSIC_HTTP_JAR_MAX + 256)
+
+/* WEAPI 常量：RSA 加密的 encSecKey + 双层 AES-128-CBC 的 params */
+#define MUSIC_WEAPI_PRESET_KEY "0CoJUm6Qyw8W8jud"
+#define MUSIC_WEAPI_IV         "0102030405060708"
+
+/* URL 编码在文件后半段定义，WEAPI 组装请求体时要用 */
+static int url_encode(const char *input, char *out, size_t out_size);
 
 /*
  * 所有 EAPI 请求都要带这两个头。
@@ -95,6 +113,11 @@ void music_netease_set_cookie(const char *cookie)
 bool music_netease_has_login(void)
 {
     return cookie_value_len("MUSIC_U") > 0;
+}
+
+size_t music_netease_login_token_len(void)
+{
+    return cookie_value_len("MUSIC_U");
 }
 
 size_t music_netease_cookie_copy(char *out, size_t out_size)
@@ -364,44 +387,83 @@ static int eapi_build_body(const char *path, const char *json, char *out, size_t
 }
 
 /*
+ * 生成 EAPI params 里的 header 对象开头（不含 __csrf / MUSIC_U，也不关闭花括号）：
+ *   {"header":{"os":"pc",...,"requestId":"<ms>_<seq>"
+ * 所有 EAPI 请求（包括申请二维码 / 轮询）都用它，保证身份一致。
+ */
+static int eapi_header_text(char *out, size_t out_size)
+{
+    static unsigned sequence;
+    unsigned long long stamp = (unsigned long long)time(NULL);
+    int n;
+
+    if (stamp == 0) {
+        /* SNTP 未同步时退回单调计数，反正服务端只看“有没有这个字段” */
+        stamp = 1700000000ull + sequence;
+    }
+    n = snprintf(out, out_size,
+                 "{\"header\":{\"os\":\"pc\",\"appver\":\"%s\",\"osver\":\"%s\","
+                 "\"channel\":\"netease\",\"deviceId\":\"%s\",\"versioncode\":\"140\","
+                 "\"mobilename\":\"\",\"buildver\":\"%llu\",\"resolution\":\"1920x1080\","
+                 "\"requestId\":\"%llu%03u_%04u\"",
+                 MUSIC_CLIENT_APPVER, MUSIC_CLIENT_OSVER, MUSIC_DEVICE_ID, stamp, stamp,
+                 sequence % 1000u, sequence % 10000u);
+    sequence++;
+    if (n < 0 || (size_t)n >= out_size) {
+        return MUSIC_ERR_OVERFLOW;
+    }
+    return MUSIC_OK;
+}
+
+/*
  * 拼 EAPI 的 params 明文 JSON：auth 为 true 时把 cookie 里的 MUSIC_U / __csrf
- * 放进 header 字段（照真实客户端的做法），否则原样用调用方的 json。
+ * 放进 header 字段（照真实客户端的做法）。
  * 输出缓冲由调用方分配（一般直接放 PSRAM）。
  */
 static int eapi_payload_build(const char *json, bool auth, char *out, size_t out_size)
 {
     const size_t mu_len = auth ? cookie_value_len("MUSIC_U") : 0;
     const size_t cs_len = auth ? cookie_value_len("__csrf") : 0;
+    char header[384];
     size_t inner_len = strlen(json);
     const char *inner = json;
-    size_t used = 0;
+    size_t used;
     int n;
 
-    if (!auth || (mu_len == 0 && cs_len == 0)) {
-        if (inner_len + 1 > out_size) {
-            return MUSIC_ERR_OVERFLOW;
-        }
-        memcpy(out, json, inner_len + 1);
-        return MUSIC_OK;
+    if (eapi_header_text(header, sizeof(header)) != MUSIC_OK) {
+        return MUSIC_ERR_OVERFLOW;
     }
-
-    n = snprintf(out, out_size, "%s,\"__csrf\":\"", MUSIC_EAPI_HEADER_PREFIX);
+    n = snprintf(out, out_size, "%s", header);
     if (n < 0 || (size_t)n >= out_size) {
         return MUSIC_ERR_OVERFLOW;
     }
     used = (size_t)n;
-    used += cookie_value_copy("__csrf", out + used, out_size - used);
-    n = snprintf(out + used, out_size - used, "\",\"MUSIC_U\":\"");
-    if (n < 0 || (size_t)n >= out_size - used) {
+
+    if (mu_len > 0 || cs_len > 0) {
+        n = snprintf(out + used, out_size - used, ",\"__csrf\":\"");
+        if (n < 0 || (size_t)n >= out_size - used) {
+            return MUSIC_ERR_OVERFLOW;
+        }
+        used += (size_t)n;
+        used += cookie_value_copy("__csrf", out + used, out_size - used);
+        n = snprintf(out + used, out_size - used, "\",\"MUSIC_U\":\"");
+        if (n < 0 || (size_t)n >= out_size - used) {
+            return MUSIC_ERR_OVERFLOW;
+        }
+        used += (size_t)n;
+        used += cookie_value_copy("MUSIC_U", out + used, out_size - used);
+        n = snprintf(out + used, out_size - used, "\"");
+        if (n < 0 || (size_t)n >= out_size - used) {
+            return MUSIC_ERR_OVERFLOW;
+        }
+        used += (size_t)n;
+    }
+
+    /* 关闭 header 对象 */
+    if (used + 2 > out_size) {
         return MUSIC_ERR_OVERFLOW;
     }
-    used += (size_t)n;
-    used += cookie_value_copy("MUSIC_U", out + used, out_size - used);
-    n = snprintf(out + used, out_size - used, "\"}");
-    if (n < 0 || (size_t)n >= out_size - used) {
-        return MUSIC_ERR_OVERFLOW;
-    }
-    used += (size_t)n;
+    out[used++] = '}';
 
     /* 再接上调用方 json 的成员（去掉外层花括号） */
     if (inner_len > 1 && inner[0] == '{' && inner[inner_len - 1] == '}') {
@@ -437,7 +499,7 @@ static int eapi_post_ex(const char *api_path, const char *json, bool auth,
                         music_http_resp_t *resp)
 {
     char url[128];
-    char headers[sizeof(MUSIC_EAPI_HEADERS) + MUSIC_COOKIE_HEADER_MAX];
+    char headers[256];
     char *payload;
     char *body;
     size_t payload_cap;
@@ -453,7 +515,8 @@ static int eapi_post_ex(const char *api_path, const char *json, bool auth,
         return MUSIC_ERR_PARAM;
     }
 
-    payload_cap = strlen(json) + (auth ? strlen(s_cookie) : 0) + 256;
+    /* header 文本 + __csrf + 整条 MUSIC_U 都要装进去，余量给到 1024 */
+    payload_cap = strlen(json) + (auth ? strlen(s_cookie) : 0) + 1024;
     payload = music_malloc(payload_cap);
     if (payload == NULL) {
         return MUSIC_ERR_NO_MEM;
@@ -481,18 +544,35 @@ static int eapi_post_ex(const char *api_path, const char *json, bool auth,
         return ret;
     }
 
-    /* Cookie 头只在 jar 足够短时才加（httpclient 上下行头部共用 2048 字节） */
-    {
-        const size_t jar_len = strlen(s_cookie);
+    /*
+     * 登录后必须同时带 Cookie 头（整条 jar，不截断）。
+     * jar 较长时走裸 socket：httpclient 的上下行头部共用 2048 字节，
+     * 一条 700 字节的 MUSIC_U 加上响应头很容易超预算，整条请求会直接失败。
+     */
+    const size_t jar_len = strlen(s_cookie);
 
-        if (jar_len > 0 && jar_len < MUSIC_COOKIE_HEADER_MAX) {
+    if (auth && jar_len > 0) {
+        char *raw_headers = music_malloc(MUSIC_COOKIE_HEADER_MAX + 256);
+
+        if (raw_headers == NULL) {
+            heap_caps_free(body);
+            return MUSIC_ERR_NO_MEM;
+        }
+        snprintf(raw_headers, MUSIC_COOKIE_HEADER_MAX + 256,
+                 "Content-Type: application/x-www-form-urlencoded\r\n"
+                 "Referer: https://music.163.com/\r\n"
+                 "Cookie: %s\r\n",
+                 s_cookie);
+        ret = music_http_raw_post(url, raw_headers, body, (int)strlen(body), NULL, 0, resp);
+        heap_caps_free(raw_headers);
+    } else {
+        if (jar_len > 0 && jar_len + sizeof(MUSIC_EAPI_HEADERS) < sizeof(headers)) {
             snprintf(headers, sizeof(headers), "%s&Cookie:%s", MUSIC_EAPI_HEADERS, s_cookie);
         } else {
             snprintf(headers, sizeof(headers), "%s", MUSIC_EAPI_HEADERS);
         }
+        ret = music_http_request_ex(url, true, body, (int)strlen(body), headers, NULL, 0, resp);
     }
-
-    ret = music_http_request_ex(url, true, body, (int)strlen(body), headers, NULL, 0, resp);
     heap_caps_free(body);
     if (ret != 0) {
         return MUSIC_ERR_NET;
@@ -518,23 +598,32 @@ static int plain_api_post(const char *api_path, const char *form_body,
                           music_http_resp_t *resp)
 {
     char url[128];
-    char headers[sizeof(MUSIC_EAPI_HEADERS) + MUSIC_COOKIE_HEADER_MAX];
+    char *raw_headers;
     const size_t jar_len = strlen(s_cookie);
     int n;
     int ret;
 
     memset(resp, 0, sizeof(*resp));
-    if (jar_len == 0 || jar_len >= MUSIC_COOKIE_HEADER_MAX) {
+    if (jar_len == 0) {
         return MUSIC_ERR_PARAM;
     }
     n = snprintf(url, sizeof(url), "%s%s", MUSIC_API_BASE, api_path);
     if (n < 0 || (size_t)n >= sizeof(url)) {
         return MUSIC_ERR_PARAM;
     }
-    snprintf(headers, sizeof(headers), "%s&Cookie:%s", MUSIC_EAPI_HEADERS, s_cookie);
-
-    ret = music_http_request_ex(url, true, form_body, form_body ? (int)strlen(form_body) : 0,
-                                headers, NULL, 0, resp);
+    /* 整条 jar 都塞进 Cookie 头，所以固定走裸 socket（不抢 httpclient 的 2048 预算） */
+    raw_headers = music_malloc(MUSIC_COOKIE_HEADER_MAX + 256);
+    if (raw_headers == NULL) {
+        return MUSIC_ERR_NO_MEM;
+    }
+    snprintf(raw_headers, MUSIC_COOKIE_HEADER_MAX + 256,
+             "Content-Type: application/x-www-form-urlencoded\r\n"
+             "Referer: https://music.163.com/\r\n"
+             "Cookie: %s\r\n",
+             s_cookie);
+    ret = music_http_raw_post(url, raw_headers, form_body,
+                              form_body ? (int)strlen(form_body) : 0, NULL, 0, resp);
+    heap_caps_free(raw_headers);
     if (ret != 0) {
         return MUSIC_ERR_NET;
     }
@@ -545,6 +634,232 @@ static int plain_api_post(const char *api_path, const char *form_body,
     }
     LOGI("plain api ok: %s", api_path);
     return MUSIC_OK;
+}
+
+/* ==================== WEAPI 加解密 ==================== */
+
+/*
+ * WEAPI 是真实客户端读「账号 / 我的歌单」用的网关：
+ *   params      = urlescape(base64(AES-CBC(base64(AES-CBC(json, 固定key)), 随机key)))
+ *   encSecKey   = hex(RSA_NoPadding(随机key，模幂 65537))
+ * 固定 key 和 IV、RSA 模数都是客户端硬编码值。
+ */
+static const unsigned char s_weapi_rsa_modulus[128] = {
+    0xe0, 0xb5, 0x09, 0xf6, 0x25, 0x9d, 0xf8, 0x64, 0x2d, 0xbc, 0x35, 0x66, 0x29, 0x01, 0x47,
+    0x7d, 0xf2, 0x26, 0x77, 0xec, 0x15, 0x2b, 0x5f, 0xf6, 0x8a, 0xce, 0x61, 0x5b, 0xb7, 0xb7,
+    0x25, 0x15, 0x2b, 0x3a, 0xb1, 0x7a, 0x87, 0x6a, 0xea, 0x8a, 0x5a, 0xa7, 0x6d, 0x2e, 0x41,
+    0x76, 0x29, 0xec, 0x4e, 0xe3, 0x41, 0xf5, 0x61, 0x35, 0xfc, 0xcf, 0x69, 0x52, 0x80, 0x10,
+    0x4e, 0x03, 0x12, 0xec, 0xbd, 0xa9, 0x25, 0x57, 0xc9, 0x38, 0x70, 0x11, 0x4a, 0xf6, 0xc9,
+    0xd0, 0x5c, 0x4f, 0x7f, 0x0c, 0x36, 0x85, 0xb7, 0xa4, 0x6b, 0xee, 0x25, 0x59, 0x32, 0x57,
+    0x5c, 0xce, 0x10, 0xb4, 0x24, 0xd8, 0x13, 0xcf, 0xe4, 0x87, 0x5d, 0x3e, 0x82, 0x04, 0x7b,
+    0x97, 0xdd, 0xef, 0x52, 0x74, 0x1d, 0x54, 0x6b, 0x8e, 0x28, 0x9d, 0xc6, 0x93, 0x5b, 0x3e,
+    0xce, 0x04, 0x62, 0xdb, 0x0a, 0x22, 0xb8, 0xe7,
+};
+
+/* AES-128-CBC + base64（PKCS#7 填充，IV 固定 0102030405060708） */
+static int weapi_aes_b64(const char *input, size_t input_len, const char *key, char *out,
+                         size_t out_size)
+{
+    unsigned char iv[16];
+    unsigned char *plain;
+    unsigned char *cipher;
+    size_t padded;
+    size_t encoded = 0;
+    int rc;
+    mbedtls_aes_context aes;
+
+    memcpy(iv, MUSIC_WEAPI_IV, 16);
+    padded = input_len + 16 - (input_len % 16);
+    if (out_size < ((padded + 2) / 3) * 4 + 1) {
+        return MUSIC_ERR_OVERFLOW;
+    }
+    plain = music_malloc(padded);
+    cipher = music_malloc(padded);
+    if (plain == NULL || cipher == NULL) {
+        heap_caps_free(plain);
+        heap_caps_free(cipher);
+        return MUSIC_ERR_NO_MEM;
+    }
+    memcpy(plain, input, input_len);
+    memset(plain + input_len, (int)(padded - input_len), padded - input_len);
+
+    mbedtls_aes_init(&aes);
+    rc = mbedtls_aes_setkey_enc(&aes, (const unsigned char *)key, 128);
+    if (rc == 0) {
+        rc = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, padded, iv, plain, cipher);
+    }
+    mbedtls_aes_free(&aes);
+    if (rc == 0) {
+        rc = mbedtls_base64_encode((unsigned char *)out, out_size - 1, &encoded, cipher, padded);
+    }
+    heap_caps_free(plain);
+    heap_caps_free(cipher);
+    if (rc != 0) {
+        out[0] = '\0';
+        return MUSIC_ERR_PARAM;
+    }
+    out[encoded] = '\0';
+    return MUSIC_OK;
+}
+
+/* 随机 16 字符密钥（不做密码学级别要求，只要每次请求不同即可） */
+static void weapi_random_key(char secret[17])
+{
+    static const char alphabet[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static uint32_t seed;
+    const uint32_t now = (uint32_t)time(NULL);
+
+    seed ^= now ^ (uint32_t)(uintptr_t)secret;
+    for (int i = 0; i < 16; i++) {
+        /* xorshift32 */
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        secret[i] = alphabet[seed % (sizeof(alphabet) - 1)];
+    }
+    secret[16] = '\0';
+}
+
+/* encSecKey = hex(RSA(secret 倒序，放在 128 字节块末尾，指数 65537)) */
+static int weapi_enc_sec_key(const char secret[17], char out[257])
+{
+    unsigned char block[128];
+    unsigned char result[128];
+    mbedtls_mpi n;
+    mbedtls_mpi e;
+    mbedtls_mpi m;
+    mbedtls_mpi c;
+    int rc;
+
+    memset(block, 0, sizeof(block));
+    for (int i = 0; i < 16; i++) {
+        block[112 + i] = (unsigned char)secret[15 - i];
+    }
+    mbedtls_mpi_init(&n);
+    mbedtls_mpi_init(&e);
+    mbedtls_mpi_init(&m);
+    mbedtls_mpi_init(&c);
+    rc = mbedtls_mpi_read_binary(&n, s_weapi_rsa_modulus, sizeof(s_weapi_rsa_modulus));
+    if (rc == 0) {
+        rc = mbedtls_mpi_lset(&e, 65537);
+    }
+    if (rc == 0) {
+        rc = mbedtls_mpi_read_binary(&m, block, sizeof(block));
+    }
+    if (rc == 0) {
+        rc = mbedtls_mpi_exp_mod(&c, &m, &e, &n, NULL);
+    }
+    if (rc == 0) {
+        rc = mbedtls_mpi_write_binary(&c, result, sizeof(result));
+    }
+    mbedtls_mpi_free(&n);
+    mbedtls_mpi_free(&e);
+    mbedtls_mpi_free(&m);
+    mbedtls_mpi_free(&c);
+    if (rc != 0) {
+        return MUSIC_ERR_PARAM;
+    }
+    for (size_t i = 0; i < sizeof(result); i++) {
+        snprintf(out + i * 2, 3, "%02x", result[i]);
+    }
+    out[256] = '\0';
+    return MUSIC_OK;
+}
+
+/*
+ * POST 一个 WEAPI 接口；path 形如 "/nuser/account/get"（不含 /weapi 前缀）。
+ * Cookie 头带整条 jar，走裸 socket（服务端不认的话至少不会因为头部预算失败）。
+ */
+static int weapi_post(const char *path, const char *json, music_http_resp_t *resp)
+{
+    char secret[17];
+    char enc_key[257];
+    char url[128];
+    char *first = NULL;
+    char *encoded = NULL;
+    char *body = NULL;
+    char *raw_headers = NULL;
+    size_t body_cap;
+    int n;
+    int ret;
+
+    memset(resp, 0, sizeof(*resp));
+    if (path == NULL || json == NULL) {
+        return MUSIC_ERR_PARAM;
+    }
+    n = snprintf(url, sizeof(url), "%s/weapi%s", MUSIC_API_BASE, path);
+    if (n < 0 || (size_t)n >= sizeof(url)) {
+        return MUSIC_ERR_PARAM;
+    }
+
+    /* 第一层：固定 key */
+    const size_t first_cap = ((strlen(json) + 16) / 16) * 16 * 4 / 3 + 64;
+    first = music_malloc(first_cap);
+    encoded = music_malloc(first_cap * 2 + 64);
+    body_cap = first_cap * 3 + 512;
+    body = music_malloc(body_cap);
+    raw_headers = music_malloc(MUSIC_COOKIE_HEADER_MAX + 256);
+    if (first == NULL || encoded == NULL || body == NULL || raw_headers == NULL) {
+        ret = MUSIC_ERR_NO_MEM;
+        goto done;
+    }
+
+    ret = weapi_aes_b64(json, strlen(json), MUSIC_WEAPI_PRESET_KEY, first, first_cap);
+    if (ret != MUSIC_OK) {
+        LOGE("weapi layer1 failed: %d", ret);
+        goto done;
+    }
+    weapi_random_key(secret);
+    ret = weapi_aes_b64(first, strlen(first), secret, encoded, first_cap * 2 + 64);
+    if (ret != MUSIC_OK) {
+        LOGE("weapi layer2 failed: %d", ret);
+        goto done;
+    }
+    ret = weapi_enc_sec_key(secret, enc_key);
+    if (ret != MUSIC_OK) {
+        LOGE("weapi rsa failed: %d", ret);
+        goto done;
+    }
+
+    memcpy(body, "params=", 7);
+    ret = url_encode(encoded, body + 7, body_cap - 7);
+    if (ret != MUSIC_OK) {
+        LOGE("weapi urlencode failed: %d", ret);
+        goto done;
+    }
+    n = snprintf(body + strlen(body), body_cap - strlen(body), "&encSecKey=%s", enc_key);
+    if (n < 0 || (size_t)n >= body_cap - strlen(body)) {
+        ret = MUSIC_ERR_OVERFLOW;
+        goto done;
+    }
+
+    snprintf(raw_headers, MUSIC_COOKIE_HEADER_MAX + 256,
+             "Content-Type: application/x-www-form-urlencoded\r\n"
+             "Referer: https://music.163.com/\r\n"
+             "Origin: https://music.163.com\r\n"
+             "Cookie: %s\r\n",
+             s_cookie);
+    ret = music_http_raw_post(url, raw_headers, body, (int)strlen(body), NULL, 0, resp);
+    if (ret != 0) {
+        ret = MUSIC_ERR_NET;
+        goto done;
+    }
+    keep_snippet(resp);
+    if (resp->status != 200) {
+        LOGW("weapi http %d: %s", resp->status, path);
+        ret = MUSIC_ERR_NET;
+        goto done;
+    }
+    LOGI("weapi ok: %s (%u bytes)", path, (unsigned)resp->length);
+    ret = MUSIC_OK;
+
+done:
+    heap_caps_free(first);
+    heap_caps_free(encoded);
+    heap_caps_free(body);
+    heap_caps_free(raw_headers);
+    return ret;
 }
 
 /* 百分号编码（搜索关键词是 UTF-8 中文，必须编码） */
@@ -883,7 +1198,7 @@ int music_netease_qr_start(char *key, size_t key_size)
     }
     key[0] = '\0';
 
-    ret = eapi_post("/api/login/qrcode/unikey", "{\"type\":3}", &resp);
+    ret = eapi_post_ex("/api/login/qrcode/unikey", "{\"type\":3}", true, &resp);
     if (ret != MUSIC_OK) {
         music_http_resp_free(&resp);
         return ret;
@@ -908,7 +1223,9 @@ int music_netease_qr_poll(const char *key, int *state, bool *got_login)
 {
     char json[128];
     char *body;
-    const size_t body_cap = 1024 + strlen(key) * 4;
+    char *payload;
+    const size_t body_cap = 2048 + strlen(key) * 4;
+    const size_t payload_cap = sizeof(json) + strlen(s_cookie) + 512;
     music_http_resp_t resp;
     cJSON *root;
     const cJSON *code;
@@ -928,8 +1245,21 @@ int music_netease_qr_poll(const char *key, int *state, bool *got_login)
     if (body == NULL) {
         return MUSIC_ERR_NO_MEM;
     }
-    /* 不能走 parse_eapi_root：这个接口的 code 就是 800/801/802/803 */
-    ret = eapi_build_body("/api/login/qrcode/client/login", json, body, body_cap);
+    /*
+     * 不能走 parse_eapi_root：这个接口的 code 就是 800/801/802/803。
+     * params 里必须带完整客户端身份（os/appver/deviceId/...），否则服务端
+     * 会下发一条“看起来正常、但用不了”的 MUSIC_U（查账号永远 profile=null）。
+     */
+    payload = music_malloc(payload_cap);
+    if (payload == NULL) {
+        heap_caps_free(body);
+        return MUSIC_ERR_NO_MEM;
+    }
+    ret = eapi_payload_build(json, true, payload, payload_cap);
+    if (ret == MUSIC_OK) {
+        ret = eapi_build_body("/api/login/qrcode/client/login", payload, body, body_cap);
+    }
+    heap_caps_free(payload);
     if (ret != MUSIC_OK) {
         LOGE("qr poll body build failed: %d", ret);
         heap_caps_free(body);
@@ -941,11 +1271,32 @@ int music_netease_qr_poll(const char *key, int *state, bool *got_login)
      * MUSIC_U 单条就可能超过 1200 字节，而 httpclient 的上下行头部**共用**
      * 2048 字节，放不下就会整个请求失败或者只拿到半条 cookie。
      * 裸 socket 版把头部上限放到 8 KB，并把每一条 Set-Cookie 合并进 s_cookie。
+     *
+     * 同时带上已有的匿名 cookie（NMTID / MUSIC_A）：真实客户端每次请求都带，
+     * 新下发的登录令牌也会挂在同一条会话上。
      */
-    ret = music_http_raw_post(MUSIC_API_BASE "/eapi/login/qrcode/client/login",
-                              "Content-Type: application/x-www-form-urlencoded\r\n"
-                              "Referer: https://music.163.com/\r\n",
-                              body, (int)strlen(body), s_cookie, sizeof(s_cookie), &resp);
+    {
+        char *raw_headers = music_malloc(MUSIC_COOKIE_HEADER_MAX + 256);
+
+        if (raw_headers == NULL) {
+            heap_caps_free(body);
+            return MUSIC_ERR_NO_MEM;
+        }
+        if (s_cookie[0] != '\0') {
+            snprintf(raw_headers, MUSIC_COOKIE_HEADER_MAX + 256,
+                     "Content-Type: application/x-www-form-urlencoded\r\n"
+                     "Referer: https://music.163.com/\r\n"
+                     "Cookie: %s\r\n",
+                     s_cookie);
+        } else {
+            snprintf(raw_headers, MUSIC_COOKIE_HEADER_MAX + 256,
+                     "Content-Type: application/x-www-form-urlencoded\r\n"
+                     "Referer: https://music.163.com/\r\n");
+        }
+        ret = music_http_raw_post(MUSIC_API_BASE "/eapi/login/qrcode/client/login", raw_headers,
+                                  body, (int)strlen(body), s_cookie, sizeof(s_cookie), &resp);
+        heap_caps_free(raw_headers);
+    }
     heap_caps_free(body);
     if (ret != 0) {
         LOGE("qr poll request failed: %d", ret);
@@ -977,17 +1328,40 @@ int music_netease_qr_poll(const char *key, int *state, bool *got_login)
     return MUSIC_OK;
 }
 
-/* 解析 /api/nuser/account/get 的响应（EAPI 与明文 /api/ 两种网关结构一致） */
-static int account_parse(const music_http_resp_t *resp, int64_t *uid_out, char *nickname,
-                         size_t nickname_size)
+/* 把响应前 200 字节打进日志：真机上“code 是 200 但字段全是 null”这种克最难猜 */
+static void log_resp_body(const char *tag, const music_http_resp_t *resp)
+{
+    char snippet[201];
+    size_t n;
+
+    if (resp == NULL || resp->body == NULL || resp->length <= 0) {
+        LOGI("%s: http=%d (empty body)", tag, resp != NULL ? resp->status : -1);
+        return;
+    }
+    n = (size_t)resp->length;
+    if (n > sizeof(snippet) - 1) {
+        n = sizeof(snippet) - 1;
+    }
+    memcpy(snippet, resp->body, n);
+    snippet[n] = '\0';
+    LOGI("%s: http=%d len=%d body=%s", tag, resp->status, resp->length, snippet);
+}
+
+/* 解析账号响应（WEAPI / EAPI / 明文 /api/ 三种网关结构一致，都是直接 JSON） */
+static void account_parse(const music_http_resp_t *resp, int64_t *uid_out, char *nickname,
+                          size_t nickname_size)
 {
     cJSON *root;
     const cJSON *profile;
     const cJSON *account;
 
-    root = parse_eapi_root(resp);
-    if (root == NULL) {
-        return MUSIC_ERR_JSON;
+    if (resp->body == NULL || resp->length <= 0) {
+        return;
+    }
+    root = cJSON_ParseWithLength(resp->body, (size_t)resp->length);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return;
     }
     profile = cJSON_GetObjectItemCaseSensitive(root, "profile");
     account = cJSON_GetObjectItemCaseSensitive(root, "account");
@@ -1001,13 +1375,21 @@ static int account_parse(const music_http_resp_t *resp, int64_t *uid_out, char *
         *uid_out = json_i64(cJSON_GetObjectItemCaseSensitive(account, "id"));
     }
     cJSON_Delete(root);
-    return MUSIC_OK;
 }
 
+/*
+ * 取登录账号。三条路线都试，因为三个网关读登录态的位置不同：
+ *   1) WEAPI  /weapi/nuser/account/get + Cookie 头（真实客户端路线）
+ *   2) EAPI   /eapi/nuser/account/get  + params.header.MUSIC_U + Cookie 头
+ *   3) 明文   /api/nuser/account/get   + Cookie 头
+ * cookie 失效时三条都会回 code=200 但 account/profile 为 null。
+ */
 int music_netease_account(int64_t *uid_out, char *nickname, size_t nickname_size)
 {
+    char json[320];
+    char csrf[MUSIC_CSRF_MAX];
     music_http_resp_t resp;
-    int ret;
+    int err;
 
     if (uid_out == NULL) {
         return MUSIC_ERR_PARAM;
@@ -1019,26 +1401,45 @@ int music_netease_account(int64_t *uid_out, char *nickname, size_t nickname_size
     if (!music_netease_has_login()) {
         return MUSIC_ERR_UNAVAILABLE;
     }
+    cookie_value_copy("__csrf", csrf, sizeof(csrf));
 
-    /* 1) EAPI：cookie 放在 params 的 header 字段里 */
-    ret = eapi_post_ex("/api/nuser/account/get", "{}", true, &resp);
-    if (ret == MUSIC_OK) {
-        ret = account_parse(&resp, uid_out, nickname, nickname_size);
+    /* 1) WEAPI */
+    snprintf(json, sizeof(json), "{\"csrf_token\":\"%s\"}", csrf);
+    err = weapi_post("/nuser/account/get", json, &resp);
+    if (err == MUSIC_OK) {
+        log_resp_body("account/weapi", &resp);
+        account_parse(&resp, uid_out, nickname, nickname_size);
+    } else {
+        LOGW("account/weapi failed: %d(%s)", err, music_err_text(err));
     }
     music_http_resp_free(&resp);
 
-    /* 2) 明文 /api/：cookie 放在 Cookie 头里（两套网关读的位置不同） */
+    /* 2) EAPI（cookie 同时进 params.header 与 Cookie 头） */
     if (*uid_out <= 0) {
-        LOGI("eapi account empty (ret=%d), retry plain /api/", ret);
-        ret = plain_api_post("/api/nuser/account/get", "", &resp);
-        if (ret == MUSIC_OK) {
-            (void)account_parse(&resp, uid_out, nickname, nickname_size);
+        err = eapi_post_ex("/api/nuser/account/get", "{}", true, &resp);
+        if (err == MUSIC_OK) {
+            log_resp_body("account/eapi", &resp);
+            account_parse(&resp, uid_out, nickname, nickname_size);
+        } else {
+            LOGW("account/eapi failed: %d(%s)", err, music_err_text(err));
         }
         music_http_resp_free(&resp);
     }
 
-    /* 未登录时服务端照样返回 200，只是 account/profile 为 null */
-    LOGI("account uid=%lld nick=%s", (long long)*uid_out, (nickname != NULL) ? nickname : "");
+    /* 3) 明文 /api/ + Cookie 头 */
+    if (*uid_out <= 0) {
+        err = plain_api_post("/api/nuser/account/get", "", &resp);
+        if (err == MUSIC_OK) {
+            log_resp_body("account/plain", &resp);
+            account_parse(&resp, uid_out, nickname, nickname_size);
+        } else {
+            LOGW("account/plain failed: %d(%s)", err, music_err_text(err));
+        }
+        music_http_resp_free(&resp);
+    }
+
+    LOGI("account uid=%lld nick=%s jar=%u", (long long)*uid_out,
+         (nickname != NULL) ? nickname : "", (unsigned)strlen(s_cookie));
     return (*uid_out > 0) ? MUSIC_OK : MUSIC_ERR_UNAVAILABLE;
 }
 
@@ -1049,8 +1450,12 @@ static int playlists_parse(const music_http_resp_t *resp, music_user_playlist_li
     const cJSON *list;
     const cJSON *item;
 
-    root = parse_eapi_root(resp);
-    if (root == NULL) {
+    if (resp->body == NULL || resp->length <= 0) {
+        return MUSIC_ERR_JSON;
+    }
+    root = cJSON_ParseWithLength(resp->body, (size_t)resp->length);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
         return MUSIC_ERR_JSON;
     }
     list = cJSON_GetObjectItemCaseSensitive(root, "playlist");
@@ -1085,8 +1490,9 @@ static int playlists_parse(const music_http_resp_t *resp, music_user_playlist_li
 
 int music_netease_user_playlists(int64_t uid, music_user_playlist_list_t *out)
 {
-    char json[160];
-    char form[160];
+    char json[256];
+    char form[256];
+    char csrf[MUSIC_CSRF_MAX];
     music_http_resp_t resp;
     int ret;
 
@@ -1094,25 +1500,45 @@ int music_netease_user_playlists(int64_t uid, music_user_playlist_list_t *out)
         return MUSIC_ERR_PARAM;
     }
     memset(out, 0, sizeof(*out));
+    cookie_value_copy("__csrf", csrf, sizeof(csrf));
 
-    snprintf(json, sizeof(json), "{\"uid\":%lld,\"limit\":%d,\"offset\":0}", (long long)uid,
-             MUSIC_USER_PLAYLIST_MAX);
-    snprintf(form, sizeof(form), "uid=%lld&limit=%d&offset=0&csrf_token=", (long long)uid,
-             MUSIC_USER_PLAYLIST_MAX);
+    snprintf(json, sizeof(json),
+             "{\"uid\":%lld,\"limit\":%d,\"offset\":0,\"includeVideo\":true,"
+             "\"csrf_token\":\"%s\"}",
+             (long long)uid, MUSIC_USER_PLAYLIST_MAX, csrf);
+    snprintf(form, sizeof(form), "uid=%lld&limit=%d&offset=0&csrf_token=%s", (long long)uid,
+             MUSIC_USER_PLAYLIST_MAX, csrf);
 
-    /* 1) EAPI：cookie 放在 params 的 header 字段里 */
-    ret = eapi_post_ex("/api/user/playlist", json, true, &resp);
+    /* 1) WEAPI（真实客户端路线） */
+    ret = weapi_post("/user/playlist", json, &resp);
     if (ret == MUSIC_OK) {
+        log_resp_body("my/weapi", &resp);
         ret = playlists_parse(&resp, out);
+    } else {
+        LOGW("my/weapi failed: %d(%s)", ret, music_err_text(ret));
     }
     music_http_resp_free(&resp);
 
-    /* 2) 明文 /api/：cookie 放在 Cookie 头里 */
+    /* 2) EAPI */
     if (out->count == 0) {
-        LOGI("eapi playlist empty (ret=%d), retry plain /api/", ret);
+        ret = eapi_post_ex("/api/user/playlist", json, true, &resp);
+        if (ret == MUSIC_OK) {
+            log_resp_body("my/eapi", &resp);
+            ret = playlists_parse(&resp, out);
+        } else {
+            LOGW("my/eapi failed: %d(%s)", ret, music_err_text(ret));
+        }
+        music_http_resp_free(&resp);
+    }
+
+    /* 3) 明文 /api/ */
+    if (out->count == 0) {
         ret = plain_api_post("/api/user/playlist", form, &resp);
         if (ret == MUSIC_OK) {
+            log_resp_body("my/plain", &resp);
             (void)playlists_parse(&resp, out);
+        } else {
+            LOGW("my/plain failed: %d(%s)", ret, music_err_text(ret));
         }
         music_http_resp_free(&resp);
     }

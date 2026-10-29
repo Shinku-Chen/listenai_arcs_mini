@@ -38,10 +38,11 @@
 #define MUSIC_HTTP_HEADER_LINE_MAX 4096
 
 /*
- * 裸 socket 版的收发缓冲（头部 + body 共用，扫码登录响应只有几十字节 body，
- * 头部里塞着 1~2 KB 的 Set-Cookie，8 KB 足够）。
+ * 裸 socket 版的收发缓冲（头部 + body 共用）。
+ * 扫码登录的响应很小，但「我的歌单」一次 12 个对象实测 20~40 KB，
+ * 所以上限抬到 72 KB（缓冲是临时的，PSRAM 堆里拿）。
  */
-#define MUSIC_RAW_RESP_MAX  (8 * 1024)
+#define MUSIC_RAW_RESP_MAX  (72 * 1024)
 #define MUSIC_RAW_TIMEOUT_S 10
 
 /*
@@ -648,6 +649,14 @@ int music_http_raw_post(const char *url, const char *headers, const char *body, 
 
                     while (value < eol && *value == ' ') {
                         value++;
+                    }
+                    /* 日志只打名字和长度：值可能是 1~2 KB 的令牌 */
+                    {
+                        const char *eq = memchr(value, '=', (size_t)(eol - value));
+                        const int name_len = (eq != NULL) ? (int)(eq - value) : 0;
+
+                        LOGI("Set-Cookie[%d]: name=%.*s len=%d", seen, name_len, value,
+                             (int)(eol - value));
                     }
                     cookie_jar_merge(cookie_jar, jar_size, value, (size_t)(eol - value));
                     seen++;

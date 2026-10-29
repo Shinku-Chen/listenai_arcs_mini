@@ -811,9 +811,11 @@ static void music_qr_poll_once(void)
 
     music_lock();
     snprintf(key, sizeof(key), "%s", s_state.unikey);
+    /* 已经登录成功就不再轮询：unikey 一次性作废，再问只会得到误导的 800 */
+    const bool logged = (s_state.qr_state == MUSIC_QR_OK);
     music_unlock();
 
-    if (key[0] == '\0') {
+    if (key[0] == '\0' || logged) {
         return;
     }
 
@@ -841,7 +843,8 @@ static void music_qr_poll_once(void)
             music_unlock();
             /* KV 写 flash 不能在持锁时做（要几十毫秒，会拖住渲染抽帧） */
             (void)lisa_kv_set_string(MUSIC_KV_KEY_COOKIE, s_state.cookie);
-            LOGI("qr login ok: cookie %u bytes", (unsigned)strlen(s_state.cookie));
+            LOGI("qr login ok: cookie %u bytes music_u=%u", (unsigned)strlen(s_state.cookie),
+                 (unsigned)music_netease_login_token_len());
             /* 登录态生效后立刻取账号 + 我的歌单，导航页顶部就会出现它们 */
             music_fetch_account();
         } else {
@@ -1614,6 +1617,14 @@ static int music_submit(music_req_kind_t kind, uint8_t arg, const char *keyword)
     if (!s_state.inited) {
         return -1;
     }
+    /*
+     * 工作线程正忙时不直接报 busy：串口命令很容易撞上后台的拉歌单/取账号，
+     * 最多等 3 秒（工作线程一个请求通常几百毫秒），让用户看到的是结果而不是
+     * 一句让人以为出错的 “music: busy”。
+     */
+    for (int waited = 0; waited < 30 && (s_req.busy || s_req.kind != MUSIC_REQ_NONE); waited++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
     if (s_req.busy || s_req.kind != MUSIC_REQ_NONE) {
         return -2;
     }
@@ -1860,8 +1871,8 @@ static int music_cmd(int argc, char *argv[])
         } else if (strcmp(what, "start") == 0) {
             ret = music_submit(MUSIC_REQ_QR_START, 0, NULL);
         } else if (strcmp(what, "cookie") == 0) {
-            shellPrint(shell, "jar(%u): %.200s\n", (unsigned)strlen(s_state.cookie),
-                       s_state.cookie);
+            shellPrint(shell, "jar(%u) music_u=%u: %.160s\n", (unsigned)strlen(s_state.cookie),
+                       (unsigned)music_netease_login_token_len(), s_state.cookie);
             return 0;
         } else if (strcmp(what, "logout") == 0) {
             s_state.cookie[0] = '\0';
