@@ -8,6 +8,7 @@ orsource "../../apps-ui/Kconfig"
 
 rsource "miniapp/Kconfig"
 rsource "radio/Kconfig"
+rsource "music/Kconfig"
 
 config CP_FIRMWARE_COMPAT
     bool "Embed CP PSRAM range"

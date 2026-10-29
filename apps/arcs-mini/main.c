@@ -55,6 +55,16 @@ int main(int argc, char **argv)
         }
     }
 
+    /* 网易云音乐直连（里程碑 1）：只起工作线程 + music 调试命令，不碰 UI */
+#ifdef CONFIG_NETEASE_MUSIC
+    {
+        extern int music_app_init(void);
+        if (music_app_init() != 0) {
+            LOGE("netease music init failed");
+        }
+    }
+#endif
+
     LOGI("leo-radio ready");
 
     while (1) {

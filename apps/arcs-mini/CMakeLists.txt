@@ -54,6 +54,10 @@ listenai_include_directories(
 if(CONFIG_RADIO)
     add_subdirectory(radio)
 endif()
+# 网易云音乐直连（里程碑 1）：只有调试命令 + 播放，没有 UI
+if(CONFIG_NETEASE_MUSIC)
+    add_subdirectory(music)
+endif()
 # 纯电台固件：语音意图 / TTS / 音乐 / 闹钟 / MCP 工具都不参与构建
 # （app 层保留 tone 资源加载、button、services）
 

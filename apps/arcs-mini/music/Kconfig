@@ -1,0 +1,19 @@
+config NETEASE_MUSIC
+    bool "网易云音乐直连（EAPI）"
+    default n
+    depends on APP_PLAYER
+    depends on CJSON
+    depends on MBEDTLS
+    help
+      把网易云音乐的开源客户端协议（EAPI）做进固件：搜索、歌单详情、歌曲详情、
+      播放直链，并用 app_player 的 music 实例真正出声。
+
+      协议要点：
+        - 请求走 http://music.163.com/eapi/...（实测明文 HTTP 可用，返回的
+          音频直链也是 http://m7xx.music.126.net/...mp3），因此不需要 TLS；
+        - 请求体是 AES-128-ECB 加密后的 params 表单，必须带
+          Content-Type: application/x-www-form-urlencoded，否则网关返回空 body；
+        - 匿名可用，VIP/付费曲目返回 code=-110（url 为 null），按不可播放处理。
+
+      当前是里程碑 1：只有串口/ADB 的 music 调试命令，不含界面、封面、歌词与
+      扫码登录（这些属于里程碑 2）。
