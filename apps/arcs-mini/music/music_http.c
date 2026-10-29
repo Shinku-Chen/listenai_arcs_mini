@@ -50,8 +50,62 @@ void music_http_resp_free(music_http_resp_t *resp)
     memset(resp, 0, sizeof(*resp));
 }
 
-int music_http_request(const char *url, bool post, const char *body, int body_len,
-                       const char *extra_headers, music_http_resp_t *resp)
+/*
+ * 从响应头里抓登录 cookie。
+ *
+ * httpclient 没有“取某个头”的便捷接口，只有 FindFirstHeader/GetNextHeader 这套
+ * 搜索游标：先 set clue，再逐条取。同一个头可能出现多次（Set-Cookie 就是典型），
+ * 所以要把所有 Set-Cookie 都翻一遍，找含 "MUSIC_U=" 的那条。
+ */
+static void music_http_capture_cookie(HTTPParameters *param, char *out, size_t out_size)
+{
+    char header[416];
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (param == NULL || param->pHTTP == 0) {
+        return;
+    }
+
+    /* FindFirstHeader 只设置“搜什么”，真正的匹配要调 GetNextHeader */
+    UINT32 length = sizeof(header);
+    header[0] = '\0';
+    if (HTTPClientFindFirstHeader(param->pHTTP, "Set-Cookie", header, &length) !=
+        HTTP_CLIENT_SUCCESS) {
+        return;
+    }
+
+    for (;;) {
+        const char *hit = NULL;
+
+        length = sizeof(header);
+        header[0] = '\0';
+        if (HTTPClientGetNextHeader(param->pHTTP, header, &length) != HTTP_CLIENT_SUCCESS) {
+            break;
+        }
+
+        hit = strstr(header, "MUSIC_U=");
+        if (hit != NULL) {
+            size_t n = 0;
+
+            hit += strlen("MUSIC_U=");
+            while (hit[n] != '\0' && hit[n] != ';' && hit[n] != '\r' && hit[n] != '\n' &&
+                   n + 1 < out_size) {
+                n++;
+            }
+            memcpy(out, hit, n);
+            out[n] = '\0';
+            break;
+        }
+    }
+    (void)HTTPClientFindCloseHeader(param->pHTTP);
+}
+
+int music_http_request_ex(const char *url, bool post, const char *body, int body_len,
+                          const char *extra_headers, char *cookie_out, size_t cookie_size,
+                          music_http_resp_t *resp)
 {
     if (url == NULL || resp == NULL) {
         return -3;
@@ -106,6 +160,9 @@ int music_http_request(const char *url, bool post, const char *body, int body_le
         return -1;
     }
     resp->status = (int)info.HTTPStatusCode;
+
+    /* 登录态 cookie 必须在 HTTPC_close 之前取（响应头只活在 session 里） */
+    music_http_capture_cookie(param, cookie_out, cookie_size);
 
     char *buffer = music_http_alloc(MUSIC_HTTP_RESP_CAP + 1);
     if (buffer == NULL) {
@@ -172,4 +229,10 @@ int music_http_request(const char *url, bool post, const char *body, int body_le
     resp->body = buffer;
     resp->length = (int)used;
     return 0;
+}
+
+int music_http_request(const char *url, bool post, const char *body, int body_len,
+                       const char *extra_headers, music_http_resp_t *resp)
+{
+    return music_http_request_ex(url, post, body, body_len, extra_headers, NULL, 0, resp);
 }

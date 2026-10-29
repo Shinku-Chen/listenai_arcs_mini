@@ -38,6 +38,8 @@ typedef enum {
 #define MUSIC_ARTIST_MAX 48
 #define MUSIC_ALBUM_MAX  48
 #define MUSIC_URL_MAX    512
+/* 封面直链（al.picUrl，通常 60~120 字节，带参数后会再长一点） */
+#define MUSIC_COVER_MAX  192
 #define MUSIC_SONG_MAX   10
 
 typedef struct {
@@ -45,6 +47,7 @@ typedef struct {
     char name[MUSIC_NAME_MAX];
     char artist[MUSIC_ARTIST_MAX];
     char album[MUSIC_ALBUM_MAX];
+    char cover[MUSIC_COVER_MAX]; /* 专辑封面原图 URL；空串表示没有 */
     int duration_ms;
     int fee; /* 0/8 可播，1 需会员，4 付费专辑 —— 仅搜索结果里有 */
 } music_song_t;
@@ -85,12 +88,40 @@ int music_netease_playlist(int64_t playlist_id, music_playlist_t *out);
 /*
  * 扫码登录第一步：申请 unikey（EAPI /api/login/qrcode/unikey）。
  * 拿到 key 后二维码内容就是 https://music.163.com/login?codekey=<key>。
- * 轮询/云端确认/登录态持久化属于里程碑 2，这里只验证接口可通。
  */
 int music_netease_qr_start(char *key, size_t key_size);
 
+/* 扫码登录轮询状态（保守照搬客户端语义） */
+typedef enum {
+    MUSIC_QR_EXPIRED = 800,  /* 二维码过期，要重新申请 */
+    MUSIC_QR_WAIT_SCAN = 801,/* 等待扫码 */
+    MUSIC_QR_WAIT_CONFIRM = 802, /* 已扫码，等手机确认 */
+    MUSIC_QR_OK = 803,       /* 登录成功 */
+} music_qr_state_t;
+
+/*
+ * 扫码登录第二步：轮询（EAPI /api/login/qrcode/client/login）。
+ *
+ * 返回值：MUSIC_OK 表示请求成功（state 里是 800/801/802/803）；
+ * MUSIC_OK 且 state == MUSIC_QR_OK 时，cookie_out 里是 "MUSIC_U=..."（可能为空 ——
+ * 真机验证时要看日志，服务端偶尔只给 __csrf）。
+ */
+int music_netease_qr_poll(const char *key, int *state, char *cookie_out, size_t cookie_size);
+
+/*
+ * 同步歌词（GET /api/song/lyric，明文 http 可用）。
+ * 把 LRC 原文（含 [mm:ss.xx] 时间戳）拷进 lrc，长度超了按行截断。
+ */
+int music_netease_lyric(int64_t id, char *lrc, size_t lrc_size);
+
 /* 把错误码转成中文短语，便于日志/串口输出 */
 const char *music_err_text(int err);
+
+/*
+ * 登录后把 "MUSIC_U=..." 交给本模块，后续 EAPI 请求会带上 Cookie 头。
+ * 传 NULL / 空串则清掉（未登录状态）。
+ */
+void music_netease_set_cookie(const char *cookie);
 
 /*
  * 调试证据：最近一次响应的开头片段 + HTTP 状态码。

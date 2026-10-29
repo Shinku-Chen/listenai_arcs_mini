@@ -55,7 +55,9 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 网易云音乐直连（里程碑 1）：只起工作线程 + music 调试命令，不碰 UI */
+    /* 网易云音乐（里程碑 2）：起工作线程 + 注册导航 id 93 的音乐页，
+     * 并把前台页面从电台页接管过来（配过网才会真的抢页，未配网时
+     * 留给电台的配网二维码）。 */
 #ifdef CONFIG_NETEASE_MUSIC
     {
         extern int music_app_init(void);

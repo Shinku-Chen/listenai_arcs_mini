@@ -28,4 +28,7 @@ int radio_ui_top_id(void);
 /* 把电台页注册成导航栈的默认页（纯电台固件里它就是整个 UI）。返回 0 成功。 */
 int radio_ui_set_default(void);
 
+/* 电台页是否在导航栈顶（音乐页占前台时它为 false） */
+bool radio_ui_is_visible(void);
+
 #endif /* __RADIO_UI_H__ */

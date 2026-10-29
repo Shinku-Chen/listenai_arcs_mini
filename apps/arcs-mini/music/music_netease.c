@@ -38,6 +38,29 @@ char music_netease_last_json[MUSIC_NETEASE_SNIPPET_MAX + 1];
 int music_netease_last_json_len;
 int music_netease_last_status;
 
+/* 登录态 cookie（只有 MUSIC_U=...，已去掉 '&' ';' 等会破环扩展头格式的字符） */
+static char s_cookie[512];
+
+/* 扩展头拼接缓冲（基础头 ~90 字节 + cookie 最长 512） */
+#define MUSIC_EAPI_HEADERS_MAX (sizeof(MUSIC_EAPI_HEADERS) + sizeof(s_cookie) + 16)
+
+void music_netease_set_cookie(const char *cookie)
+{
+    size_t n = 0;
+
+    s_cookie[0] = '\0';
+    if (cookie == NULL) {
+        return;
+    }
+    for (const char *p = cookie; *p != '\0' && n + 1 < sizeof(s_cookie); p++) {
+        if (*p == '&' || *p == ';' || *p == '\r' || *p == '\n') {
+            continue;
+        }
+        s_cookie[n++] = *p;
+    }
+    s_cookie[n] = '\0';
+}
+
 /* ==================== 小工具 ==================== */
 
 /* 按 UTF-8 字符边界截断拷贝 */
@@ -231,12 +254,21 @@ static int eapi_build_body(const char *path, const char *json, char *out, size_t
 }
 
 /* POST 一个 EAPI 接口；api_path 形如 "/api/song/enhance/player/url" */
-static int eapi_post(const char *api_path, const char *json, music_http_resp_t *resp)
+static int eapi_post_ex(const char *api_path, const char *json, char *cookie_out,
+                        size_t cookie_size, music_http_resp_t *resp)
 {
     char url[128];
     char body[MUSIC_EAPI_BODY_MAX];
+    char headers[MUSIC_EAPI_HEADERS_MAX];
+    const char *hdrs = MUSIC_EAPI_HEADERS;
     int n;
     int ret;
+
+    /* 登录后带上 Cookie（匿名也能用，所以只影响推荐/音质/歌单可见性） */
+    if (s_cookie[0] != '\0') {
+        snprintf(headers, sizeof(headers), "%s&Cookie:%s", MUSIC_EAPI_HEADERS, s_cookie);
+        hdrs = headers;
+    }
 
     /* 失败路径上调用方仍会 music_http_resp_free()，所以先清干净 */
     memset(resp, 0, sizeof(*resp));
@@ -249,7 +281,8 @@ static int eapi_post(const char *api_path, const char *json, music_http_resp_t *
         LOGW("eapi body build failed: %d", ret);
         return ret;
     }
-    ret = music_http_request(url, true, body, (int)strlen(body), MUSIC_EAPI_HEADERS, resp);
+    ret = music_http_request_ex(url, true, body, (int)strlen(body), hdrs, cookie_out,
+                               cookie_size, resp);
     if (ret != 0) {
         return MUSIC_ERR_NET;
     }
@@ -259,6 +292,11 @@ static int eapi_post(const char *api_path, const char *json, music_http_resp_t *
         return MUSIC_ERR_NET;
     }
     return MUSIC_OK;
+}
+
+static int eapi_post(const char *api_path, const char *json, music_http_resp_t *resp)
+{
+    return eapi_post_ex(api_path, json, NULL, 0, resp);
 }
 
 /* 百分号编码（搜索关键词是 UTF-8 中文，必须编码） */
@@ -386,6 +424,7 @@ int music_netease_search(const char *keyword, int limit, music_song_list_t *out)
                         sizeof(song->artist));
         album = cJSON_GetObjectItemCaseSensitive(item, "album");
         copy_text(song->album, sizeof(song->album), json_text(album, "name"));
+        copy_text(song->cover, sizeof(song->cover), json_text(album, "picUrl"));
         song->duration_ms = (int)json_i64(cJSON_GetObjectItemCaseSensitive(item, "duration"));
         song->fee = (int)json_i64(cJSON_GetObjectItemCaseSensitive(item, "fee"));
         out->count++;
@@ -460,6 +499,7 @@ int music_netease_song_detail(const int64_t *ids, int count, music_song_list_t *
                         sizeof(song->artist));
         album = cJSON_GetObjectItemCaseSensitive(item, "al");
         copy_text(song->album, sizeof(song->album), json_text(album, "name"));
+        copy_text(song->cover, sizeof(song->cover), json_text(album, "picUrl"));
         song->duration_ms = (int)json_i64(cJSON_GetObjectItemCaseSensitive(item, "dt"));
         song->fee = (int)json_i64(cJSON_GetObjectItemCaseSensitive(item, "fee"));
         out->count++;
@@ -614,4 +654,92 @@ int music_netease_qr_start(char *key, size_t key_size)
     memcpy(key, value, n + 1);
     cJSON_Delete(root);
     return MUSIC_OK;
+}
+
+int music_netease_qr_poll(const char *key, int *state, char *cookie_out, size_t cookie_size)
+{
+    char json[128];
+    music_http_resp_t resp;
+    cJSON *root;
+    const cJSON *code;
+    int ret;
+
+    if (key == NULL || key[0] == '\0' || state == NULL) {
+        return MUSIC_ERR_PARAM;
+    }
+    *state = MUSIC_QR_WAIT_SCAN;
+    if (cookie_out != NULL && cookie_size > 0) {
+        cookie_out[0] = '\0';
+    }
+
+    snprintf(json, sizeof(json), "{\"key\":\"%s\",\"type\":3}", key);
+
+    /* 不能走 parse_eapi_root：这个接口的 code 就是 800/801/802/803 */
+    ret = eapi_post_ex("/api/login/qrcode/client/login", json, cookie_out, cookie_size, &resp);
+    if (ret != MUSIC_OK) {
+        music_http_resp_free(&resp);
+        return ret;
+    }
+    root = (resp.body != NULL) ? cJSON_ParseWithLength(resp.body, (size_t)resp.length) : NULL;
+    music_http_resp_free(&resp);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return MUSIC_ERR_JSON;
+    }
+
+    code = cJSON_GetObjectItemCaseSensitive(root, "code");
+    *state = (int)json_i64(code);
+    if (*state == 0) {
+        /* 有些服务端版本成功时不回 code，只回 message="success" */
+        *state = MUSIC_QR_WAIT_SCAN;
+    }
+    cJSON_Delete(root);
+    return MUSIC_OK;
+}
+
+int music_netease_lyric(int64_t id, char *lrc, size_t lrc_size)
+{
+    char url[160];
+    music_http_resp_t resp;
+    cJSON *root;
+    const cJSON *lrcobj;
+    int ret;
+    int n;
+
+    if (id <= 0 || lrc == NULL || lrc_size < 64) {
+        return MUSIC_ERR_PARAM;
+    }
+    lrc[0] = '\0';
+
+    n = snprintf(url, sizeof(url), "%s/api/song/lyric?id=%lld&lv=-1&kv=-1&tv=-1", MUSIC_API_BASE,
+                 (long long)id);
+    if (n < 0 || (size_t)n >= sizeof(url)) {
+        return MUSIC_ERR_OVERFLOW;
+    }
+
+    memset(&resp, 0, sizeof(resp));
+    ret = music_http_request(url, false, NULL, 0, NULL, &resp);
+    if (ret != 0) {
+        return MUSIC_ERR_NET;
+    }
+    keep_snippet(&resp);
+    if (resp.status != 200) {
+        LOGW("lyric http %d", resp.status);
+        music_http_resp_free(&resp);
+        return MUSIC_ERR_NET;
+    }
+
+    root = (resp.body != NULL) ? cJSON_ParseWithLength(resp.body, (size_t)resp.length) : NULL;
+    music_http_resp_free(&resp);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return MUSIC_ERR_JSON;
+    }
+
+    lrcobj = cJSON_GetObjectItemCaseSensitive(root, "lrc");
+    if (cJSON_IsObject(lrcobj)) {
+        copy_text(lrc, lrc_size, json_text(lrcobj, "lyric"));
+    }
+    cJSON_Delete(root);
+    return (lrc[0] != '\0') ? MUSIC_OK : MUSIC_ERR_UNAVAILABLE;
 }

@@ -1,19 +1,23 @@
 config NETEASE_MUSIC
-    bool "网易云音乐直连（EAPI）"
+    bool "网易云音乐直连（EAPI + 播放页/歌单/歌词/扫码登录）"
     default n
     depends on APP_PLAYER
     depends on CJSON
     depends on MBEDTLS
+    depends on APPLICATION_UI
+    # 扫码登录页用 LVGL 的 qrcode 组件渲染动态二维码
+    select LV_USE_QRCODE
     help
       把网易云音乐的开源客户端协议（EAPI）做进固件：搜索、歌单详情、歌曲详情、
-      播放直链，并用 app_player 的 music 实例真正出声。
+      播放直链、同步歌词、扫码登录，并用 app_player 的 music 实例真正出声。
+      界面是一个独立导航页（id 93），五个子页：播放 / 导航（歌单）/ 歌曲列表 /
+      歌词 / 扫码登录。
 
       协议要点：
         - 请求走 http://music.163.com/eapi/...（实测明文 HTTP 可用，返回的
-          音频直链也是 http://m7xx.music.126.net/...mp3），因此不需要 TLS；
+          音频直链和封面图也都是 http 明文），因此不需要 TLS；
         - 请求体是 AES-128-ECB 加密后的 params 表单，必须带
           Content-Type: application/x-www-form-urlencoded，否则网关返回空 body；
-        - 匿名可用，VIP/付费曲目返回 code=-110（url 为 null），按不可播放处理。
-
-      当前是里程碑 1：只有串口/ADB 的 music 调试命令，不含界面、封面、歌词与
-      扫码登录（这些属于里程碑 2）。
+        - 匿名可用，VIP/付费曲目返回 code=-110（url 为 null），按不可播放处理；
+        - 扫码登录成功后的 MUSIC_U cookie 明文存 KV（后续 EAPI 请求带 Cookie 头）。
+          注意：整条链路是明文 HTTP，登录态在网络上不加密，只适合自用固件。

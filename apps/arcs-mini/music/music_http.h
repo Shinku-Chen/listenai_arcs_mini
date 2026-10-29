@@ -33,6 +33,18 @@ typedef struct {
 int music_http_request(const char *url, bool post, const char *body, int body_len,
                        const char *extra_headers, music_http_resp_t *resp);
 
+/*
+ * 带响应头捕获的版本（扫码登录用）。
+ *
+ * cookie_out 非空时，从响应的 Set-Cookie 里抓第一个 "MUSIC_U=" 及其后续值
+ * （网易云的登录态 cookie 就叫这个名字），写进 cookie_out。抓不到就写空串。
+ * 底层用 HTTPClientFindFirstHeader/GetNextHeader 遍历响应头，所以必须在
+ * HTTPC_close 之前取。
+ */
+int music_http_request_ex(const char *url, bool post, const char *body, int body_len,
+                          const char *extra_headers, char *cookie_out, size_t cookie_size,
+                          music_http_resp_t *resp);
+
 void music_http_resp_free(music_http_resp_t *resp);
 
 #endif /* __MUSIC_HTTP_H__ */

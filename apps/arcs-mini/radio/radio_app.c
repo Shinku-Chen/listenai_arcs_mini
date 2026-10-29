@@ -26,7 +26,12 @@
 #include "power_manager.h"
 #include "app_ble_common.h"
 
+#ifdef CONFIG_NETEASE_MUSIC
+#include "music_app.h"
+#endif
+
 #include "lisa_ui_nav_scr_ids.h"
+#include "lisa_ui_invoke.h"
 
 #include "radio_catalog.h"
 #include "radio_net.h"
@@ -484,6 +489,10 @@ static void radio_app_handle_triple_click(void)
         break;
     case RADIO_PAGE_NETCFG:
         s_state.page = RADIO_PAGE_PLAYER;
+#ifdef CONFIG_NETEASE_MUSIC
+        /* 配网页退出后回到音乐页（否则用户在音乐固件里会落到电台页上） */
+        music_app_show();
+#endif
         break;
     case RADIO_PAGE_LIST:
     case RADIO_PAGE_CITY:
@@ -528,6 +537,14 @@ void radio_app_handle_action(int action)
         return;
     }
 
+#ifdef CONFIG_NETEASE_MUSIC
+    /* 音乐页在栈顶时先交给音乐：单击/双击/三击/四击它全消费，
+     * 长按（关机）与 5/6/7 击（配网）返回 false，落回下面的系统语义。 */
+    if (music_app_handle_action(action)) {
+        return;
+    }
+#endif
+
     /* 未配网时锁在配网页：只允许关机（长按）和重新发起配网（5/6/7），
      * 单击/双击/三击/四击一律不响应，避免用户退出去以后一台空电台什么都放不出来。 */
     if (!sys_wifi_has_ap() && (radio_page_t)s_state.page == RADIO_PAGE_NETCFG) {
@@ -560,6 +577,13 @@ void radio_app_handle_action(int action)
     case VOICE_MSG_BUTTON_ACTION_SEXTUPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_SEPTUPLE_CLICK:
         /* 五/六/七击：进入 BLE 配网页（屏幕显示配网二维码）并开始广播 */
+#ifdef CONFIG_NETEASE_MUSIC
+        /* 音乐页占着前台时先退回导航默认页（电台），否则配网二维码在后台看不见。
+         * nav 会 close 掉音乐页（删 LVGL 对象），必须投递到 UI 线程。 */
+        if (!radio_ui_is_visible()) {
+            LISA_UI_INVOKE_UI_ARG_NONE({ radio_ui_hide(); });
+        }
+#endif
         s_state.page = RADIO_PAGE_NETCFG;
         xSemaphoreTake(s_lock, portMAX_DELAY);
         radio_app_set_detail(NULL);
@@ -578,6 +602,16 @@ bool radio_app_intercept_action(int action)
 {
     radio_app_handle_action(action);
     return true;
+}
+
+void radio_app_audio_yield(void)
+{
+    if (!s_state.inited) {
+        return;
+    }
+    radio_app_stop(); /* 已经置 user_paused，目录刷新时不会自己再拉流 */
+    (void)radio_net_cancel();
+    LOGI("radio audio yielded to music");
 }
 
 /* 按键消息回调（订阅 VOICE_MSG_BUTTON_CHANGE） */
@@ -612,7 +646,11 @@ static void radio_app_task(void *argument)
             if (ok) {
                 s_state.auto_queried = false;
                 if ((radio_page_t)s_state.page == RADIO_PAGE_NETCFG) {
-                    s_state.page = RADIO_PAGE_PLAYER; /* 配网成功，回到电台页 */
+                    /* 配网成功：回到本固件的主页（纯电台 = 电台页；音乐固件 = 音乐页） */
+                    s_state.page = RADIO_PAGE_PLAYER;
+#ifdef CONFIG_NETEASE_MUSIC
+                    music_app_show();
+#endif
                 }
                 if (s_state.foreground) {
                     radio_app_start_auto_query();
@@ -963,12 +1001,18 @@ int radio_app_init(void)
         app_ble_netcfg_adv_start_delayed();
     }
 
+#ifdef CONFIG_NETEASE_MUSIC
+    /* 网易云音乐固件：默认页是音乐页，电台保持静默（音乐占音频焦点，
+     * 这里再自己拉一次流只会白白抢一下焦点）；目录查询照旧，切回来就有台单。 */
+    s_state.user_paused = true;
+    LOGI("netease music build: radio stays silent at boot");
+#else
     radio_app_play_current();
+#endif
     if (s_state.net_ok) {
         radio_app_start_auto_query();
     }
     LOGI("leo-radio page is the root screen");
-
     if (xTaskCreate(radio_app_task, "radio.app", RADIO_APP_TASK_STACK, NULL,
                     RADIO_APP_TASK_PRIO, &s_task) != pdPASS) {
         LOGE("failed to create app task");

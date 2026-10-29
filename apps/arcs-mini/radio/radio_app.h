@@ -71,6 +71,14 @@ int radio_app_init(void);
 /* 按键拦截：返回 true 表示这次动作已被电台消费掉 */
 bool radio_app_intercept_action(int action);
 
+/*
+ * 把音频与前台页面让给别的模块（目前是网易云音乐页）。
+ *
+ * 语义：停播 + 置 user_paused（以后目录刷新/网络恢复都不会再自己拉流），
+ * 供 music_app_init 在接管主界面时调用一次。
+ */
+void radio_app_audio_yield(void);
+
 /* 渲染侧取数；返回 false 表示取不到（持锁超时），调用方跳过本帧 */
 bool radio_app_get_model(radio_ui_model_t *out);
 bool radio_app_get_station(uint8_t index, radio_station_t *out);
