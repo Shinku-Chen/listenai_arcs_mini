@@ -168,7 +168,7 @@ typedef struct {
     uint32_t qr_at_ms;
     uint32_t qr_start_ms;
     char unikey[64];
-    char cookie[512];
+    char cookie[MUSIC_HTTP_JAR_MAX];
     char qr_url[MUSIC_QR_URL_MAX];
 
     /* 登录账号 + 「我的歌单」（扫码成功后才会有内容） */
@@ -183,6 +183,8 @@ typedef struct {
     bool busy;
     uint32_t boot_ms;
     char detail[MUSIC_SUB_MAX];
+    uint32_t detail_ms; /* detail 的设置时刻（成功类提示几秒后自动消失） */
+    bool detail_transient;
 } music_state_t;
 
 static music_state_t s_state __psram_bss__;
@@ -236,6 +238,8 @@ static void music_unlock(void)
 static void music_set_detail(const char *text)
 {
     snprintf(s_state.detail, sizeof(s_state.detail), "%s", (text != NULL) ? text : "");
+    s_state.detail_ms = music_now_ms();
+    s_state.detail_transient = false;
 }
 
 static void music_set_detailf(const char *fmt, ...)
@@ -245,6 +249,15 @@ static void music_set_detailf(const char *fmt, ...)
     va_start(args, fmt);
     vsnprintf(s_state.detail, sizeof(s_state.detail), fmt, args);
     va_end(args);
+    s_state.detail_ms = music_now_ms();
+    s_state.detail_transient = false;
+}
+
+/* 一次性提示（例如“登录成功”）：几秒后自己消失，不长期占着屏幕 */
+static void music_set_detail_info(const char *text)
+{
+    music_set_detail(text);
+    s_state.detail_transient = true;
 }
 
 static const music_song_t *music_song_locked(uint8_t index)
@@ -793,7 +806,7 @@ static void music_qr_start(void)
 static void music_qr_poll_once(void)
 {
     char key[64];
-    char cookie[512];
+    bool got_login = false;
     int state = MUSIC_QR_WAIT_SCAN;
 
     music_lock();
@@ -804,8 +817,7 @@ static void music_qr_poll_once(void)
         return;
     }
 
-    cookie[0] = '\0';
-    const int err = music_netease_qr_poll(key, &state, cookie, sizeof(cookie));
+    const int err = music_netease_qr_poll(key, &state, &got_login);
 
     music_lock();
     s_state.qr_at_ms = music_now_ms();
@@ -816,21 +828,29 @@ static void music_qr_poll_once(void)
     s_state.qr_state = (uint16_t)state;
 
     if (state == MUSIC_QR_OK) {
-        if (cookie[0] != '\0') {
-            snprintf(s_state.cookie, sizeof(s_state.cookie), "%s", cookie);
-            music_set_detail("登录成功");
+        (void)music_netease_cookie_copy(s_state.cookie, sizeof(s_state.cookie));
+        if (got_login) {
+            music_netease_set_cookie(s_state.cookie);
+            music_set_detail_info("登录成功");
+            /*
+             * 扫码成功就立刻离开二维码页回导航页：「我的歌单」在导航页顶部，
+             * 用户应该马上看到结果，而不是盯着一张已失效的二维码。
+             */
+            s_state.page = MUSIC_PAGE_MENU;
+            s_state.menu_index = 0;
             music_unlock();
             /* KV 写 flash 不能在持锁时做（要几十毫秒，会拖住渲染抽帧） */
-            music_netease_set_cookie(s_state.cookie);
             (void)lisa_kv_set_string(MUSIC_KV_KEY_COOKIE, s_state.cookie);
+            LOGI("qr login ok: cookie %u bytes", (unsigned)strlen(s_state.cookie));
             /* 登录态生效后立刻取账号 + 我的歌单，导航页顶部就会出现它们 */
             music_fetch_account();
         } else {
-            /* 少数情况下 803 不带 Set-Cookie：别假装登录成功 */
-            music_set_detail("登录返回成功但没拿到 cookie");
+            /* 803 但没下发 MUSIC_U：别假装登录成功 */
+            s_state.cookie[0] = '\0';
+            music_set_detail("登录成功但没拿到 cookie");
             music_unlock();
+            LOGW("qr login 803 but no MUSIC_U in cookie jar");
         }
-        LOGI("qr login ok, cookie %s", cookie[0] != '\0' ? "saved" : "missing");
         return;
     }
     if (state == MUSIC_QR_EXPIRED) {
@@ -1091,6 +1111,12 @@ static void music_tick(void)
     music_lock();
     if (s_state.lyric_count > 0) {
         music_lyric_seek(s_state.pos_ms);
+    }
+
+    /* 一次性提示（登录成功等）3 秒后自动消失 */
+    if (s_state.detail_transient && s_state.detail[0] != '\0' &&
+        (uint32_t)(music_now_ms() - s_state.detail_ms) > 3000u) {
+        music_set_detail(NULL);
     }
 
     /* 扫码轮询：只在登录页、且状态是「待扫码/待确认」时跑 */
@@ -1699,8 +1725,10 @@ static int music_cmd(int argc, char *argv[])
                    (unsigned)s_state.current + 1u, (unsigned)s_state.pos_ms,
                    (unsigned)s_state.dur_ms, (unsigned)s_state.lyric_count,
                    (int)s_state.lyric_index);
-        shellPrint(shell, "  qr=%u logon=%s art=%d detail=%s\n", (unsigned)s_state.qr_state,
-                   s_state.cookie[0] != '\0' ? "yes" : "no", s_state.art.length,
+        shellPrint(shell, "  qr=%u logon=%s jar=%u art=%d detail=%s\n",
+                   (unsigned)s_state.qr_state,
+                   s_state.cookie[0] != '\0' ? "yes" : "no",
+                   (unsigned)strlen(s_state.cookie), s_state.art.length,
                    s_state.detail[0] != '\0' ? s_state.detail : "-");
         shellPrint(shell, "  uid=%lld nick=%s my=%d menu=%u/%u\n", (long long)s_state.uid,
                    s_state.nickname[0] != '\0' ? s_state.nickname : "-",
@@ -1831,8 +1859,23 @@ static int music_cmd(int argc, char *argv[])
             ret = music_submit(MUSIC_REQ_QR_POLL, 0, NULL);
         } else if (strcmp(what, "start") == 0) {
             ret = music_submit(MUSIC_REQ_QR_START, 0, NULL);
+        } else if (strcmp(what, "cookie") == 0) {
+            shellPrint(shell, "jar(%u): %.200s\n", (unsigned)strlen(s_state.cookie),
+                       s_state.cookie);
+            return 0;
+        } else if (strcmp(what, "logout") == 0) {
+            s_state.cookie[0] = '\0';
+            s_state.uid = 0;
+            s_state.nickname[0] = '\0';
+            s_state.my.count = 0;
+            s_state.account_loaded = false;
+            s_state.menu_index = 0;
+            music_netease_set_cookie(NULL);
+            (void)lisa_kv_set_string(MUSIC_KV_KEY_COOKIE, "");
+            shellPrint(shell, "music: logged out\n");
+            return 0;
         } else {
-            shellPrint(shell, "usage: music login start|poll\n");
+            shellPrint(shell, "usage: music login start|poll|cookie|logout\n");
             return -1;
         }
     } else if (strcmp(sub, "chain") == 0) {
@@ -1881,6 +1924,13 @@ static void music_restore_kv(void)
         snprintf(s_state.cookie, sizeof(s_state.cookie), "%s", value);
         lisa_kv_free(value);
         music_netease_set_cookie(s_state.cookie);
+        if (!music_netease_has_login()) {
+            /* 只有 __csrf 没有 MUSIC_U 的残渣不算登录态 */
+            s_state.cookie[0] = '\0';
+            music_netease_set_cookie(NULL);
+            LOGW("restored cookie has no MUSIC_U, treated as logged out");
+            return;
+        }
         /* 登录态是持久的：等网络就绪后补拉账号 + 我的歌单 */
         s_state.account_pending = true;
         LOGI("restored login cookie (%u bytes)", (unsigned)strlen(s_state.cookie));

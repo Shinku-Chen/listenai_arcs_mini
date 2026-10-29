@@ -102,6 +102,7 @@ static lv_obj_t *s_lbl_hint;
 /* 导航页 */
 static lv_obj_t *s_page_menu;
 static lv_obj_t *s_lbl_menu_pos;
+static lv_obj_t *s_lbl_menu_hint;
 static lv_obj_t *s_menu_row[MUSIC_UI_ROWS];
 static lv_obj_t *s_menu_name[MUSIC_UI_ROWS];
 static lv_obj_t *s_menu_value[MUSIC_UI_ROWS];
@@ -292,7 +293,11 @@ static void build_menu(lv_obj_t *root)
 {
     s_page_menu = ui_page(root);
     ui_page_title(s_page_menu, "网易云音乐");
-    ui_page_hint(s_page_menu, "单击选择 双击确认 三击返回");
+
+    /* 底部提示兼「登录结果 / 错误」显示位：扫码成功后这里会短暂显示“登录成功” */
+    s_lbl_menu_hint = ui_label(s_page_menu, "单击选择 双击确认 三击返回", C_MUTED_DIM,
+                               &lv_font_chinese_16);
+    lv_obj_align(s_lbl_menu_hint, LV_ALIGN_TOP_MID, 0, 206);
 
     /* 登录后条目会多出「我的歌单」并滚动，右侧标一下当前位置 */
     s_lbl_menu_pos = ui_label(s_page_menu, "", C_MUTED_DIM, &lv_font_chinese_16);
@@ -540,6 +545,9 @@ static void refresh_menu(const music_ui_model_t *m)
         ui_set_color(s_menu_name[i], selected ? C_AMBER : C_TEXT);
         ui_set_color(s_menu_value[i], selected ? C_AMBER : C_MUTED_DIM);
     }
+
+    ui_set_text(s_lbl_menu_hint, (m->detail[0] != '\0') ? m->detail : "单击选择 双击确认 三击返回");
+    ui_set_color(s_lbl_menu_hint, (m->detail[0] != '\0') ? C_RED : C_MUTED_DIM);
 }
 
 static void refresh_netcfg(const music_ui_model_t *m)
@@ -612,8 +620,9 @@ static void refresh_login(const music_ui_model_t *m)
         }
     }
 
-    ui_set_text(s_lbl_qr_hint, m->qr_hint);
-    ui_set_color(s_lbl_qr_hint, (m->qr_state == 803) ? C_GREEN : C_AMBER);
+    ui_set_text(s_lbl_qr_hint, m->detail[0] != '\0' ? m->detail : m->qr_hint);
+    ui_set_color(s_lbl_qr_hint, (m->detail[0] != '\0') ? C_RED :
+                                  ((m->qr_state == 803) ? C_GREEN : C_AMBER));
 
     ui_set_text(s_lbl_logon, m->logon);
     ui_set_color(s_lbl_logon, m->logged_in ? C_GREEN : C_MUTED_DIM);

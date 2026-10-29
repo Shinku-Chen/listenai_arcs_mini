@@ -130,11 +130,11 @@ typedef enum {
 /*
  * 扫码登录第二步：轮询（EAPI /api/login/qrcode/client/login）。
  *
- * 返回值：MUSIC_OK 表示请求成功（state 里是 800/801/802/803）；
- * MUSIC_OK 且 state == MUSIC_QR_OK 时，cookie_out 里是 "MUSIC_U=..."（可能为空 ——
- * 真机验证时要看日志，服务端偶尔只给 __csrf）。
+ * 返回值：MUSIC_OK 表示请求成功（state 里是 800/801/802/803）。
+ * 服务端下手的所有 Set-Cookie 都会并进模块内部的 cookie jar（不返回调用方定长缓冲，
+ * 因为 MUSIC_U 令牌单条就可能 1~2 KB）。got_login 非空时，告知“现在是否已经拿到 MUSIC_U”。
  */
-int music_netease_qr_poll(const char *key, int *state, char *cookie_out, size_t cookie_size);
+int music_netease_qr_poll(const char *key, int *state, bool *got_login);
 
 /*
  * 同步歌词（GET /api/song/lyric，明文 http 可用）。
@@ -146,10 +146,16 @@ int music_netease_lyric(int64_t id, char *lrc, size_t lrc_size);
 const char *music_err_text(int err);
 
 /*
- * 登录后把 "MUSIC_U=..." 交给本模块，后续 EAPI 请求会带上 Cookie 头。
+ * 登录后把 cookie jar（"MUSIC_U=...; __csrf=..."）交给本模块。
  * 传 NULL / 空串则清掉（未登录状态）。
  */
 void music_netease_set_cookie(const char *cookie);
+
+/* 当前是否已经拿到 MUSIC_U（登录态） */
+bool music_netease_has_login(void);
+
+/* 把内部 cookie jar 拷出来（给 KV 持久化用），返回 strlen */
+size_t music_netease_cookie_copy(char *out, size_t out_size);
 
 /*
  * 调试证据：最近一次响应的开头片段 + HTTP 状态码。
