@@ -1,7 +1,8 @@
 /*
  * 网易云音乐界面：独立 LVGL 子对象（挂在 lv_scr_act() 下），导航 id 93。
  *
- * 五个页面同属一个 nav screen，用 HIDDEN 切换（不要 lv_scr_load 独立 screen：
+ * 六个页面同属一个 nav screen，用 HIDDEN 切换；主菜单、歌单和设置复用菜单页。
+ * 不要 lv_scr_load 独立 screen：
  * 导航管理器 close 时删掉 active screen 会让 LVGL 拿到 NULL 活动屏幕而卡死）。
  *
  * 240x240 布局（与 radio 页同一套配色与几何）：
@@ -13,7 +14,7 @@
  *   y 132..136   ━━━━━━━━━━━━━━━━━━  进度
  *   y 140..158   0:12 / 3:45
  *   y 162..182   当前歌词（居中）
- *   y 206..224   单击换台 双击暂停 三击列表
+ *   y 206..224   单击下一首 双击暂停 三击菜单
  */
 #include <stdio.h>
 #include <string.h>
@@ -99,8 +100,9 @@ static lv_obj_t *s_lbl_lyric;
 static lv_obj_t *s_lbl_detail;
 static lv_obj_t *s_lbl_hint;
 
-/* 导航页 */
+/* 主菜单 / 歌单 / 设置：复用同一组列表控件 */
 static lv_obj_t *s_page_menu;
+static lv_obj_t *s_lbl_menu_title;
 static lv_obj_t *s_lbl_menu_pos;
 static lv_obj_t *s_lbl_menu_hint;
 static lv_obj_t *s_menu_row[MUSIC_UI_ROWS];
@@ -220,12 +222,13 @@ static lv_obj_t *ui_page(lv_obj_t *parent)
     return page;
 }
 
-static void ui_page_title(lv_obj_t *page, const char *text)
+static lv_obj_t *ui_page_title(lv_obj_t *page, const char *text)
 {
     lv_obj_t *title = ui_label(page, text, C_AMBER, &lv_font_chinese_16);
 
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 3);
     ui_box(page, 12, 28, 216, 1, 0, C_GRID_DIM);
+    return title;
 }
 
 static void ui_page_hint(lv_obj_t *page, const char *text)
@@ -284,7 +287,7 @@ static void build_player(lv_obj_t *root)
     s_lbl_detail = ui_clip_label(s_page_player, "", C_RED, &lv_font_chinese_16, 220);
     lv_obj_align(s_lbl_detail, LV_ALIGN_TOP_MID, 0, 184);
 
-    s_lbl_hint = ui_label(s_page_player, "单击下一首 双击暂停 三击列表", C_FOOT,
+    s_lbl_hint = ui_label(s_page_player, "单击下一首 双击暂停 三击菜单", C_FOOT,
                           &lv_font_chinese_16);
     lv_obj_align(s_lbl_hint, LV_ALIGN_TOP_LEFT, 12, 206);
 }
@@ -292,14 +295,14 @@ static void build_player(lv_obj_t *root)
 static void build_menu(lv_obj_t *root)
 {
     s_page_menu = ui_page(root);
-    ui_page_title(s_page_menu, "网易云音乐");
+    s_lbl_menu_title = ui_page_title(s_page_menu, "网易云音乐");
 
     /* 底部提示兼「登录结果 / 错误」显示位：扫码成功后这里会短暂显示“登录成功” */
     s_lbl_menu_hint = ui_label(s_page_menu, "单击选择 双击确认 三击返回", C_MUTED_DIM,
                                &lv_font_chinese_16);
     lv_obj_align(s_lbl_menu_hint, LV_ALIGN_TOP_MID, 0, 206);
 
-    /* 登录后条目会多出「我的歌单」并滚动，右侧标一下当前位置 */
+    /* 二级歌单超过五项时滚动，右侧标一下当前位置 */
     s_lbl_menu_pos = ui_label(s_page_menu, "", C_MUTED_DIM, &lv_font_chinese_16);
     lv_obj_align(s_lbl_menu_pos, LV_ALIGN_TOP_RIGHT, -12, 3);
 
@@ -507,7 +510,7 @@ static void refresh_player(const music_ui_model_t *m)
         ui_set_text(s_lbl_lyric, m->lyric[m->lyric_center]);
         ui_set_color(s_lbl_lyric, m->playing ? C_AMBER : C_AMBER_SOFT);
     } else if (m->song_index == 0) {
-        ui_set_text(s_lbl_lyric, m->net_ok ? "双击进列表选歌" : "未连接网络");
+        ui_set_text(s_lbl_lyric, m->net_ok ? "三击菜单选择歌单" : "未连接网络");
         ui_set_color(s_lbl_lyric, C_MUTED_DIM);
     } else {
         ui_set_text(s_lbl_lyric, "");
@@ -519,6 +522,8 @@ static void refresh_player(const music_ui_model_t *m)
 static void refresh_menu(const music_ui_model_t *m)
 {
     char text[16];
+
+    ui_set_text(s_lbl_menu_title, m->menu_title);
 
     if (m->menu_count > MUSIC_UI_ROWS) {
         snprintf(text, sizeof(text), "%u/%u", (unsigned)m->menu_index + 1u,
@@ -546,7 +551,7 @@ static void refresh_menu(const music_ui_model_t *m)
         ui_set_color(s_menu_value[i], selected ? C_AMBER : C_MUTED_DIM);
     }
 
-    ui_set_text(s_lbl_menu_hint, (m->detail[0] != '\0') ? m->detail : "单击选择 双击确认 三击返回");
+    ui_set_text(s_lbl_menu_hint, (m->detail[0] != '\0') ? m->detail : m->menu_hint);
     ui_set_color(s_lbl_menu_hint, (m->detail[0] != '\0') ? C_RED : C_MUTED_DIM);
 }
 
@@ -751,7 +756,9 @@ static void destroy(void)
 
     s_page_player = NULL;
     s_page_menu = NULL;
+    s_lbl_menu_title = NULL;
     s_lbl_menu_pos = NULL;
+    s_lbl_menu_hint = NULL;
     s_page_list = NULL;
     s_page_lyric = NULL;
     s_page_login = NULL;

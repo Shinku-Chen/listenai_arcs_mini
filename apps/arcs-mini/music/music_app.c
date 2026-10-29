@@ -85,7 +85,7 @@ static void music_netcfg_enter(void);
 #define MUSIC_LOG_LINES 20
 #define MUSIC_LOG_LINE  120
 
-/* 导航页：3 个推荐歌单 + 歌词 + 扫码登录 */
+/* 歌单二级菜单：我的歌单之后保留 3 个推荐榜单。 */
 static const struct {
     const char *name;
     int64_t id;
@@ -97,15 +97,18 @@ static const struct {
 #define MUSIC_PLAYLIST_COUNT ((uint8_t)(sizeof(s_playlists) / sizeof(s_playlists[0])))
 
 /*
- * 导航页条目。登录后「我的歌单」会动态插在最前面，所以条目数不是编译期常量：
- *   [我的歌单 …] + 热歌榜 / 新歌榜 / 飙升榜 + 歌词 + 扫码登录
- * 未登录时（无 cookie）就只有后面 5 条，和一屏的高度恰好一致。
+ * 主菜单固定四项；歌单二级菜单按登录结果动态加入「我的歌单」。
+ * 设置二级菜单通过现有音量服务调节并保存音量。
  */
 typedef enum {
     MUSIC_ITEM_MY = 0, /* 登录用户自己的歌单（index 指向 s_state.my） */
     MUSIC_ITEM_CHART,  /* 官方榜单（index 指向 s_playlists） */
     MUSIC_ITEM_LYRIC,
     MUSIC_ITEM_LOGIN,
+    MUSIC_ITEM_PLAYLISTS,
+    MUSIC_ITEM_SETTINGS,
+    MUSIC_ITEM_VOLUME_UP,
+    MUSIC_ITEM_VOLUME_DOWN,
 } music_item_kind_t;
 
 typedef struct {
@@ -136,6 +139,8 @@ typedef struct {
     bool started;      /* 开机自动进音乐页只做一次 */
     uint8_t page;      /* music_page_t */
     uint8_t menu_index;
+    uint8_t menu_level; /* music_menu_level_t */
+    uint8_t menu_selection[MUSIC_MENU_LEVEL_COUNT];
     uint8_t list_index;
 
     /* 当前歌单 */
@@ -270,10 +275,38 @@ static const music_song_t *music_song_locked(uint8_t index)
 
 /* ==================== 导航页条目 ==================== */
 
-/* 条目总数（锁内调用）：未登录 = 3 榜单 + 歌词 + 扫码登录 = 5 */
+/* 当前层级条目总数（锁内调用）。 */
 static uint8_t music_menu_count_locked(void)
 {
-    return (uint8_t)(s_state.my.count + MUSIC_PLAYLIST_COUNT + 2u);
+    switch ((music_menu_level_t)s_state.menu_level) {
+    case MUSIC_MENU_PLAYLISTS:
+        return (uint8_t)(s_state.my.count + MUSIC_PLAYLIST_COUNT);
+    case MUSIC_MENU_SETTINGS:
+        return 2u;
+    case MUSIC_MENU_ROOT:
+    default:
+        return 4u;
+    }
+}
+
+static void music_menu_normalize_locked(void)
+{
+    if (s_state.menu_level >= MUSIC_MENU_LEVEL_COUNT) {
+        s_state.menu_level = MUSIC_MENU_ROOT;
+    }
+    if (s_state.menu_index >= music_menu_count_locked()) {
+        s_state.menu_index = 0;
+    }
+    s_state.menu_selection[s_state.menu_level] = s_state.menu_index;
+}
+
+static void music_menu_open_locked(music_menu_level_t level)
+{
+    music_menu_normalize_locked();
+    s_state.menu_level = (uint8_t)level;
+    s_state.menu_index = s_state.menu_selection[level];
+    music_menu_normalize_locked();
+    s_state.page = MUSIC_PAGE_MENU;
 }
 
 /* 把菜单下标翻译成具体条目（锁内调用） */
@@ -282,6 +315,28 @@ static bool music_menu_item_locked(uint8_t index, music_item_t *out)
     uint8_t rest;
 
     if (out == NULL) {
+        return false;
+    }
+    if (s_state.menu_level == MUSIC_MENU_ROOT) {
+        static const music_item_kind_t root_items[] = {
+            MUSIC_ITEM_PLAYLISTS, MUSIC_ITEM_LYRIC, MUSIC_ITEM_LOGIN, MUSIC_ITEM_SETTINGS,
+        };
+        if (index >= sizeof(root_items) / sizeof(root_items[0])) {
+            return false;
+        }
+        out->kind = (uint8_t)root_items[index];
+        out->index = 0;
+        return true;
+    }
+    if (s_state.menu_level == MUSIC_MENU_SETTINGS) {
+        if (index >= 2u) {
+            return false;
+        }
+        out->kind = (index == 0) ? MUSIC_ITEM_VOLUME_UP : MUSIC_ITEM_VOLUME_DOWN;
+        out->index = 0;
+        return true;
+    }
+    if (s_state.menu_level != MUSIC_MENU_PLAYLISTS) {
         return false;
     }
     if (index < s_state.my.count) {
@@ -293,17 +348,6 @@ static bool music_menu_item_locked(uint8_t index, music_item_t *out)
     if (rest < MUSIC_PLAYLIST_COUNT) {
         out->kind = MUSIC_ITEM_CHART;
         out->index = rest;
-        return true;
-    }
-    rest = (uint8_t)(rest - MUSIC_PLAYLIST_COUNT);
-    if (rest == 0) {
-        out->kind = MUSIC_ITEM_LYRIC;
-        out->index = 0;
-        return true;
-    }
-    if (rest == 1) {
-        out->kind = MUSIC_ITEM_LOGIN;
-        out->index = 0;
         return true;
     }
     return false;
@@ -835,17 +879,16 @@ static void music_qr_poll_once(void)
             music_netease_set_cookie(s_state.cookie);
             music_set_detail_info("登录成功");
             /*
-             * 扫码成功就立刻离开二维码页回导航页：「我的歌单」在导航页顶部，
-             * 用户应该马上看到结果，而不是盯着一张已失效的二维码。
+             * 扫码成功就离开二维码页，回主菜单的「歌单」入口。
              */
-            s_state.page = MUSIC_PAGE_MENU;
+            music_menu_open_locked(MUSIC_MENU_ROOT);
             s_state.menu_index = 0;
             music_unlock();
             /* KV 写 flash 不能在持锁时做（要几十毫秒，会拖住渲染抽帧） */
             (void)lisa_kv_set_string(MUSIC_KV_KEY_COOKIE, s_state.cookie);
             LOGI("qr login ok: cookie %u bytes music_u=%u", (unsigned)strlen(s_state.cookie),
                  (unsigned)music_netease_login_token_len());
-            /* 登录态生效后立刻取账号 + 我的歌单，导航页顶部就会出现它们 */
+            /* 登录态生效后立刻取账号，个人歌单出现在歌单二级菜单。 */
             music_fetch_account();
         } else {
             /* 803 但没下发 MUSIC_U：别假装登录成功 */
@@ -1179,8 +1222,10 @@ bool music_app_get_model(music_ui_model_t *out)
         return false;
     }
 
+    music_menu_normalize_locked();
     memset(out, 0, sizeof(*out));
     out->page = s_state.page;
+    out->menu_level = s_state.menu_level;
     out->menu_index = s_state.menu_index;
     out->list_index = s_state.list_index;
     out->net_ok = s_state.net_ok ? 1u : 0u;
@@ -1215,11 +1260,17 @@ bool music_app_get_model(music_ui_model_t *out)
     } else {
         snprintf(out->title, sizeof(out->title), "网易云音乐");
         snprintf(out->artist, sizeof(out->artist), "%s",
-                 s_state.net_ok ? "双击导航页选歌单" : "未连接网络");
+                 s_state.net_ok ? "三击菜单选歌单" : "未连接网络");
         snprintf(out->album, sizeof(out->album), "热歌榜 · 新歌榜 · 飙升榜");
     }
 
-    /* 导航页：我的歌单（已登录时插在最前）+ 3 个榜单 + 歌词 + 扫码登录，一屏 5 条滚动 */
+    snprintf(out->menu_title, sizeof(out->menu_title), "%s",
+             s_state.menu_level == MUSIC_MENU_PLAYLISTS ? "歌单" : "网易云音乐");
+    snprintf(out->menu_hint, sizeof(out->menu_hint), "%s",
+             s_state.menu_level == MUSIC_MENU_SETTINGS
+                 ? "单击选择 双击调节 三击返回" : "单击选择 双击确认 三击返回");
+
+    /* 所有层级复用一屏五行，歌单二级菜单超过五项时滚动。 */
     const uint8_t menu_count = music_menu_count_locked();
     uint8_t menu_window = (uint8_t)(s_state.menu_index / MUSIC_UI_ROWS * MUSIC_UI_ROWS);
 
@@ -1236,6 +1287,22 @@ bool music_app_get_model(music_ui_model_t *out)
             continue;
         }
         switch (item.kind) {
+        case MUSIC_ITEM_PLAYLISTS:
+            snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "歌单");
+            snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%u 个",
+                     (unsigned)(s_state.my.count + MUSIC_PLAYLIST_COUNT));
+            break;
+        case MUSIC_ITEM_SETTINGS:
+            snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "设置");
+            snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "音量");
+            break;
+        case MUSIC_ITEM_VOLUME_UP:
+        case MUSIC_ITEM_VOLUME_DOWN:
+            snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "%s",
+                     item.kind == MUSIC_ITEM_VOLUME_UP ? "音量增加" : "音量降低");
+            snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%c%u",
+                     item.kind == MUSIC_ITEM_VOLUME_UP ? '+' : '-', (unsigned)MUSIC_VOLUME_STEP);
+            break;
         case MUSIC_ITEM_MY: {
             const music_user_playlist_t *my = &s_state.my.items[item.index];
 
@@ -1264,12 +1331,14 @@ bool music_app_get_model(music_ui_model_t *out)
             snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%s",
                      (s_state.lyric_count > 0) ? "有" : "无");
             break;
-        default:
+        case MUSIC_ITEM_LOGIN:
             snprintf(out->menu_name[i], sizeof(out->menu_name[i]), "扫码登录");
             snprintf(out->menu_value[i], sizeof(out->menu_value[i]), "%s",
                      (s_state.cookie[0] != '\0')
                          ? (s_state.nickname[0] != '\0' ? s_state.nickname : "已登录")
                          : "未登录");
+            break;
+        default:
             break;
         }
     }
@@ -1332,6 +1401,10 @@ bool music_app_get_model(music_ui_model_t *out)
 
     const int volume = service_volume_get();
     out->volume = (volume < 0) ? 0u : (uint8_t)volume;
+    if (out->menu_level == MUSIC_MENU_SETTINGS) {
+        snprintf(out->menu_title, sizeof(out->menu_title), "设置 · 音量%u",
+                 (unsigned)out->volume);
+    }
     return true;
 }
 
@@ -1372,17 +1445,6 @@ void music_app_hide(void)
 
 /* ==================== 按键 ==================== */
 
-static void music_volume_step(void)
-{
-    const int current = service_volume_get();
-    int next = current + MUSIC_VOLUME_STEP;
-
-    if (current >= 100 || next > 100) {
-        next = 10;
-    }
-    service_volume_set(next);
-}
-
 static void music_toggle_play(void)
 {
     bool resume = false;
@@ -1422,9 +1484,16 @@ static void music_menu_enter(void)
     bool ok;
 
     music_lock();
+    music_menu_normalize_locked();
     ok = music_menu_item_locked(s_state.menu_index, &item);
     if (ok) {
         switch (item.kind) {
+        case MUSIC_ITEM_PLAYLISTS:
+            music_menu_open_locked(MUSIC_MENU_PLAYLISTS);
+            break;
+        case MUSIC_ITEM_SETTINGS:
+            music_menu_open_locked(MUSIC_MENU_SETTINGS);
+            break;
         case MUSIC_ITEM_MY:
             playlist_id = s_state.my.items[item.index].id;
             snprintf(title, sizeof(title), "%s", s_state.my.items[item.index].name);
@@ -1440,6 +1509,15 @@ static void music_menu_enter(void)
     music_unlock();
 
     if (!ok) {
+        return;
+    }
+    if (item.kind == MUSIC_ITEM_PLAYLISTS || item.kind == MUSIC_ITEM_SETTINGS) {
+        return;
+    }
+    if (item.kind == MUSIC_ITEM_VOLUME_UP || item.kind == MUSIC_ITEM_VOLUME_DOWN) {
+        /* 持久化写入放在锁外，避免阻塞渲染侧快照。 */
+        service_volume_adjust(item.kind == MUSIC_ITEM_VOLUME_UP
+                                  ? MUSIC_VOLUME_STEP : -MUSIC_VOLUME_STEP);
         return;
     }
     if (item.kind == MUSIC_ITEM_MY || item.kind == MUSIC_ITEM_CHART) {
@@ -1463,19 +1541,29 @@ static void music_menu_enter(void)
 
 static void music_back(void)
 {
+    music_lock();
     switch ((music_page_t)s_state.page) {
     case MUSIC_PAGE_SONGLIST:
-        s_state.page = MUSIC_PAGE_MENU;
+        music_menu_open_locked(MUSIC_MENU_PLAYLISTS);
         break;
     case MUSIC_PAGE_MENU:
+        if (s_state.menu_level != MUSIC_MENU_ROOT) {
+            music_menu_open_locked(MUSIC_MENU_ROOT);
+        } else {
+            s_state.page = MUSIC_PAGE_PLAYER;
+        }
+        break;
     case MUSIC_PAGE_LYRIC:
     case MUSIC_PAGE_LOGIN:
+        music_menu_open_locked(MUSIC_MENU_ROOT);
+        break;
     case MUSIC_PAGE_NETCFG:
     case MUSIC_PAGE_PLAYER:
     default:
         s_state.page = MUSIC_PAGE_PLAYER;
         break;
     }
+    music_unlock();
 }
 
 /*
@@ -1536,14 +1624,15 @@ bool music_app_handle_action(int action)
     case VOICE_MSG_BUTTON_ACTION_CLICK:
         switch ((music_page_t)s_state.page) {
         case MUSIC_PAGE_MENU: {
-            /* 条目数随登录态变化（我的歌单是动态的），所以模数要取实时值 */
+            /* 歌单层条目数会随登录状态变化，读写选中项都在锁内。 */
             music_lock();
+            music_menu_normalize_locked();
             const uint8_t menu_count = music_menu_count_locked();
-            music_unlock();
 
             if (menu_count > 0) {
                 s_state.menu_index = (uint8_t)((s_state.menu_index + 1u) % menu_count);
             }
+            music_unlock();
             break;
         }
         case MUSIC_PAGE_SONGLIST:
@@ -1591,8 +1680,10 @@ bool music_app_handle_action(int action)
     case VOICE_MSG_BUTTON_ACTION_TRIPLE_CLICK:
     case VOICE_MSG_BUTTON_ACTION_QUADRUPLE_CLICK:
         if ((music_page_t)s_state.page == MUSIC_PAGE_PLAYER) {
+            music_lock();
+            music_menu_open_locked(MUSIC_MENU_ROOT);
             s_state.menu_index = 0;
-            s_state.page = MUSIC_PAGE_MENU;
+            music_unlock();
         } else {
             music_back();
         }
@@ -1694,6 +1785,7 @@ static int music_cmd_ui(const char *name)
         {"player", MUSIC_PAGE_PLAYER},
         {"menu", MUSIC_PAGE_MENU},
         {"playlist", MUSIC_PAGE_MENU},
+        {"settings", MUSIC_PAGE_MENU},
         {"songlist", MUSIC_PAGE_SONGLIST},
         {"lyric", MUSIC_PAGE_LYRIC},
         {"login", MUSIC_PAGE_LOGIN},
@@ -1702,7 +1794,16 @@ static int music_cmd_ui(const char *name)
 
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
         if (strcmp(name, map[i].name) == 0) {
-            s_state.page = map[i].page;
+            music_lock();
+            if (map[i].page == MUSIC_PAGE_MENU) {
+                music_menu_open_locked(strcmp(name, "playlist") == 0 ? MUSIC_MENU_PLAYLISTS
+                                       : strcmp(name, "settings") == 0 ? MUSIC_MENU_SETTINGS
+                                                                       : MUSIC_MENU_ROOT);
+                s_state.menu_index = 0;
+            } else {
+                s_state.page = map[i].page;
+            }
+            music_unlock();
             LISA_UI_INVOKE_UI_ARG_NONE({ music_ui_show(); });
             if (map[i].page == MUSIC_PAGE_LOGIN &&
                 s_state.qr_state != MUSIC_QR_WAIT_SCAN) {
@@ -1745,10 +1846,11 @@ static int music_cmd(int argc, char *argv[])
                    s_state.cookie[0] != '\0' ? "yes" : "no",
                    (unsigned)strlen(s_state.cookie), s_state.art.length,
                    s_state.detail[0] != '\0' ? s_state.detail : "-");
-        shellPrint(shell, "  uid=%lld nick=%s my=%d menu=%u/%u\n", (long long)s_state.uid,
+        shellPrint(shell, "  uid=%lld nick=%s my=%d menu=%u/%u level=%u volume=%d\n", (long long)s_state.uid,
                    s_state.nickname[0] != '\0' ? s_state.nickname : "-",
                    (int)s_state.my.count, (unsigned)s_state.menu_index,
-                   (unsigned)music_menu_count_locked());
+                   (unsigned)music_menu_count_locked(), (unsigned)s_state.menu_level,
+                   service_volume_get());
         shellPrint(shell, "  psram free=%u sram free=%u\n",
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -1767,7 +1869,7 @@ static int music_cmd(int argc, char *argv[])
 
     if (strcmp(sub, "ui") == 0) {
         if (argc < 3) {
-            shellPrint(shell, "usage: music ui player|menu|songlist|lyric|login\n");
+            shellPrint(shell, "usage: music ui player|menu|playlist|settings|songlist|lyric|login\n");
             return -1;
         }
         return music_cmd_ui(argv[2]);

@@ -10,7 +10,7 @@
  *
  * 页面（都是同一个 nav screen 里的子页，用 HIDDEN 切换）：
  *   PLAYER   播放页：封面 / 歌名 / 歌手 / 进度 / 当前歌词 / 提示
- *   MENU     导航页：我的歌单（登录后）+ 3 个推荐歌单 + 歌词 + 扫码登录
+ *   MENU     主菜单：歌单 / 歌词 / 扫码登录 / 设置；歌单和设置各有二级菜单
  *   SONGLIST 歌曲列表（最多 10 首，两行式）
  *   LYRIC    歌词页（当前行 + 上下各两行）
  *   LOGIN    扫码登录（二维码 + 轮询状态）
@@ -19,7 +19,7 @@
  * 按键（单键，与电量键系统语义保持一致）：
  *   单击 PLAYER=下一首 / MENU=下移 / SONGLIST=下移 / LYRIC=下一首 / LOGIN=刷新二维码
  *   双击 PLAYER=播放暂停 / MENU=进入 / SONGLIST=播放选中 / LYRIC=播放暂停 / LOGIN=立即查询
- *   三击 PLAYER=进导航页 / 子页=回上一级（SONGLIST→MENU，其余→PLAYER）
+ *   三击 PLAYER=进主菜单 / 子页=逐级返回（歌曲列表→歌单→主菜单→播放页）
  *   四击 同三击
  *   长按 关机（单应用固件里由本模块调 power_shutdown()，否则交给 radio）
  *   5/6/7 击 蓝牙配网页（单应用固件里由本模块处理，否则交给 radio）
@@ -46,9 +46,17 @@ typedef enum {
     MUSIC_PAGE_NETCFG, /* 蓝牙配网（单应用固件自带，不再依赖 radio 模块） */
 } music_page_t;
 
+typedef enum {
+    MUSIC_MENU_ROOT = 0,
+    MUSIC_MENU_PLAYLISTS,
+    MUSIC_MENU_SETTINGS,
+    MUSIC_MENU_LEVEL_COUNT,
+} music_menu_level_t;
+
 /* 界面每帧读取的快照 */
 typedef struct {
     uint8_t page;        /* music_page_t */
+    uint8_t menu_level;  /* music_menu_level_t */
     uint8_t menu_index;  /* 导航页选中项 */
     uint8_t menu_window; /* 导航页窗口起点（登录后多出「我的歌单」，条目超过一屏） */
     uint8_t menu_count;  /* 导航页条目总数 */
@@ -78,6 +86,8 @@ typedef struct {
     char album[MUSIC_SUB_MAX];
     char detail[MUSIC_SUB_MAX]; /* 非空时用红字显示（出错/提示） */
     char list_title[MUSIC_TITLE_MAX];
+    char menu_title[20];
+    char menu_hint[MUSIC_SUB_MAX];
     char menu_name[MUSIC_UI_ROWS][20];
     char menu_value[MUSIC_UI_ROWS][20];
     char row_title[MUSIC_UI_ROWS][MUSIC_TITLE_MAX];
