@@ -1984,6 +1984,11 @@ int music_app_init(void)
         LOGE("failed to create sync objects");
         return -1;
     }
+    /* 开机每一步都打一行 INFO：以后“起不来”能直接看出停在哪个阶段，
+     * 不用再靠猜（本 SDK 内存分配失败会 __builtin_trap，静默停机）。 */
+    LOGI("music init: sync objects ok, psram free %u sram free %u",
+         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
     /* 音乐页是这套固件的主界面：让 radio 让出音频（它开机自己拉过流）。
      * 未编译电台（CONFIG_RADIO=n）时没有这个符号，也就不需要让位。 */
@@ -1995,6 +2000,7 @@ int music_app_init(void)
 #endif
 
     music_restore_kv();
+    LOGI("music init: kv restored (logon=%d)", (int)music_netease_has_login());
 
     if (music_player != NULL) {
         (void)app_player_register_callback(music_player, music_player_event_cb, NULL);
@@ -2015,6 +2021,7 @@ int music_app_init(void)
         s_state.inited = false;
         return -1;
     }
+    LOGI("music init: ui ok, psram free %u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     if (xTaskCreate(music_task, "music.app", MUSIC_TASK_STACK, NULL, MUSIC_TASK_PRIO, &s_task) !=
         pdPASS) {
@@ -2023,6 +2030,7 @@ int music_app_init(void)
         s_state.inited = false;
         return -1;
     }
+    LOGI("music init: task started");
 
     LOGI("netease music ready (milestone 2: player/playlist/lyric/login ui)");
     return 0;

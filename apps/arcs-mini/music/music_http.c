@@ -72,15 +72,82 @@ static void *music_http_get_header(void)
     return (void *)MUSIC_HTTP_DEFAULT_HEADERS;
 }
 
-/* 响应缓冲放 PSRAM：SRAM 只剩十几 KB，这里要 24 KB */
-static char *music_http_alloc(size_t size)
+/*
+ * 分配前必须留出的 PSRAM 余量。
+ *
+ * 这套 SDK 的堆失败回调是 __builtin_trap()（arcs-sdk/system/heap/sysheap.c
+ * 的 CRASH_ON_ALLOC_FAIL），一旦 heap_caps_malloc 失败整机静默停机——落在
+ * 开机阶段就是“黑屏 + adb 掉线 + 串口没日志”这种最难查的现象。音乐链路只是
+ * 众多内存使用者之一（LVGL 缓冲、WiFi/mbedtls、播放器解码都在抢），所以每次
+ * 大块分配前先看余量，不够就降级，绝不把系统推到 trap 上。
+ */
+#define MUSIC_PSRAM_RESERVE     (128 * 1024)
+/* 小于这个尺寸才允许退回内部 SRAM（大块请求内部分配必然失败 → trap） */
+#define MUSIC_ALLOC_INTERNAL_MAX (8 * 1024)
+
+static size_t music_psram_free(void)
 {
+    return heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+}
+
+/* 带余量检查的 PSRAM 分配（带日志，方便下次开机一眼看出卡在哪） */
+static char *music_http_alloc_tag(size_t size, const char *what)
+{
+    const size_t free_psram = music_psram_free();
+
+    if (free_psram < size + MUSIC_PSRAM_RESERVE) {
+        LOGW("%s: need %u + reserve, psram free %u -> skip", what, (unsigned)size,
+             (unsigned)free_psram);
+        return NULL;
+    }
     char *buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
 
     if (buffer == NULL) {
-        buffer = malloc(size);
+        LOGW("%s: psram %u bytes alloc failed (free %u)", what, (unsigned)size,
+             (unsigned)music_psram_free());
     }
     return buffer;
+}
+
+/* 响应缓冲放 PSRAM：SRAM 只剩十几 KB，这里要几十 KB。
+ * 拿不到 PSRAM 时只给小块留内部 SRAM 退路，绝不往内部堆塞大块。 */
+static char *music_http_alloc(size_t size)
+{
+    char *buffer = music_http_alloc_tag(size, "http.buf");
+
+    if (buffer == NULL && size <= MUSIC_ALLOC_INTERNAL_MAX) {
+        const size_t free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+
+        if (free_sram > size + (16 * 1024)) {
+            buffer = heap_caps_malloc(size, MALLOC_CAP_INTERNAL);
+        }
+    }
+    return buffer;
+}
+
+/*
+ * 按可用内存“降级取最大”：先试 72 KB，不够就 48 / 32 / 16 KB。
+ * 歌单详情实测新歌榜 20.6 KB、飙升榜 21.7 KB、热歌榜 38.1 KB，
+ * 内存紧张时降到 32 KB 仍能覆盖两个榜，热歌榜会被截断但不会拖死系统。
+ */
+static char *music_http_alloc_resp(size_t want, size_t *got)
+{
+    static const size_t steps[] = {72 * 1024, 48 * 1024, 32 * 1024, 16 * 1024, 8 * 1024};
+
+    for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+        const size_t size = steps[i];
+
+        if (size > want) {
+            continue;
+        }
+        char *buffer = music_http_alloc_tag(size + 1, "http.resp");
+
+        if (buffer != NULL) {
+            *got = size;
+            return buffer;
+        }
+    }
+    return NULL;
 }
 
 void music_http_resp_free(music_http_resp_t *resp)
@@ -320,22 +387,26 @@ int music_http_request_ex(const char *url, bool post, const char *body, int body
     /* 登录态 cookie 必须在 HTTPC_close 之前取（响应头只活在 session 里） */
     music_http_capture_cookie(param, cookie_jar, jar_size);
 
-    char *buffer = music_http_alloc(MUSIC_HTTP_RESP_CAP + 1);
+    size_t cap = 0;
+    char *buffer = music_http_alloc_resp(MUSIC_HTTP_RESP_CAP, &cap);
     if (buffer == NULL) {
-        LOGE("no memory for response (%d bytes)", MUSIC_HTTP_RESP_CAP);
+        LOGE("no memory for response (need %d bytes, psram free %u)", MUSIC_HTTP_RESP_CAP,
+             (unsigned)music_psram_free());
         HTTPC_close(param);
         s_headers = NULL;
         free(param);
         return -2;
     }
+    if (cap < MUSIC_HTTP_RESP_CAP) {
+        LOGW("response buffer degraded to %u bytes", (unsigned)cap);
+    }
 
     size_t used = 0;
     if (info.TotalResponseBodyLength > 0) {
         size_t total = info.TotalResponseBodyLength;
-        if (total > MUSIC_HTTP_RESP_CAP) {
-            LOGW("response %u > cap %u, truncating", (unsigned)total,
-                 (unsigned)MUSIC_HTTP_RESP_CAP);
-            total = MUSIC_HTTP_RESP_CAP;
+        if (total > cap) {
+            LOGW("response %u > cap %u, truncating", (unsigned)total, (unsigned)cap);
+            total = cap;
         }
         while (used < total) {
             UINT32 received = 0;
@@ -357,11 +428,11 @@ int music_http_request_ex(const char *url, bool post, const char *body, int body
         /* 没有 Content-Length（服务端分块）：一直读到对端关闭或超过上限 */
         for (;;) {
             UINT32 received = 0;
-            const UINT32 want = (UINT32)((MUSIC_HTTP_RESP_CAP - used) > MUSIC_HTTP_READ_CHUNK
+            const UINT32 want = (UINT32)((cap - used) > MUSIC_HTTP_READ_CHUNK
                                              ? MUSIC_HTTP_READ_CHUNK
-                                             : (MUSIC_HTTP_RESP_CAP - used));
+                                             : (cap - used));
             if (want == 0) {
-                LOGW("response hit cap %u", (unsigned)MUSIC_HTTP_RESP_CAP);
+                LOGW("response hit cap %u", (unsigned)cap);
                 break;
             }
             if (HTTPC_read(param, buffer + used, want, (void *)&received) != 0) {
@@ -581,17 +652,23 @@ int music_http_raw_post(const char *url, const char *headers, const char *body, 
     }
     heap_caps_free(request);
 
-    buffer = music_http_alloc(MUSIC_RAW_RESP_MAX + 1);
+    size_t raw_cap = 0;
+    buffer = music_http_alloc_resp(MUSIC_RAW_RESP_MAX, &raw_cap);
     if (buffer == NULL) {
+        LOGE("no memory for raw response (need %d bytes, psram free %u)", MUSIC_RAW_RESP_MAX,
+             (unsigned)music_psram_free());
         close(fd);
         return -2;
     }
+    if (raw_cap < MUSIC_RAW_RESP_MAX) {
+        LOGW("raw response buffer degraded to %u bytes", (unsigned)raw_cap);
+    }
     for (;;) {
-        if (used >= MUSIC_RAW_RESP_MAX) {
-            LOGW("raw response hit cap %u", (unsigned)MUSIC_RAW_RESP_MAX);
+        if (used >= raw_cap) {
+            LOGW("raw response hit cap %u", (unsigned)raw_cap);
             break;
         }
-        const int got = (int)recv(fd, buffer + used, MUSIC_RAW_RESP_MAX - used, 0);
+        const int got = (int)recv(fd, buffer + used, raw_cap - used, 0);
 
         if (got <= 0) {
             break;

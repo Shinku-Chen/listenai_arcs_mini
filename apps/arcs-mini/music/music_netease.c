@@ -75,13 +75,32 @@ int music_netease_last_status;
  */
 static char s_cookie[MUSIC_HTTP_JAR_MAX] __psram_bss__;
 
-/* 临时缓冲优先放 PSRAM（登后 EAPI 的明文/密文能到 3~4 KB，别去抢内部 SRAM） */
+/*
+ * 临时缓冲优先放 PSRAM（登后 EAPI 的明文/密文能到 3~4 KB，别去抢内部 SRAM）。
+ *
+ * 注意：本 SDK 的堆失败回调是 __builtin_trap()，分配失败 = 整机静默停机。
+ * 所以这里也先看余量：大块请求不够就直接返回 NULL 让调用方走错误分支，
+ * 只有小块（≤ 4 KB）才允许退回内部 SRAM。
+ */
+#define MUSIC_ALLOC_PSRAM_RESERVE (128 * 1024)
+#define MUSIC_ALLOC_INTERNAL_MAX  (4 * 1024)
+
 static void *music_malloc(size_t size)
 {
+    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+    if (free_psram < size + MUSIC_ALLOC_PSRAM_RESERVE) {
+        LOGE("alloc %u rejected: psram free %u", (unsigned)size, (unsigned)free_psram);
+        return NULL;
+    }
     void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
 
     if (ptr == NULL) {
-        ptr = malloc(size);
+        LOGE("psram alloc %u failed (free %u)", (unsigned)size,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        if (size <= MUSIC_ALLOC_INTERNAL_MAX) {
+            ptr = malloc(size);
+        }
     }
     return ptr;
 }
