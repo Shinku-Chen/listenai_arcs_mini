@@ -39,12 +39,10 @@ int main(int argc, char **argv)
     /* LVGL + UI 线程：只做显示，不加载助手页面（lisa_ui_app_init 不调用） */
     {
         extern int lisa_ui_lvgl_init(void);
-        extern int lisa_ui_lvgl_run(void);
 
         lv_i18n_init(lv_i18n_language_pack);
         lisa_ui_invoke_init();
         lisa_ui_lvgl_init();
-        lisa_ui_lvgl_run();
     }
 
     /* 电台把自己注册成导航栈的默认页面（整个 UI 就是它）并开始播放。
@@ -71,6 +69,13 @@ int main(int argc, char **argv)
         }
     }
 #endif
+
+    /* 先完成默认页构建，再启动刷新循环，避免 worq.ui 读到主线程
+     * 正在调整的 LVGL 样式/对象；顺序与 lisa_ui_init() 保持一致。 */
+    {
+        extern int lisa_ui_lvgl_run(void);
+        lisa_ui_lvgl_run();
+    }
 
     LOGI("leo-radio ready");
 
