@@ -18,6 +18,19 @@
 #define MUSIC_HTTP_TIMEOUT_S 15
 
 /*
+ * 调用方没给扩展头时必须回退到这一串，不能返回 NULL。
+ *
+ * httpclient 在 HTTPClientSendRequest() 里对 GetHeader() 的返回值只判 NULL：
+ *     pHttpHeaders = GetHeader();
+ *     if (!pHttpHeaders) { nRetCode = -1; break; }
+ * 也就是说返回 NULL 会让整个请求在「解析完 URL、还没做 DNS」时立刻失败，
+ * 且失败码就是 -1（与 connect 失败、超时无法区分）。
+ * 这是个隐藏地雷：EAPI 的 POST 一直带着 Content-Type/Referer，所以从来没踩到；
+ * 只有不带头部的 GET（/api/search/get、/api/song/lyric）会瞬间失败。
+ */
+#define MUSIC_HTTP_DEFAULT_HEADERS "Accept:*/*&Referer:https://music.163.com/"
+
+/*
  * HTTPC 的 GetHeader 回调没有 user 参数，只能返回全局。
  * 本模块所有请求都在同一个 music 工作线程里串行执行，所以单指针够用。
  */
@@ -25,7 +38,10 @@ static const char *s_headers;
 
 static void *music_http_get_header(void)
 {
-    return (void *)s_headers;
+    if (s_headers != NULL && s_headers[0] != '\0') {
+        return (void *)s_headers;
+    }
+    return (void *)MUSIC_HTTP_DEFAULT_HEADERS;
 }
 
 /* 响应缓冲放 PSRAM：SRAM 只剩十几 KB，这里要 24 KB */
@@ -132,6 +148,8 @@ int music_http_request_ex(const char *url, bool post, const char *body, int body
 
     s_headers = extra_headers;
 
+    LOGI("%s %s", post ? "POST" : "GET", url);
+
     int ret = HTTPC_open(param);
     if (ret != 0) {
         LOGE("open failed(%d): %s", ret, url);
@@ -160,6 +178,7 @@ int music_http_request_ex(const char *url, bool post, const char *body, int body
         return -1;
     }
     resp->status = (int)info.HTTPStatusCode;
+    LOGI("http=%d body=%u", resp->status, (unsigned)info.TotalResponseBodyLength);
 
     /* 登录态 cookie 必须在 HTTPC_close 之前取（响应头只活在 session 里） */
     music_http_capture_cookie(param, cookie_out, cookie_size);
