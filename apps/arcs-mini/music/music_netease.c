@@ -749,6 +749,7 @@ static int weapi_enc_sec_key(const char secret[17], char out[257])
     mbedtls_mpi e;
     mbedtls_mpi m;
     mbedtls_mpi c;
+    mbedtls_mpi rr;
     int rc;
 
     memset(block, 0, sizeof(block));
@@ -759,6 +760,7 @@ static int weapi_enc_sec_key(const char secret[17], char out[257])
     mbedtls_mpi_init(&e);
     mbedtls_mpi_init(&m);
     mbedtls_mpi_init(&c);
+    mbedtls_mpi_init(&rr);
     rc = mbedtls_mpi_read_binary(&n, s_weapi_rsa_modulus, sizeof(s_weapi_rsa_modulus));
     if (rc == 0) {
         rc = mbedtls_mpi_lset(&e, 65537);
@@ -767,7 +769,22 @@ static int weapi_enc_sec_key(const char secret[17], char out[257])
         rc = mbedtls_mpi_read_binary(&m, block, sizeof(block));
     }
     if (rc == 0) {
-        rc = mbedtls_mpi_exp_mod(&c, &m, &e, &n, NULL);
+        /*
+         * 本 SDK 在 prec_RR == NULL 时走 HSU；当前驱动对 WEAPI 的
+         * 128 字节模数会直接断言。显式准备 Montgomery 缓存以走软件
+         * 实现，并检查预计算错误（SDK 内部预计算遗漏了返回值检查）。
+         * 固定模数占满 128 字节，R^2 = 2^2048，缓存只属于当前请求。
+         */
+        rc = mbedtls_mpi_lset(&rr, 1);
+    }
+    if (rc == 0) {
+        rc = mbedtls_mpi_shift_l(&rr, 2 * sizeof(s_weapi_rsa_modulus) * 8);
+    }
+    if (rc == 0) {
+        rc = mbedtls_mpi_mod_mpi(&rr, &rr, &n);
+    }
+    if (rc == 0) {
+        rc = mbedtls_mpi_exp_mod(&c, &m, &e, &n, &rr);
     }
     if (rc == 0) {
         rc = mbedtls_mpi_write_binary(&c, result, sizeof(result));
@@ -776,6 +793,7 @@ static int weapi_enc_sec_key(const char secret[17], char out[257])
     mbedtls_mpi_free(&e);
     mbedtls_mpi_free(&m);
     mbedtls_mpi_free(&c);
+    mbedtls_mpi_free(&rr);
     if (rc != 0) {
         return MUSIC_ERR_PARAM;
     }
