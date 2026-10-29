@@ -1098,7 +1098,12 @@ static void music_tick(void)
         music_fetch_account();
     }
 
-    if (music_player != NULL) {
+    const app_player_state_t player_state = music_player != NULL
+        ? app_player_get_state(music_player) : APP_PLAYER_STATE_IDLE;
+    s_state.playing = (player_state == APP_PLAYER_STATE_PLAYING);
+
+    /* 只在播放或暂停时查询进度，避免无 demux 时反复打印错误。 */
+    if (player_state == APP_PLAYER_STATE_PLAYING || player_state == APP_PLAYER_STATE_PAUSED) {
         uint32_t pos = 0;
         uint32_t dur = 0;
 
@@ -1108,7 +1113,6 @@ static void music_tick(void)
         if (app_player_get_duration(music_player, &dur) == 0 && dur > 0) {
             s_state.dur_ms = dur;
         }
-        s_state.playing = (app_player_get_state(music_player) == APP_PLAYER_STATE_PLAYING);
     }
 
     music_lock();
