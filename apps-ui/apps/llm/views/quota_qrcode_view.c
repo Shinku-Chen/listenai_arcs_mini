@@ -32,6 +32,8 @@ static void quota_qrcode_view_constructor(const lv_obj_class_t *class_p, lv_obj_
     lv_obj_set_size(obj, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(obj, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_pad_all(obj, 0, 0);
 
     view->qr_img = lv_img_create(obj);
 #ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
@@ -39,7 +41,7 @@ static void quota_qrcode_view_constructor(const lv_obj_class_t *class_p, lv_obj_
     lv_obj_align(view->qr_img, LV_ALIGN_CENTER, -80, 0);
 #else
     lv_obj_set_size(view->qr_img, 148, 148);
-    lv_obj_align(view->qr_img, LV_ALIGN_CENTER, 0, 5);
+    lv_obj_align(view->qr_img, LV_ALIGN_CENTER, 0, -6);
 #endif
 
     view->title_label = lv_label_create(obj);
@@ -49,16 +51,28 @@ static void quota_qrcode_view_constructor(const lv_obj_class_t *class_p, lv_obj_
     lv_obj_set_width(view->title_label, LV_PCT(90));
     lv_label_set_long_mode(view->title_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(view->title_label, "");
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
     lv_obj_align_to(view->title_label, view->qr_img, LV_ALIGN_OUT_TOP_MID, 0, -25);
+#else
+    /* 滚动模式裁剪到内容框，需保留字模伸出行高的下沿。 */
+    lv_obj_set_height(view->title_label, lv_font_get_line_height(&lv_font_chinese_16) + 4);
+    lv_label_set_long_mode(view->title_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(view->title_label, LV_ALIGN_CENTER, 0, -100);
+#endif
 
     view->message_label = lv_label_create(obj);
     lv_obj_set_style_text_color(view->message_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(view->message_label, &lv_font_chinese_16, 0);
     lv_obj_set_style_text_align(view->message_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(view->message_label, LV_PCT(100));
+    lv_obj_set_width(view->message_label, LV_PCT(90));
+    lv_obj_set_style_text_opa(view->message_label, LV_OPA_70, 0);
     lv_label_set_long_mode(view->message_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(view->message_label, "");
+#ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
     lv_obj_align_to(view->message_label, view->qr_img, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
+#else
+    lv_obj_align(view->message_label, LV_ALIGN_BOTTOM_MID, 0, -12);
+#endif
 
     LV_TRACE_OBJ_CREATE("finished");
 }

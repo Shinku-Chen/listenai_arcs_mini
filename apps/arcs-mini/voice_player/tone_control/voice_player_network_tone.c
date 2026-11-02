@@ -54,6 +54,8 @@
 #define NETWORK_UNSTABLE_TONE_GRACE_MS 800U
 #define NETWORK_SUCCESS_TONE_MIN_INTERVAL_MS 3000U
 #define BIND_TONE_MIN_INTERVAL_MS 3000U
+#define STARTUP_NETCFG_TONE_DELAY_MS 2000U
+#define STARTUP_NETCFG_TONE_AFTER_BATTERY_MS 300U
 
 #define NETWORK_SUCCESS_TONE_ID TONE_ID_59
 #define NETWORK_DISCONNECTED_TONE_ID TONE_ID_60
@@ -89,11 +91,18 @@ typedef struct {
     TimerHandle_t cloud_success_delay_timer;
     /* 过滤短暂断网和网络探测抖动。 */
     TimerHandle_t network_unstable_grace_timer;
+    /* 等待 UI 首帧完成后再播放无保存 AP 的启动配网提示音。 */
+    TimerHandle_t startup_netcfg_tone_timer;
+    bool startup_netcfg_tone_pending;
+    bool startup_netcfg_tone_ui_ready;
     /* 只保护本结构中的策略状态，不覆盖实际音频播放过程。 */
     SemaphoreHandle_t lock;
 } network_tone_context_t;
 
 static network_tone_context_t s_network_tone;
+/* PLATFORM_READY 通过异步 EBUS 分发，记录 main 可能早于网络提示音模块到达的通知。 */
+static volatile bool s_startup_netcfg_tone_ui_ready_requested;
+static volatile bool s_startup_netcfg_tone_requested_before_init;
 
 /* ==================== 内部工具：状态与定时器 ==================== */
 
@@ -126,6 +135,23 @@ static void network_tone_stop_timer_locked(TimerHandle_t timer,
         xTimerStop(timer, 0) != pdPASS) {
         LOGW("failed to stop %s timer", name);
     }
+}
+
+static void network_tone_start_startup_netcfg_timer_locked(void)
+{
+    if (s_network_tone.startup_netcfg_tone_pending &&
+        s_network_tone.startup_netcfg_tone_ui_ready &&
+        s_network_tone.startup_netcfg_tone_timer != NULL &&
+        xTimerStart(s_network_tone.startup_netcfg_tone_timer, 0) != pdPASS) {
+        LOGW("failed to start startup netcfg tone timer");
+    }
+}
+
+static void network_tone_cancel_startup_netcfg_locked(void)
+{
+    network_tone_stop_timer_locked(s_network_tone.startup_netcfg_tone_timer,
+                                   "startup netcfg tone");
+    s_network_tone.startup_netcfg_tone_pending = false;
 }
 
 static void network_tone_cancel_unstable_grace_locked(void)
@@ -315,6 +341,54 @@ static void network_tone_play_bind(void)
     }
 }
 
+static void network_tone_startup_netcfg_timer_cb(TimerHandle_t timer)
+{
+    bool should_play = false;
+
+    (void)timer;
+
+    if (!network_tone_lock()) {
+        return;
+    }
+
+    if (s_network_tone.startup_netcfg_tone_pending) {
+        s_network_tone.startup_netcfg_tone_pending = false;
+        should_play = true;
+    }
+    network_tone_unlock();
+
+    if (should_play) {
+        network_tone_play(NETCFG_ENTER_TONE_ID);
+    }
+}
+
+static void network_tone_on_battery_update(void *unused, uint32_t msg_id,
+                                           void *data, uint32_t len,
+                                           void *user_data)
+{
+    (void)unused;
+    (void)msg_id;
+    (void)data;
+    (void)len;
+    (void)user_data;
+
+    if (!network_tone_lock()) {
+        return;
+    }
+
+    /* 电量首帧已经发布后，给 UI 一个短暂渲染窗口即可播报提示音。 */
+    if (s_network_tone.startup_netcfg_tone_pending &&
+        s_network_tone.startup_netcfg_tone_ui_ready &&
+        s_network_tone.startup_netcfg_tone_timer != NULL &&
+        xTimerChangePeriod(s_network_tone.startup_netcfg_tone_timer,
+                           pdMS_TO_TICKS(STARTUP_NETCFG_TONE_AFTER_BATTERY_MS),
+                           0) != pdPASS) {
+        LOGW("failed to shorten startup netcfg tone delay");
+    }
+
+    network_tone_unlock();
+}
+
 static bool cloud_unbound_active(void)
 {
     /* 云通道存在但业务连接失败时，仍处于未绑定或鉴权失败流程。 */
@@ -472,6 +546,10 @@ static void network_tone_on_cloud_message(void *unused, uint32_t msg_id,
     case VOICE_MSG_CLOUD_PUSHUP_TTS_URL:
         /* 云端主动 TTS 优先级更高，避免延迟成功提示与其连续或重叠播放。 */
         network_tone_cancel_success_delay();
+        if (network_tone_lock()) {
+            network_tone_cancel_startup_netcfg_locked();
+            network_tone_unlock();
+        }
         if (cloud_unbound_active()) {
             /* TTS 模块负责新旧 TTS 切换；这里只清理本地提示音。 */
             voice_player_tone_stop();
@@ -480,6 +558,11 @@ static void network_tone_on_cloud_message(void *unused, uint32_t msg_id,
 
     case VOICE_MSG_CLOUD_CLOUD_AUTH_SUCCESS: {
         struct app_datas *app_data = get_app_datas();
+
+        if (network_tone_lock()) {
+            network_tone_cancel_startup_netcfg_locked();
+            network_tone_unlock();
+        }
 
         if (app_data != NULL) {
             app_data->auth_failed = 0;
@@ -494,6 +577,10 @@ static void network_tone_on_cloud_message(void *unused, uint32_t msg_id,
 
         /* 失败结果会使此前候选的成功提示失效。 */
         network_tone_cancel_success_delay();
+        if (network_tone_lock()) {
+            network_tone_cancel_startup_netcfg_locked();
+            network_tone_unlock();
+        }
         if (app_data != NULL) {
             app_data->auth_failed = 1;
         }
@@ -514,6 +601,10 @@ static void network_tone_on_cloud_message(void *unused, uint32_t msg_id,
 
         /* 进入绑定引导时不再播放通用连接成功提示，避免连续播音。 */
         network_tone_cancel_success_delay();
+        if (network_tone_lock()) {
+            network_tone_cancel_startup_netcfg_locked();
+            network_tone_unlock();
+        }
         if (cloud_unbound_active()) {
             /* 未绑定状态由随后的云端 TTS 引导，不额外播放退出配网提示。 */
             voice_player_tone_stop();
@@ -530,6 +621,7 @@ static void network_tone_on_cloud_message(void *unused, uint32_t msg_id,
         if (!network_tone_lock()) {
             return;
         }
+        network_tone_cancel_startup_netcfg_locked();
         suppress = s_network_tone.suppress_next_success;
         s_network_tone.suppress_next_success = false;
         network_tone_unlock();
@@ -601,6 +693,7 @@ static void network_tone_on_link_message(void *unused, uint32_t msg_id,
         if (!network_tone_lock()) {
             return;
         }
+        network_tone_cancel_startup_netcfg_locked();
         network_tone_cancel_unstable_grace_locked();
         /* 只有已经提示过异常，恢复时才补充成功提示，避免无故播报。 */
         if (s_network_tone.outage == NETWORK_OUTAGE_ANNOUNCED) {
@@ -663,6 +756,7 @@ static void network_tone_on_ble_message(void *unused, uint32_t msg_id,
         if (!network_tone_lock()) {
             return;
         }
+        network_tone_cancel_startup_netcfg_locked();
         /* 配网后的下一次云连接由 BLE 流程负责反馈，避免两次成功提示。 */
         s_network_tone.suppress_next_success =
             voice_cloud_get_state() == VOICE_CLOUD_STATE_CONNECT_FAILED;
@@ -670,6 +764,10 @@ static void network_tone_on_ble_message(void *unused, uint32_t msg_id,
         break;
 
     case VOICE_MSG_BLE_CONNECT_DONE:
+        if (network_tone_lock()) {
+            network_tone_cancel_startup_netcfg_locked();
+            network_tone_unlock();
+        }
         network_tone_play(NETCFG_SUCCESS_TONE_ID);
         break;
 
@@ -718,6 +816,19 @@ static int network_tone_create_runtime_resources(void)
         }
     }
 
+    if (s_network_tone.startup_netcfg_tone_timer == NULL) {
+        s_network_tone.startup_netcfg_tone_timer =
+            xTimerCreate("netcfg.startup",
+                         pdMS_TO_TICKS(STARTUP_NETCFG_TONE_DELAY_MS),
+                         pdFALSE,
+                         NULL,
+                         network_tone_startup_netcfg_timer_cb);
+        if (s_network_tone.startup_netcfg_tone_timer == NULL) {
+            LOGE("failed to create startup netcfg tone timer");
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -727,6 +838,7 @@ int voice_player_network_tone_init(void)
 {
     sys_network_status_t status = {0};
     bool wifi_mode;
+    bool no_saved_ap;
     int ret = 0;
 
     if (network_tone_create_runtime_resources() != 0) {
@@ -734,6 +846,16 @@ int voice_player_network_tone_init(void)
     }
 
     network_tone_reset();
+
+    if (network_tone_lock()) {
+        if (s_startup_netcfg_tone_ui_ready_requested) {
+            s_network_tone.startup_netcfg_tone_ui_ready = true;
+        }
+        if (s_startup_netcfg_tone_requested_before_init) {
+            s_network_tone.startup_netcfg_tone_pending = true;
+        }
+        network_tone_unlock();
+    }
 
     /* 云连接、鉴权及云端业务消息。 */
     ret |= voice_msg_sub(VOICE_MSG_CLOUD_CONNECTED, network_tone_on_cloud_message, NULL);
@@ -752,13 +874,56 @@ int voice_player_network_tone_init(void)
     /* BLE 配网流程消息。 */
     ret |= voice_msg_sub(VOICE_MSG_BLE_AUTH_INFO_DONE, network_tone_on_ble_message, NULL);
     ret |= voice_msg_sub(VOICE_MSG_BLE_CONNECT_DONE, network_tone_on_ble_message, NULL);
+    ret |= voice_msg_sub(VOICE_MSG_POWER_BATTERY_UPDATE,
+                         network_tone_on_battery_update, NULL);
 
     /* Wi-Fi 模式下没有已保存 AP，启动后直接提示用户进入配网。 */
     wifi_mode = sys_network_get_status(&status) == 0 &&
                 status.mode == SYS_NETWORK_MODE_WIFI;
-    if (wifi_mode && !sys_wifi_has_ap()) {
-        network_tone_play(NETCFG_ENTER_TONE_ID);
+    no_saved_ap = wifi_mode && !sys_wifi_has_ap();
+    if (network_tone_lock()) {
+        if (no_saved_ap) {
+            s_network_tone.startup_netcfg_tone_pending = true;
+        }
+        network_tone_start_startup_netcfg_timer_locked();
+        network_tone_unlock();
     }
 
     return ret == 0 ? 0 : -1;
+}
+
+void voice_player_network_tone_request_netcfg_tone(void)
+{
+    bool should_play = false;
+
+    if (!network_tone_lock()) {
+        s_startup_netcfg_tone_requested_before_init = true;
+        return;
+    }
+
+    if (s_network_tone.startup_netcfg_tone_ui_ready) {
+        should_play = true;
+    } else {
+        s_network_tone.startup_netcfg_tone_pending = true;
+    }
+
+    network_tone_unlock();
+
+    if (should_play) {
+        network_tone_play(NETCFG_ENTER_TONE_ID);
+    }
+}
+
+void voice_player_network_tone_ui_ready(void)
+{
+    s_startup_netcfg_tone_ui_ready_requested = true;
+
+    if (!network_tone_lock()) {
+        return;
+    }
+
+    s_network_tone.startup_netcfg_tone_ui_ready = true;
+    network_tone_start_startup_netcfg_timer_locked();
+
+    network_tone_unlock();
 }

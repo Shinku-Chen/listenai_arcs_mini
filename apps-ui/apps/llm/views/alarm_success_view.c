@@ -45,7 +45,10 @@ static void alarm_success_view_constructor(const lv_obj_class_t *class_p, lv_obj
     lv_label_set_text(view->date_label, "");
     lv_obj_set_style_text_color(view->date_label, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(view->date_label, &lv_font_chinese_16, LV_PART_MAIN);
-    lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, -50, 30);
+    lv_obj_set_width(view->date_label, LV_PCT(90));
+    lv_obj_set_style_text_align(view->date_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_opa(view->date_label, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 30);
 }
 
 static void alarm_success_view_destructor(const lv_obj_class_t *class_p, lv_obj_t *obj)
@@ -75,6 +78,8 @@ void alarm_success_view_set_time(lv_obj_t *obj, const char *time_str)
     alarm_success_view_t *view = (alarm_success_view_t *)obj;
     if (view->time_label) {
         lv_label_set_text(view->time_label, time_str);
+        lv_obj_update_layout(obj);
+        lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 30);
     }
 }
 
@@ -85,5 +90,7 @@ void alarm_success_view_set_date(lv_obj_t *obj, const char *date_str)
     alarm_success_view_t *view = (alarm_success_view_t *)obj;
     if (view->date_label) {
         lv_label_set_text(view->date_label, date_str);
+        lv_obj_update_layout(obj);
+        lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 30);
     }
 }

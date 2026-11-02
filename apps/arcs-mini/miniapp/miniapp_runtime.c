@@ -1,4 +1,7 @@
 #include "miniapp.h"
+#include "miniapp_synth.h"
+#include "miniapp_audio.h"
+#include "miniapp_lua_screen.h"
 
 #include <stdio.h>
 #include <math.h>
@@ -6,6 +9,7 @@
 #include "cJSON.h"
 #include "listen_system.h"
 #include "miniapp_storage.h"
+#include "miniapp_actions.h"
 #include <string.h>
 
 #include "FreeRTOS.h"
@@ -42,6 +46,8 @@ typedef enum {
     MINIAPP_EVENT_INSTALL,
     MINIAPP_EVENT_CLICK,
     MINIAPP_EVENT_EXIT,
+    MINIAPP_EVENT_DESCRIBE,
+    MINIAPP_EVENT_ACTION,
 } miniapp_event_type_t;
 
 typedef struct {
@@ -65,6 +71,8 @@ typedef struct {
 #define MINIAPP_TTS_RESULT_SLOTS 4u
 
 typedef struct {
+    miniapp_score_t *score; /* Owned by pending VM, queue, then audio worker. */
+    bool loop;
     uint16_t frequency_hz;
     uint16_t duration_ms;
     uint32_t generation;
@@ -110,7 +118,11 @@ typedef struct {
 #endif
     bool validating;
     uint32_t http_generation;
+    bool synth_paused;
     bool faulted, retiring, storage_read;
+    bool exiting;
+    cJSON *actions;
+    int action_ref;
     char id[MINIAPP_ID_MAX + 1];
     cJSON *storage_json;
     char storage_data[MINIAPP_STORAGE_MAX_BYTES + 1];
@@ -123,7 +135,10 @@ typedef struct {
     int pending_led;
     uint32_t led_on_ms, led_off_ms;
     unsigned buzz_count;
-    miniapp_buzzer_command_t buzz[4];
+    miniapp_buzzer_command_t buzz[MINIAPP_SYNTH_QUEUE_DEPTH];
+    char audio_url[MINIAPP_AUDIO_MAX_URL_BYTES + 1];
+    bool audio_paused;
+    char audio_state[MINIAPP_AUDIO_STATE_MAX];
 } miniapp_vm_t;
 
 typedef struct {
@@ -133,6 +148,14 @@ typedef struct {
     int result;
     char error[128];
 } miniapp_request_t;
+
+typedef struct {
+    const char *action;
+    const cJSON *arguments;
+    cJSON *result;
+    SemaphoreHandle_t done;
+    char error[128];
+} miniapp_control_request_t;
 
 static QueueHandle_t s_event_queue;
 static TaskHandle_t s_task;
@@ -149,6 +172,7 @@ static miniapp_package_t s_current;
 static volatile bool s_active;
 static volatile bool s_install_busy;
 static volatile uint32_t s_buzzer_generation;
+static volatile bool s_synth_paused;
 static uint32_t s_install_generation;
 static uint32_t s_tts_next_id = 1;
 static uint32_t s_tts_worker_id;
@@ -373,64 +397,11 @@ static lua_Integer miniapp_integer(lua_State *L, int index, lua_Integer min, lua
     return value;
 }
 
-static int miniapp_lua_screen_begin(lua_State *L)
-{
-    miniapp_vm_t *vm = miniapp_vm_get(L);
-    vm->scene.background = (uint32_t)luaL_checkinteger(L, 1) & 0xffffffu;
-    vm->scene.rect_count = 0;
-    vm->scene.text_count = 0;
-    return 0;
-}
-
-static int miniapp_lua_screen_rect(lua_State *L)
-{
-    miniapp_vm_t *vm = miniapp_vm_get(L);
-    if (vm->scene.rect_count >= MINIAPP_MAX_RECTS) {
-        return luaL_error(L, "screen.rect limit is %d", MINIAPP_MAX_RECTS);
-    }
-    miniapp_rect_t *rect = &vm->scene.rects[vm->scene.rect_count++];
-    rect->x = (int16_t)miniapp_integer(L, 1, 0, MINIAPP_SCREEN_WIDTH - 1);
-    rect->y = (int16_t)miniapp_integer(L, 2, 0, MINIAPP_SCREEN_HEIGHT - 1);
-    rect->w = (int16_t)miniapp_integer(L, 3, 0, MINIAPP_SCREEN_WIDTH);
-    rect->h = (int16_t)miniapp_integer(L, 4, 0, MINIAPP_SCREEN_HEIGHT);
-    rect->color = (uint32_t)luaL_checkinteger(L, 5) & 0xffffffu;
-    if (rect->w <= 0 || rect->h <= 0 || rect->x < 0 || rect->y < 0 ||
-        rect->x + rect->w > MINIAPP_SCREEN_WIDTH ||
-        rect->y + rect->h > MINIAPP_SCREEN_HEIGHT) {
-        return luaL_error(L, "invalid rectangle");
-    }
-    return 0;
-}
-
-static int miniapp_lua_screen_text(lua_State *L)
-{
-    miniapp_vm_t *vm = miniapp_vm_get(L);
-    size_t len = 0;
-    const char *text = luaL_checklstring(L, 1, &len);
-    if (vm->scene.text_count >= MINIAPP_MAX_TEXTS) {
-        return luaL_error(L, "screen.text limit is %d", MINIAPP_MAX_TEXTS);
-    }
-    if (len > MINIAPP_TEXT_MAX) {
-        return luaL_error(L, "text is too long");
-    }
-    miniapp_text_t *item = &vm->scene.texts[vm->scene.text_count++];
-    item->x = (int16_t)miniapp_integer(L, 2, 0, MINIAPP_SCREEN_WIDTH - 1);
-    item->y = (int16_t)miniapp_integer(L, 3, 0, MINIAPP_SCREEN_HEIGHT - MINIAPP_TEXT_FONT_PX);
-    item->color = (uint32_t)luaL_checkinteger(L, 4) & 0xffffffu;
-    if (item->x < 0 || item->x >= MINIAPP_SCREEN_WIDTH || item->y < 0 ||
-        item->y + MINIAPP_TEXT_FONT_PX > MINIAPP_SCREEN_HEIGHT) {
-        return luaL_error(L, "invalid text position");
-    }
-    memcpy(item->text, text, len);
-    item->text[len] = '\0';
-    return 0;
-}
-
 static int miniapp_lua_screen_present(lua_State *L)
 {
     miniapp_vm_t *vm = miniapp_vm_get(L);
     vm->present_count++;
-    vm->presented_scene = vm->scene;
+    miniapp_scene_copy(&vm->presented_scene, &vm->scene);
     if (!vm->validating && miniapp_ui_present(&vm->scene) != 0) {
         s_status.dropped_frames++;
     }
@@ -476,12 +447,157 @@ static int miniapp_lua_led_blink(lua_State *L)
     return 0;
 }
 
-static void miniapp_buzzer_enqueue(const miniapp_buzzer_command_t *command)
+static bool miniapp_buzzer_enqueue(const miniapp_buzzer_command_t *command)
 {
     /* Sound effects are best effort. Audio contention must not fault the Lua
      * application or replay stale effects after a spoken reply or alarm. */
-    if (!s_buzzer_queue || voice_player_tts_is_active() || alarm_ring_is_active()) return;
-    (void)xQueueSend(s_buzzer_queue, command, 0);
+    if (!s_buzzer_queue || !miniapp_player || (!command->score &&
+        (voice_player_tts_is_active() || alarm_ring_is_active())) ||
+        xQueueSend(s_buzzer_queue, command, 0) != pdTRUE) {
+        lisa_mem_free(command->score);
+        return false;
+    }
+    return true;
+}
+
+static void miniapp_audio_clear_queue(void)
+{
+    miniapp_buzzer_command_t command;
+    while (s_buzzer_queue && xQueueReceive(s_buzzer_queue, &command, 0) == pdTRUE) {
+        lisa_mem_free(command.score);
+    }
+}
+
+static void miniapp_audio_clear_pending(miniapp_vm_t *vm)
+{
+    for (unsigned i = 0; i < vm->buzz_count; ++i) {
+        lisa_mem_free(vm->buzz[i].score);
+    }
+    vm->buzz_count = 0;
+}
+
+/* Scratch is Lua-owned so any validation error releases it automatically. */
+static lua_Integer miniapp_note_integer(lua_State *L, int index, const char *key, lua_Integer min, lua_Integer max)
+{
+    lua_getfield(L, index, key);
+    int exact = 0;
+    lua_Integer value = lua_tointegerx(L, -1, &exact);
+    if (!exact || value < min || value > max) {
+        luaL_error(L, "note.%s must be an integer in %d..%d", key, (int)min, (int)max);
+    }
+    lua_pop(L, 1);
+    return value;
+}
+
+static int miniapp_lua_synth_play(lua_State *L)
+{
+    luaL_checktype(L, 1, LUA_TTABLE);
+    bool loop = false;
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        lua_getfield(L, 2, "loop");
+        if (!lua_isnil(L, -1)) {
+            luaL_checktype(L, -1, LUA_TBOOLEAN);
+        }
+        loop = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+    }
+    size_t count = lua_rawlen(L, 1);
+    if (!count || count > MINIAPP_SYNTH_NOTES) {
+        return luaL_error(L, "score requires 1..256 notes");
+    }
+    miniapp_score_t *scratch = lua_newuserdata(L, sizeof(*scratch));
+    memset(scratch, 0, sizeof(*scratch));
+    scratch->count = count;
+    static const char *const waves[] = {"square", "triangle", "noise", NULL};
+    for (size_t i = 0; i < count; ++i) {
+        lua_rawgeti(L, 1, i + 1);
+        luaL_checktype(L, -1, LUA_TTABLE);
+        int index = lua_gettop(L);
+        miniapp_note_t *note = &scratch->notes[i];
+        note->at = miniapp_note_integer(L, index, "at", 0, MINIAPP_SYNTH_MAX_DURATION_MS) * 16u;
+        note->duration = miniapp_note_integer(L, index, "ms", 20, 3000) * 16u;
+        note->hz = miniapp_note_integer(L, index, "hz", 50, 5000);
+        note->voice = miniapp_note_integer(L, index, "voice", 1, MINIAPP_SYNTH_VOICES) - 1;
+        note->volume = miniapp_note_integer(L, index, "volume", 0, 100);
+        lua_getfield(L, index, "wave");
+        note->wave = luaL_checkoption(L, -1, "square", waves);
+        lua_pop(L, 2);
+        uint32_t end = note->at + note->duration;
+        if (end > MINIAPP_SYNTH_MAX_DURATION_MS * 16u) {
+            return luaL_error(L, "score exceeds 60 seconds");
+        }
+        if (end > scratch->samples) {
+            scratch->samples = end;
+        }
+    }
+    /* Small bounded insertion sort, independent of Lua's event order. */
+    for (size_t i = 1; i < count; ++i) {
+        miniapp_note_t note = scratch->notes[i];
+        size_t j = i;
+        while (j && scratch->notes[j - 1].at > note.at) {
+            scratch->notes[j] = scratch->notes[j - 1];
+            --j;
+        }
+        scratch->notes[j] = note;
+    }
+    uint32_t ends[MINIAPP_SYNTH_VOICES] = {0};
+    for (size_t i = 0; i < count; ++i) {
+        miniapp_note_t *note = &scratch->notes[i];
+        if (note->at < ends[note->voice]) {
+            return luaL_error(L, "notes overlap on the same voice");
+        }
+        ends[note->voice] = note->at + note->duration;
+    }
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    if (vm->retiring) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+    if (vm->validating && vm->buzz_count == MINIAPP_SYNTH_QUEUE_DEPTH) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+    miniapp_score_t *score = lisa_mem_alloc(sizeof(*score));
+    if (!score) {
+        return luaL_error(L, "not enough memory for synth score");
+    }
+    memcpy(score, scratch, sizeof(*score));
+    miniapp_buzzer_command_t command = {.score = score, .loop = loop, .generation = s_buzzer_generation};
+    if (vm->validating) {
+        vm->buzz[vm->buzz_count++] = command;
+    } else if (!miniapp_buzzer_enqueue(&command)) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int miniapp_lua_synth_pause(lua_State *L)
+{
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    if (vm->retiring) {
+        return 0;
+    }
+    vm->synth_paused = true;
+    if (!vm->validating) {
+        s_synth_paused = true;
+    }
+    return 0;
+}
+
+static int miniapp_lua_synth_resume(lua_State *L)
+{
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    if (vm->retiring) {
+        return 0;
+    }
+    vm->synth_paused = false;
+    if (!vm->validating) {
+        s_synth_paused = false;
+    }
+    return 0;
 }
 
 static int miniapp_lua_buzzer_play(lua_State *L)
@@ -503,10 +619,10 @@ static int miniapp_lua_buzzer_play(lua_State *L)
         .generation = s_buzzer_generation,
     };
     if (vm->validating) {
-        if (vm->buzz_count == 4) return 0;
+        if (vm->buzz_count == MINIAPP_SYNTH_QUEUE_DEPTH) return 0;
         vm->buzz[vm->buzz_count++] = command;
     } else {
-        miniapp_buzzer_enqueue(&command);
+        (void)miniapp_buzzer_enqueue(&command);
     }
     return 0;
 }
@@ -522,7 +638,7 @@ static int miniapp_lua_tts_speak(lua_State *L)
     if (!len || len > MINIAPP_TTS_TEXT_MAX || memchr(text, '\0', len)) {
         return luaL_error(L, "text must be 1..%u bytes", MINIAPP_TTS_TEXT_MAX);
     }
-    if (vm->validating || vm->faulted || vm->retiring) {
+    if (vm->validating || vm->faulted || vm->retiring || vm->exiting) {
         return luaL_error(L, "tts unavailable during startup or exit");
     }
 
@@ -600,6 +716,150 @@ static bool miniapp_buzzer_player_active(void)
            state == APP_PLAYER_STATE_PLAYING || state == APP_PLAYER_STATE_PAUSED;
 }
 
+static volatile bool s_synth_streaming, s_synth_focus_lost;
+
+#ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
+static bool miniapp_synth_focus(app_player_t *player, app_player_focus_state_t state, app_player_t *by, void *data)
+{
+    (void)data;
+    if (by == player) {
+        return false;
+    }
+    if (s_synth_streaming && state != APP_PLAYER_FOCUS_FOREGROUND) {
+        /* Stream mode has no stop(): the worker finishes/resets it instead. */
+        s_synth_focus_lost = true;
+        return true;
+    }
+    return false;
+}
+#endif
+
+static bool miniapp_player_busy(app_player_t *player)
+{
+    if (!player) {
+        return false;
+    }
+    app_player_state_t state = app_player_get_state(player);
+    return state == APP_PLAYER_STATE_PREPARING || state == APP_PLAYER_STATE_PREPARED ||
+           state == APP_PLAYER_STATE_PLAYING;
+}
+
+static bool miniapp_synth_waiting(void)
+{
+    return voice_cloud_is_session_active() || voice_cloud_is_uploading_audio() || voice_player_tts_is_active() ||
+           alarm_ring_is_active() || miniapp_player_busy(tone_player) || miniapp_player_busy(tts_player) ||
+           miniapp_player_busy(alert_player);
+}
+
+static bool miniapp_audio_cancelled(uint32_t generation)
+{
+    /* Latch every interruption, including recording before TTS starts. A
+     * short interruption must not be mistaken for ordinary end-of-score. */
+    if (s_synth_paused || miniapp_synth_waiting()) {
+        s_synth_focus_lost = true;
+    }
+    return !s_active || generation != s_buzzer_generation || s_synth_focus_lost;
+}
+
+static void miniapp_synth_play_score(const miniapp_buzzer_command_t *command)
+{
+    miniapp_synth_t synth;
+    int16_t pcm[1024]; /* 64 ms; no full-song PCM allocation. */
+    uint32_t resume_sample = 0;
+    int result = APP_PLAYER_OK;
+    miniapp_synth_init(&synth);
+#ifdef CONFIG_APP_PLAYER_AUDIO_FOCUS
+    app_player_register_focus_cb(miniapp_player, miniapp_synth_focus, NULL);
+#endif
+    app_player_set_decode_prepared_count(miniapp_player, 1);
+    app_player_set_readstream_buf_size(miniapp_player, 4096);
+    while (s_active && command->generation == s_buzzer_generation) {
+        if (s_synth_paused || miniapp_synth_waiting()) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        miniapp_synth_seek(&synth, command->score, resume_sample);
+        uint64_t rendered_samples = 0;
+        s_synth_focus_lost = false;
+        s_synth_streaming = true;
+        TickType_t started = xTaskGetTickCount();
+        bool stream_finished = false;
+        result = app_player_play_stream(miniapp_player, MINIAPP_SYNTH_RATE, 1, 16);
+        if (result == APP_PLAYER_OK) {
+            while (!miniapp_audio_cancelled(command->generation)) {
+                size_t samples = miniapp_synth_render(&synth, command->score, pcm, 1024);
+                if (!samples && command->loop) {
+                    /* Keep the PCM stream open across score boundaries. */
+                    miniapp_synth_init(&synth);
+                    samples = miniapp_synth_render(&synth, command->score, pcm, 1024);
+                }
+                if (!samples) {
+                    break;
+                }
+                rendered_samples += samples;
+                size_t offset = 0, bytes = samples * sizeof(*pcm);
+                TickType_t stalled = xTaskGetTickCount();
+                while (offset < bytes && !miniapp_audio_cancelled(command->generation)) {
+                    int written =
+                        app_player_write_stream(miniapp_player, (const uint8_t *)pcm + offset, bytes - offset, 100);
+                    if (written < 0 || (written == 0 && xTaskGetTickCount() - stalled > pdMS_TO_TICKS(1000))) {
+                        result = APP_PLAYER_ERR_IO;
+                        break;
+                    }
+                    if (written > 0) {
+                        offset += written;
+                        stalled = xTaskGetTickCount();
+                    } else {
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                    }
+                }
+                if (result != APP_PLAYER_OK) {
+                    break;
+                }
+            }
+            if (!miniapp_audio_cancelled(command->generation)) {
+                (void)app_player_finish_stream(miniapp_player);
+                stream_finished = true;
+                /* Drain the entire tail, not merely two seconds of buffering. */
+                TickType_t deadline = pdMS_TO_TICKS((command->score->samples - resume_sample) / 16u + 2000u);
+                while (result == APP_PLAYER_OK && !miniapp_audio_cancelled(command->generation) &&
+                       miniapp_buzzer_player_active() && xTaskGetTickCount() - started < deadline) {
+                    vTaskDelay(pdMS_TO_TICKS(20));
+                }
+            }
+        }
+        bool interrupted = s_synth_paused || s_synth_focus_lost || miniapp_synth_waiting();
+        uint32_t position_ms = 0;
+        if (interrupted && app_player_get_position(miniapp_player, &position_ms) == APP_PLAYER_OK) {
+            uint64_t played = (uint64_t)position_ms * 16u;
+            if (played > rendered_samples) {
+                played = rendered_samples;
+            }
+            uint64_t position = resume_sample + played;
+            resume_sample = command->loop ? position % command->score->samples : position;
+            LISA_LOGI(TAG, "synth suspended at %u ms (player=%u ms)", resume_sample / 16u, position_ms);
+        }
+        /* finish removes stream mode, allowing synchronous stop to flush queued
+         * PCM and release PA/focus. Reset alone does not send the stop event. */
+        if (!stream_finished && result == APP_PLAYER_OK) {
+            (void)app_player_finish_stream(miniapp_player);
+        }
+        if (miniapp_buzzer_player_active()) {
+            (void)app_player_stop(miniapp_player);
+        }
+        (void)app_player_reset(miniapp_player);
+        s_synth_streaming = false;
+        if (!s_active || command->generation != s_buzzer_generation || !interrupted || result != APP_PLAYER_OK ||
+            resume_sample >= command->score->samples) {
+            break;
+        }
+        /* Failed position lookup conservatively repeats only this segment. */
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    LISA_LOGI(TAG, "synth finished: notes=%u samples=%u/%u result=%d", command->score->count, synth.cursor,
+              command->score->samples, result);
+}
+
 static void miniapp_buzzer_task(void *argument)
 {
     (void)argument;
@@ -609,10 +869,19 @@ static void miniapp_buzzer_task(void *argument)
     uint8_t *wav = NULL;
     for (;;) {
         if (xQueueReceive(s_buzzer_queue, &command, portMAX_DELAY) != pdTRUE) continue;
-        if (voice_player_tts_is_active() || alarm_ring_is_active()) continue;
-        if (!s_active || command.generation != s_buzzer_generation || !miniapp_player) continue;
+        if ((!command.score && (voice_player_tts_is_active() || alarm_ring_is_active())) ||
+            !s_active || command.generation != s_buzzer_generation || !miniapp_player) {
+            lisa_mem_free(command.score);
+            continue;
+        }
         if (miniapp_buzzer_player_active() && app_player_stop(miniapp_player) != APP_PLAYER_OK) {
             LISA_LOGW(TAG, "failed to stop previous buzzer");
+            lisa_mem_free(command.score);
+            continue;
+        }
+        if (command.score) {
+            miniapp_synth_play_score(&command);
+            lisa_mem_free(command.score);
             continue;
         }
         if (!wav) wav = lisa_mem_alloc(44u + MINIAPP_BUZZER_MAX_MS * 32u);
@@ -638,7 +907,7 @@ static void miniapp_buzzer_task(void *argument)
         uint32_t phase = 0;
         for (uint32_t i = 0; i < count; ++i) {
             phase = (phase + command.frequency_hz) % 16000u;
-            int16_t sample = phase < 8000u ? 12000 : -12000;
+            int16_t sample = phase < 8000u ? MINIAPP_TONE_AMPLITUDE : -MINIAPP_TONE_AMPLITUDE;
             wav[44u + i * 2u] = (uint8_t)sample;
             wav[45u + i * 2u] = (uint8_t)((uint16_t)sample >> 8);
         }
@@ -1112,7 +1381,7 @@ static int miniapp_lua_http_request_common(lua_State *L, int url_index, int opti
     const char *url = luaL_checklstring(L, url_index, &url_len);
     if (memchr(url, 0, url_len) || strpbrk(url, "\r\n")) return luaL_error(L, "invalid http URL");
     if (!lua_checkstack(L, 4)) return luaL_error(L, "not enough Lua stack");
-    if (vm->faulted || vm->retiring || !s_http_queue) return luaL_error(L, "http unavailable");
+    if (vm->faulted || vm->retiring || vm->exiting || !s_http_queue) return luaL_error(L, "http unavailable");
     miniapp_http_request_t *request = lisa_mem_calloc(1, sizeof(*request));
     if (!request) return luaL_error(L, "no memory");
     lua_pushcfunction(L, miniapp_http_options_protected);
@@ -1187,13 +1456,15 @@ typedef struct {
     const char *error;
     const void *ancestors[MINIAPP_JSON_MAX_DEPTH + 1];
     size_t bytes;
+    size_t limit; /* zero uses the general JSON API limit */
 } json_call_t;
 
 static void fill_json(lua_State *L, int index, cJSON *out, json_call_t *c, unsigned depth)
 {
     index = lua_absindex(L, index);
+    size_t limit = c->limit ? c->limit : MINIAPP_JSON_MAX_BYTES;
     if (!lua_checkstack(L, 6)) { luaL_error(L, "not enough Lua stack"); return; }
-    if (c->bytes > MINIAPP_JSON_MAX_BYTES - 8) { c->error = "too_large"; return; }
+    if (c->bytes > limit - 8) { c->error = "too_large"; return; }
     c->bytes += 8;
     if (depth > MINIAPP_JSON_MAX_DEPTH) { c->error = "too_deep"; return; }
     if (lua_type(L, index) == LUA_TLIGHTUSERDATA && lua_touserdata(L, index) == &null_key) {
@@ -1211,7 +1482,7 @@ static void fill_json(lua_State *L, int index, cJSON *out, json_call_t *c, unsig
         size_t len;
         const char *s = lua_tolstring(L, index, &len);
         if (memchr(s, 0, len)) { c->error = "invalid_value"; break; }
-        if (len > MINIAPP_JSON_MAX_BYTES - c->bytes) { c->error = "too_large"; break; }
+        if (len > limit - c->bytes) { c->error = "too_large"; break; }
         c->bytes += len;
         out->valuestring = cJSON_malloc(len + 1);
         if (!out->valuestring) { c->error = "unavailable"; break; }
@@ -1260,7 +1531,7 @@ static void fill_json(lua_State *L, int index, cJSON *out, json_call_t *c, unsig
                 size_t n;
                 const char *key = lua_tolstring(L, -2, &n);
                 if (memchr(key, 0, n)) { c->error = "invalid_value"; break; }
-                if (n > MINIAPP_JSON_MAX_BYTES - c->bytes) { c->error = "too_large"; break; }
+                if (n > limit - c->bytes) { c->error = "too_large"; break; }
                 c->bytes += n;
                 cJSON *item = cJSON_CreateNull();
                 if (!item || !cJSON_AddItemToObject(out, key, item)) { cJSON_Delete(item); c->error = "unavailable"; break; }
@@ -1402,6 +1673,98 @@ static void miniapp_register_function(lua_State *L, const char *table,
     lua_pop(L, 1);
 }
 
+static int miniapp_lua_audio_play(lua_State *L)
+{
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    size_t size;
+    const char *url = luaL_checklstring(L, 1, &size);
+    const char *host = NULL;
+    if (strncmp(url, "http://", 7) == 0) {
+        host = url + 7;
+    }
+    if (strncmp(url, "https://", 8) == 0) {
+        host = url + 8;
+    }
+    if (!host || !*host || *host == '/' || *host == '?' || *host == '#' || size > MINIAPP_AUDIO_MAX_URL_BYTES ||
+        strlen(url) != size) {
+        return luaL_error(L, "audio.play requires a bounded HTTP(S) URL");
+    }
+    for (size_t i = 0; i < size; ++i) {
+        if ((unsigned char)url[i] <= 32 || (unsigned char)url[i] == 127) {
+            return luaL_error(L, "audio URL contains whitespace or control bytes");
+        }
+    }
+    if (vm->retiring || vm->exiting) {
+        lua_pushboolean(L, false);
+        return 1;
+    }
+    bool accepted = true;
+    if (vm->validating) {
+        memcpy(vm->audio_url, url, size + 1);
+        vm->audio_paused = false;
+    } else {
+        accepted = miniapp_audio_play(url);
+    }
+    lua_pushboolean(L, accepted);
+    return 1;
+}
+
+static int miniapp_lua_audio_pause(lua_State *L)
+{
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    if (!vm->retiring && !vm->exiting) {
+        if (vm->validating) {
+            vm->audio_paused = true;
+        } else {
+            miniapp_audio_pause(true);
+        }
+    }
+    return 0;
+}
+
+static int miniapp_lua_audio_resume(lua_State *L)
+{
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    if (!vm->retiring && !vm->exiting) {
+        if (vm->validating) {
+            vm->audio_paused = false;
+        } else {
+            miniapp_audio_pause(false);
+        }
+    }
+    return 0;
+}
+
+static int miniapp_lua_audio_stop(lua_State *L)
+{
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    if (!vm->retiring && !vm->exiting) {
+        if (vm->validating) {
+            vm->audio_url[0] = '\0';
+        } else {
+            miniapp_audio_stop();
+        }
+    }
+    return 0;
+}
+
+static const char *miniapp_vm_audio_state(const miniapp_vm_t *vm)
+{
+    if (!vm->validating) {
+        return miniapp_audio_state();
+    }
+    if (!vm->audio_url[0]) {
+        return "idle";
+    }
+    return vm->audio_paused ? "paused" : "loading";
+}
+
+static int miniapp_lua_audio_get_state(lua_State *L)
+{
+    lua_pushstring(L, miniapp_vm_audio_state(miniapp_vm_get(L)));
+    return 1;
+}
+
 static void miniapp_open_safe_libraries(lua_State *L)
 {
     static const struct {
@@ -1432,9 +1795,7 @@ static void miniapp_open_safe_libraries(lua_State *L)
 #if MINIAPP_HAS_SCREEN
     lua_newtable(L);
     lua_setglobal(L, "screen");
-    miniapp_register_function(L, "screen", "begin", miniapp_lua_screen_begin);
-    miniapp_register_function(L, "screen", "rect", miniapp_lua_screen_rect);
-    miniapp_register_function(L, "screen", "text", miniapp_lua_screen_text);
+    miniapp_lua_screen_register(L, &miniapp_vm_get(L)->scene);
     miniapp_register_function(L, "screen", "present", miniapp_lua_screen_present);
 #endif
 
@@ -1449,6 +1810,11 @@ static void miniapp_open_safe_libraries(lua_State *L)
 #if MINIAPP_HAS_BUZZER
     lua_newtable(L);
     lua_setglobal(L, "buzzer");
+    lua_newtable(L);
+    lua_setglobal(L, "synth");
+    miniapp_register_function(L, "synth", "play", miniapp_lua_synth_play);
+    miniapp_register_function(L, "synth", "pause", miniapp_lua_synth_pause);
+    miniapp_register_function(L, "synth", "resume", miniapp_lua_synth_resume);
     miniapp_register_function(L, "buzzer", "play", miniapp_lua_buzzer_play);
 #endif
 
@@ -1474,6 +1840,14 @@ static void miniapp_open_safe_libraries(lua_State *L)
     lua_setglobal(L, "tts");
     miniapp_register_function(L, "tts", "speak", miniapp_lua_tts_speak);
     miniapp_register_function(L, "tts", "cancel", miniapp_lua_tts_cancel);
+
+    lua_newtable(L);
+    lua_setglobal(L, "audio");
+    miniapp_register_function(L, "audio", "play", miniapp_lua_audio_play);
+    miniapp_register_function(L, "audio", "pause", miniapp_lua_audio_pause);
+    miniapp_register_function(L, "audio", "resume", miniapp_lua_audio_resume);
+    miniapp_register_function(L, "audio", "stop", miniapp_lua_audio_stop);
+    miniapp_register_function(L, "audio", "get_state", miniapp_lua_audio_get_state);
 
     lua_newtable(L);
 #if MINIAPP_HAS_SCREEN
@@ -1537,6 +1911,7 @@ static lua_State *miniapp_vm_create(miniapp_vm_t *vm, bool validating)
     vm->http_generation = ++s_http_generation;
     vm->validating = validating;
     vm->pending_led = -1;
+    vm->action_ref = LUA_NOREF;
     vm->scene.background = 0;
     lua_State *L = lua_newstate(miniapp_lua_alloc, vm);
     if (!L) {
@@ -1571,30 +1946,43 @@ static int miniapp_run_chunk(lua_State *L, miniapp_vm_t *vm,
     return 0;
 }
 
+typedef enum {
+    MINIAPP_CALLBACK_NO_ARGS,
+    MINIAPP_CALLBACK_INTEGER,
+    MINIAPP_CALLBACK_BUTTON,
+    MINIAPP_CALLBACK_HTTP_RESPONSE,
+    MINIAPP_CALLBACK_TTS_RESULT,
+    MINIAPP_CALLBACK_AUDIO_STATE,
+    MINIAPP_CALLBACK_ACTION,
+} miniapp_callback_kind_t;
+
 typedef struct {
     const char *name;
+    miniapp_callback_kind_t kind;
     const char *button;
     miniapp_http_response_t *http_response;
     lua_Integer argument;
     const char *text_argument;
     const char *error_code;
-    bool result_table;
-    int nargs;
+    json_call_t *json_result;
+    const char *action;
+    const cJSON *action_args;
+    bool capture_actions;
 } miniapp_callback_t;
 
-static int miniapp_callback_protected(lua_State *L)
+static int miniapp_callback_arguments(lua_State *L, const miniapp_callback_t *call)
 {
-    miniapp_callback_t *call = lua_touserdata(L, 1);
-    lua_getglobal(L, call->name);
-    if (lua_isnil(L, -1) && strcmp(call->name, "on_tick") != 0) {
-        return 0;
-    }
-    if (!lua_isfunction(L, -1)) {
-        return luaL_error(L, "%s must be a function", call->name);
-    }
-    if (call->http_response) miniapp_lua_http_response(L, call->http_response);
-    else if (call->button) lua_pushstring(L, call->button);
-    else if (call->result_table) {
+    switch (call->kind) {
+    case MINIAPP_CALLBACK_INTEGER:
+        lua_pushinteger(L, call->argument);
+        return 1;
+    case MINIAPP_CALLBACK_BUTTON:
+        lua_pushstring(L, call->button);
+        return 1;
+    case MINIAPP_CALLBACK_HTTP_RESPONSE:
+        miniapp_lua_http_response(L, call->http_response);
+        return 2;
+    case MINIAPP_CALLBACK_TTS_RESULT:
         lua_pushinteger(L, call->argument);
         lua_newtable(L);
         lua_pushstring(L, call->text_argument);
@@ -1607,11 +1995,63 @@ static int miniapp_callback_protected(lua_State *L)
             lua_setfield(L, -2, "message");
             lua_setfield(L, -2, "error");
         }
-    } else if (call->text_argument) {
-        lua_pushinteger(L, call->argument);
+        return 2;
+    case MINIAPP_CALLBACK_AUDIO_STATE:
         lua_pushstring(L, call->text_argument);
-    } else if (call->nargs) lua_pushinteger(L, call->argument);
-    lua_call(L, call->nargs, 0);
+        return 1;
+    case MINIAPP_CALLBACK_ACTION:
+        lua_pushstring(L, call->action);
+        push_json(L, call->action_args, 0);
+        return 2;
+    case MINIAPP_CALLBACK_NO_ARGS:
+        return 0;
+    }
+    return luaL_error(L, "unknown callback argument kind");
+}
+
+static int miniapp_callback_protected(lua_State *L)
+{
+    miniapp_callback_t *call = lua_touserdata(L, 1);
+    miniapp_vm_t *vm = miniapp_vm_get(L);
+    if (call->capture_actions) {
+        lua_getglobal(L, "on_action");
+        if (!lua_isfunction(L, -1)) {
+            return 0;
+        }
+        vm->action_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    if (call->kind == MINIAPP_CALLBACK_ACTION) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, vm->action_ref);
+    } else {
+        lua_getglobal(L, call->name);
+    }
+    /* Optional query callbacks with an invalid type advertise no capability. */
+    if (call->json_result && call->kind != MINIAPP_CALLBACK_ACTION && !lua_isfunction(L, -1)) {
+        return 0;
+    }
+    if (lua_isnil(L, -1) && strcmp(call->name, "on_tick") != 0) {
+        return 0;
+    }
+    if (!lua_isfunction(L, -1)) {
+        return luaL_error(L, "%s must be a function", call->name);
+    }
+
+    int nargs = miniapp_callback_arguments(L, call);
+    lua_call(L, nargs, call->json_result ? 1 : 0);
+    if (call->json_result) {
+        if (!strcmp(call->name, "get_state")) {
+            /* Strict string check: lua_isstring also accepts numbers. */
+            if (lua_type(L, -1) != LUA_TSTRING) {
+                return 0;
+            }
+            size_t length;
+            const char *state = lua_tolstring(L, -1, &length);
+            if (length > MINIAPP_ACTION_STATE_MAX || memchr(state, 0, length)) {
+                return 0;
+            }
+        }
+        fill_json(L, -1, call->json_result->root, call->json_result, 0);
+    }
     return 0;
 }
 
@@ -1639,20 +2079,24 @@ static int miniapp_invoke(lua_State *L, miniapp_vm_t *vm, miniapp_callback_t *ca
 static int miniapp_call(lua_State *L, miniapp_vm_t *vm, const char *name,
                         int nargs, lua_Integer argument)
 {
-    miniapp_callback_t call = {.name = name, .nargs = nargs, .argument = argument};
+    miniapp_callback_t call = {
+        .name = name,
+        .kind = nargs ? MINIAPP_CALLBACK_INTEGER : MINIAPP_CALLBACK_NO_ARGS,
+        .argument = argument,
+    };
     return miniapp_invoke(L, vm, &call);
 }
 
 static int miniapp_call_button(lua_State *L, miniapp_vm_t *vm, const char *button_id)
 {
-    miniapp_callback_t call = {.name = "on_button_click", .nargs = 1, .button = button_id};
+    miniapp_callback_t call = {.name = "on_button_click", .kind = MINIAPP_CALLBACK_BUTTON, .button = button_id};
     return miniapp_invoke(L, vm, &call);
 }
 
 static int miniapp_call_http_response(lua_State *L, miniapp_vm_t *vm,
                                       miniapp_http_response_t *response)
 {
-    miniapp_callback_t call = {.name = "on_http_response", .nargs = 2,
+    miniapp_callback_t call = {.name = "on_http_response", .kind = MINIAPP_CALLBACK_HTTP_RESPONSE,
                                .http_response = response};
     /* Release admission quota before Lua can chain its next request. */
     miniapp_http_remove(response->request);
@@ -1667,13 +2111,127 @@ static int miniapp_call_tts_result(lua_State *L, miniapp_vm_t *vm,
     LISA_LOGI(TAG, "TTS result id=%u status=%s error=%s", (unsigned)speech_id, result, error ? error : "");
     miniapp_callback_t call = {
         .name = "on_tts_result",
-        .nargs = 2,
+        .kind = MINIAPP_CALLBACK_TTS_RESULT,
         .argument = speech_id,
         .text_argument = result,
         .error_code = error,
-        .result_table = true,
     };
     return miniapp_invoke(L, vm, &call);
+}
+
+static int miniapp_call_audio_state(lua_State *L, miniapp_vm_t *vm)
+{
+    const char *state = miniapp_vm_audio_state(vm);
+
+    if (!strcmp(vm->audio_state, state)) {
+        return 0;
+    }
+
+    miniapp_callback_t call = {
+        .name = "on_audio_state",
+        .kind = MINIAPP_CALLBACK_AUDIO_STATE,
+        .text_argument = state,
+    };
+    int result = miniapp_invoke(L, vm, &call);
+    if (result == 0) {
+        snprintf(vm->audio_state, sizeof(vm->audio_state), "%s", state);
+    }
+    return result;
+}
+
+static int miniapp_capture_actions(lua_State *L, miniapp_vm_t *vm)
+{
+    json_call_t result = {.root = cJSON_CreateNull(), .limit = MINIAPP_ACTIONS_BYTES_MAX};
+    if (!result.root) {
+        miniapp_set_error("not enough memory for action declarations");
+        return -1;
+    }
+    miniapp_callback_t call = {.name = "get_actions", .capture_actions = true, .json_result = &result};
+    int rc = miniapp_invoke(L, vm, &call);
+    if (rc == 0 && !result.error && miniapp_actions_valid(result.root)) {
+        vm->actions = result.root;
+    } else {
+        cJSON_Delete(result.root);
+        luaL_unref(L, LUA_REGISTRYINDEX, vm->action_ref);
+        vm->action_ref = LUA_NOREF;
+        vm->actions = cJSON_CreateObject();
+    }
+    if (!vm->actions) {
+        miniapp_set_error("not enough memory for action declarations");
+    }
+    return vm->actions ? rc : -1;
+}
+
+/* Executed only by the Lua task, after rechecking foreground and generation. */
+static int miniapp_control(lua_State *L, miniapp_vm_t *vm, miniapp_control_request_t *request)
+{
+    if (request->action) {
+        const char *error = miniapp_action_validate(vm->actions, request->action, request->arguments);
+        if (error) {
+            snprintf(request->error, sizeof(request->error), "%s", error);
+            return 0;
+        }
+    }
+    json_call_t result = {.root = cJSON_CreateNull(), .limit = MINIAPP_ACTIONS_BYTES_MAX};
+    if (!result.root) {
+        return 0;
+    }
+    miniapp_callback_t call = {
+        .name = request->action ? "on_action" : "get_state",
+        .kind = request->action ? MINIAPP_CALLBACK_ACTION : MINIAPP_CALLBACK_NO_ARGS,
+        .action = request->action,
+        .action_args = request->arguments,
+        .json_result = &result,
+    };
+    int rc = miniapp_invoke(L, vm, &call);
+    if (rc != 0) {
+        snprintf(request->error, sizeof(request->error), "miniapp callback failed: %.95s", s_status.last_error);
+        cJSON_Delete(result.root);
+        return rc;
+    }
+    if (request->action) {
+        const cJSON *ok = cJSON_GetObjectItemCaseSensitive(result.root, "ok");
+        const cJSON *message = cJSON_GetObjectItemCaseSensitive(result.root, "message");
+        if (result.error || !cJSON_IsObject(result.root) || !cJSON_IsBool(ok) || !cJSON_IsString(message) ||
+            strlen(message->valuestring) > MINIAPP_ACTION_STATE_MAX) {
+            snprintf(request->error, sizeof(request->error), "on_action must return {ok=boolean, message=string}");
+            cJSON_Delete(result.root);
+        } else {
+            request->result = result.root;
+        }
+        return 0;
+    }
+    /* Invalid state values become null without disabling the application. */
+    if (result.error) {
+        cJSON_Delete(result.root);
+        result.root = cJSON_CreateNull();
+    }
+    cJSON *description = cJSON_CreateObject();
+    cJSON *app = description ? cJSON_AddObjectToObject(description, "app") : NULL;
+    cJSON *actions = cJSON_Duplicate(vm->actions, true);
+    miniapp_package_t package;
+    taskENTER_CRITICAL();
+    package = s_current; /* Same-version installs may refresh the name. */
+    taskEXIT_CRITICAL();
+    if (!description || !app || !actions || !result.root || !cJSON_AddBoolToObject(description, "running", true) ||
+        !cJSON_AddStringToObject(app, "id", package.id) || !cJSON_AddStringToObject(app, "version", package.version) ||
+        !cJSON_AddStringToObject(app, "name", package.name)) {
+        goto failed;
+    }
+    if (!cJSON_AddItemToObject(description, "state", result.root)) {
+        goto failed;
+    }
+    result.root = NULL;
+    if (!cJSON_AddItemToObject(description, "actions", actions)) {
+        goto failed;
+    }
+    request->result = description;
+    return 0;
+failed:
+    cJSON_Delete(actions);
+    cJSON_Delete(result.root);
+    cJSON_Delete(description);
+    return 0;
 }
 
 static void miniapp_tts_stop(void)
@@ -1693,6 +2251,9 @@ static void miniapp_tts_stop(void)
 
 static void miniapp_runtime_stop(lua_State **state, miniapp_vm_t *vm, bool navigate_home)
 {
+    /* Normal on_exit may persist data; replacement/fault guards remain separate. */
+    vm->exiting = true;
+    miniapp_audio_release();
     miniapp_http_discard(vm);
     miniapp_tts_stop();
     if (*state) {
@@ -1700,7 +2261,10 @@ static void miniapp_runtime_stop(lua_State **state, miniapp_vm_t *vm, bool navig
         lua_close(*state);
         *state = NULL;
     }
+    cJSON_Delete(vm->actions);
+    vm->actions = NULL;
     ++s_buzzer_generation;
+    s_synth_paused = false;
     service_led_off();
     miniapp_set_active(false);
 #ifdef CONFIG_MINIAPP_ADB_DEBUG
@@ -1711,7 +2275,7 @@ static void miniapp_runtime_stop(lua_State **state, miniapp_vm_t *vm, bool navig
     taskEXIT_CRITICAL();
     s_status.installed = false;
     if (s_buzzer_queue) {
-        xQueueReset(s_buzzer_queue);
+        miniapp_audio_clear_queue();
     }
     if (navigate_home) {
         (void)miniapp_ui_close();
@@ -1750,7 +2314,8 @@ static int miniapp_replace(lua_State **current, miniapp_vm_t **current_vm,
         goto failed;
     }
     if (miniapp_call(next, candidate, "on_start", 0, 0) != 0 ||
-        miniapp_call(next, candidate, "on_tick", 1, MINIAPP_TICK_MS) != 0) {
+        miniapp_call(next, candidate, "on_tick", 1, MINIAPP_TICK_MS) != 0 ||
+        miniapp_capture_actions(next, candidate) != 0) {
         snprintf(request->error, sizeof(request->error), "%s", s_status.last_error);
         goto failed;
     }
@@ -1772,13 +2337,16 @@ static int miniapp_replace(lua_State **current, miniapp_vm_t **current_vm,
 #endif
     /* The candidate is now usable. Do not run old callbacks with device side
      * effects: they must not clear the new scene or enqueue old sounds. */
+    miniapp_audio_release();
     if (*current) {
         miniapp_tts_stop();
         (*current_vm)->validating = true;
         (*current_vm)->retiring = true;
         (void)miniapp_call(*current, *current_vm, "on_exit", 0, 0);
         miniapp_http_discard(*current_vm);
+        miniapp_audio_clear_pending(*current_vm);
         lua_close(*current);
+        cJSON_Delete((*current_vm)->actions);
         lisa_mem_free(*current_vm);
     }
     *current = next;
@@ -1792,8 +2360,9 @@ static int miniapp_replace(lua_State **current, miniapp_vm_t **current_vm,
         candidate->storage_pending = 0;
     }
     ++s_buzzer_generation;
+    s_synth_paused = candidate->synth_paused;
     if (s_buzzer_queue) {
-        xQueueReset(s_buzzer_queue);
+        miniapp_audio_clear_queue();
     }
     service_led_off();
     taskENTER_CRITICAL();
@@ -1812,11 +2381,18 @@ static int miniapp_replace(lua_State **current, miniapp_vm_t **current_vm,
         candidate->buzz[i].generation = s_buzzer_generation;
         miniapp_buzzer_enqueue(&candidate->buzz[i]);
     }
+    candidate->buzz_count = 0; /* Ownership transferred to queue/worker. */
     if (voice_intent_contains(INTENT_MUSIC)) {
         voice_player_music_publish_info(NULL, NULL);
         (void)voice_intent_pop(INTENT_MUSIC);
     } else if (music_player && app_player_get_state(music_player) != APP_PLAYER_STATE_IDLE) {
         (void)app_player_stop(music_player);
+    }
+    if (candidate->audio_url[0]) {
+        if (!miniapp_audio_play(candidate->audio_url)) {
+            LISA_LOGW(TAG, "failed to start miniapp audio worker");
+        }
+        miniapp_audio_pause(candidate->audio_paused);
     }
     return 0;
 failed:
@@ -1824,9 +2400,18 @@ failed:
     miniapp_source_release(source);
 #endif
     miniapp_http_discard(candidate);
+    miniapp_audio_clear_pending(candidate);
+    cJSON_Delete(candidate->actions);
     lua_close(next);
     lisa_mem_free(candidate);
     return -1;
+}
+
+static void miniapp_stop_current(lua_State **state, miniapp_vm_t **vm)
+{
+    miniapp_runtime_stop(state, *vm, true);
+    lisa_mem_free(*vm);
+    *vm = NULL;
 }
 
 static void miniapp_task(void *argument)
@@ -1852,21 +2437,37 @@ static void miniapp_task(void *argument)
                 next_tick = xTaskGetTickCount() + pdMS_TO_TICKS(MINIAPP_TICK_MS);
                 xSemaphoreGive(request->done);
                 /* request belongs to the waiting caller; never touch it again. */
+            } else if (event.type == MINIAPP_EVENT_DESCRIBE || event.type == MINIAPP_EVENT_ACTION) {
+                miniapp_control_request_t *request = event.request;
+                if (!L || !s_active || event.generation != s_buzzer_generation || alarm_ring_is_active()) {
+                    if (event.type == MINIAPP_EVENT_DESCRIBE) {
+                        request->result = cJSON_CreateObject();
+                        if (request->result && !cJSON_AddBoolToObject(request->result, "running", false)) {
+                            cJSON_Delete(request->result);
+                            request->result = NULL;
+                        }
+                    } else snprintf(request->error, sizeof(request->error), "miniapp is not in foreground or application changed");
+                } else if (miniapp_control(L, vm, request) != 0) {
+                    miniapp_stop_current(&L, &vm);
+                }
+                xSemaphoreGive(request->done);
             } else if (event.generation != s_buzzer_generation) {
                 /* Input queued for a previous instance cannot affect its replacement. */
                 continue;
             } else if (event.type == MINIAPP_EVENT_CLICK && L && !alarm_ring_is_active()) {
                 if (miniapp_call_button(L, vm, event.button_id) != 0) {
-                    miniapp_runtime_stop(&L, vm, true);
-                    lisa_mem_free(vm);
-                    vm = NULL;
+                    miniapp_stop_current(&L, &vm);
                 }
             } else if (event.type == MINIAPP_EVENT_EXIT && L) {
-                miniapp_runtime_stop(&L, vm, true);
-                lisa_mem_free(vm);
-                vm = NULL;
+                miniapp_stop_current(&L, &vm);
 
             }
+        }
+        /* The audio worker can be blocked in synchronous network preparation. */
+        miniapp_audio_poll();
+        if (L && vm && !alarm_ring_is_active() &&
+            miniapp_call_audio_state(L, vm) != 0) {
+            miniapp_stop_current(&L, &vm);
         }
         miniapp_http_response_t *response;
         for (unsigned i = 0; i < MINIAPP_HTTP_MAX_REQUESTS &&
@@ -1874,9 +2475,7 @@ static void miniapp_task(void *argument)
             if (L && vm && response->request->generation == vm->http_generation &&
                 !miniapp_http_is_cancelled(response->request)) {
                 if (miniapp_call_http_response(L, vm, response) != 0) {
-                    miniapp_runtime_stop(&L, vm, true);
-                    lisa_mem_free(vm);
-                    vm = NULL;
+                    miniapp_stop_current(&L, &vm);
                 }
             } else miniapp_http_free(response->request, response);
         }
@@ -1888,9 +2487,7 @@ static void miniapp_task(void *argument)
             if (L && !tts_result->cancelled && tts_result->generation == s_buzzer_generation &&
                 miniapp_call_tts_result(L, vm, tts_result->speech_id,
                                        tts_result->result, tts_result->error) != 0) {
-                miniapp_runtime_stop(&L, vm, true);
-                lisa_mem_free(vm);
-                vm = NULL;
+                miniapp_stop_current(&L, &vm);
             }
             lisa_mem_free(tts_result);
         }
@@ -1902,9 +2499,7 @@ static void miniapp_task(void *argument)
                 continue;
             }
             if (miniapp_call(L, vm, "on_tick", 1, MINIAPP_TICK_MS) != 0) {
-                miniapp_runtime_stop(&L, vm, true);
-                lisa_mem_free(vm);
-                vm = NULL;
+                miniapp_stop_current(&L, &vm);
             } else {
                 s_status.frames++;
             }
@@ -1922,12 +2517,12 @@ int miniapp_init(void)
     s_http_queue = xQueueCreate(MINIAPP_HTTP_MAX_REQUESTS, sizeof(miniapp_http_request_t *));
     s_http_lock = xSemaphoreCreateMutex();
 #if MINIAPP_HAS_BUZZER
-    s_buzzer_queue = xQueueCreate(4, sizeof(miniapp_buzzer_command_t));
+    s_buzzer_queue = xQueueCreate(MINIAPP_SYNTH_QUEUE_DEPTH, sizeof(miniapp_buzzer_command_t));
     if (!s_buzzer_queue) {
         goto failed;
     }
 #endif
-    if (!s_event_queue || !s_http_queue || !s_http_lock || miniapp_ui_init() != 0) {
+    if (!s_event_queue || !s_http_queue || !s_http_lock) {
         goto failed;
     }
     if (xTaskCreate(miniapp_http_task, "miniapp.http", 4096, NULL, 4,
@@ -1944,8 +2539,18 @@ int miniapp_init(void)
     if (xTaskCreate(miniapp_task, "miniapp.lua", 8192, NULL, 5, &s_task) != pdPASS) {
         goto failed;
     }
+    /* The navigation registry has no remove operation. Register the UI only
+     * after every task is ready so a later startup failure cannot strand the
+     * page registration or its scene buffers. */
+    if (miniapp_ui_init() != 0) {
+        goto failed;
+    }
     return 0;
 failed:
+    if (s_task) {
+        vTaskDelete(s_task);
+        s_task = NULL;
+    }
     if (s_http_task) {
         vTaskDelete(s_http_task);
         s_http_task = NULL;
@@ -2026,6 +2631,7 @@ bool miniapp_matches(const miniapp_package_t *package)
             strcmp(s_current.id, package->id) == 0 &&
             strcmp(s_current.version, package->version) == 0 &&
             strcmp(s_current.hash, package->hash) == 0;
+    if (match) snprintf(s_current.name, sizeof(s_current.name), "%s", package->name);
     taskEXIT_CRITICAL();
     return match;
 }
@@ -2071,6 +2677,56 @@ int miniapp_button_click(const char *button_id)
     miniapp_event_t event = {.type = MINIAPP_EVENT_CLICK, .generation = s_buzzer_generation};
     snprintf(event.button_id, sizeof(event.button_id), "%s", button_id);
     return xQueueSend(s_event_queue, &event, 0) == pdTRUE ? 0 : -1;
+}
+
+static cJSON *miniapp_control_request(const char *action, const cJSON *arguments, char *error, size_t error_size)
+{
+    if (!error || !error_size) {
+        return NULL;
+    }
+    error[0] = 0;
+    if (!s_task || xTaskGetCurrentTaskHandle() == s_task) {
+        snprintf(error, error_size, "miniapp runtime unavailable");
+        return NULL;
+    }
+    miniapp_control_request_t request = {.action = action, .arguments = arguments};
+    request.done = xSemaphoreCreateBinary();
+    if (!request.done) {
+        return NULL;
+    }
+    miniapp_event_t event = {
+        .type = action ? MINIAPP_EVENT_ACTION : MINIAPP_EVENT_DESCRIBE,
+        .request = &request,
+        .generation = s_buzzer_generation,
+    };
+    /* Do not let an action received during an alarm run after it ends. */
+    if (action && (!s_active || alarm_ring_is_active())) {
+        snprintf(error, error_size, "miniapp is not in foreground");
+    } else if (xQueueSend(s_event_queue, &event, 0) != pdTRUE) {
+        snprintf(error, error_size, "miniapp queue is busy");
+    } else {
+        /* Keep caller buffers alive until the bounded callback has finished. */
+        xSemaphoreTake(request.done, portMAX_DELAY);
+        snprintf(error, error_size, "%s", request.error);
+    }
+    vSemaphoreDelete(request.done);
+    return request.result;
+}
+
+cJSON *miniapp_describe(char *error, size_t error_size)
+{
+    return miniapp_control_request(NULL, NULL, error, error_size);
+}
+
+cJSON *miniapp_action(const char *action, const cJSON *arguments, char *error, size_t error_size)
+{
+    if (!action) {
+        if (error && error_size) {
+            snprintf(error, error_size, "invalid action name");
+        }
+        return NULL;
+    }
+    return miniapp_control_request(action, arguments, error, error_size);
 }
 
 int miniapp_exit(void)

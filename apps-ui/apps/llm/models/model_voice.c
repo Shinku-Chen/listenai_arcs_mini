@@ -13,12 +13,14 @@
 
 #ifdef LISA_UI_PLATFORM_ARCS
 #include "app_datas.h"
+#include "app_wakeup.h"
 #ifdef CONFIG_LOG_UPLOAD
 #include "log_upload.h"
 #endif
 #include "voice_msg.h"
 #include "app_player.h"
 #include "voice_player_comm.h"
+#include "voice_player/voice_player_tts.h"
 #include "voice_intent_photo_flow.h"
 #include "voice_cloud.h"
 #include "lisa_kv.h"
@@ -96,6 +98,15 @@ static struct model_voice_context model_voice_ctx = {
 };
 
 static char s_last_iat_text[128] = {0};
+
+bool model_voice_wakeup_available(void)
+{
+#ifdef LISA_UI_PLATFORM_ARCS
+    return app_wakeup_is_available();
+#else
+    return true;
+#endif
+}
 
 static bool voice_alarm_ui_suppressed(void)
 {
@@ -209,6 +220,11 @@ const char *model_voice_role_propmt_get(void)
 
 model_voice_wakeup_mode_t model_voice_wakeup_mode_get(void)
 {
+#if defined(LISA_UI_PLATFORM_ARCS) && defined(CONFIG_BOARD_ARCS_MINI)
+    if (app_interaction_mode_is_forced_single()) {
+        return MODEL_VOICE_WAKEUP_MODE_BUTTON;
+    }
+#endif
     return model_voice_ctx.wakeup_mode;
 }
 
@@ -220,6 +236,16 @@ int model_voice_interaction_mode_set(int interaction_mode)
     if (interaction_mode < 0 || interaction_mode >= APP_INTERACTION_MODE_MAX) {
         return -1;
     }
+
+    /* An unavailable wakeword/AP pair uses the button fallback and must stay
+     * single-turn.  A compatible pair leaves the configured conversation mode
+     * unrestricted. */
+#ifdef CONFIG_BOARD_ARCS_MINI
+    if (!app_wakeup_is_available() && interaction_mode != APP_INTERACTION_MODE_SINGLE) {
+        LISA_UI_LOGW("wakeup resources unavailable; interaction mode is locked to single");
+        return -1;
+    }
+#endif
 
     wakeup_mode = app_interaction_mode_is_continuous(interaction_mode) ?
         MODEL_VOICE_WAKEUP_MODE_VOICE_MULTI : MODEL_VOICE_WAKEUP_MODE_VOICE_SINGLE;
@@ -238,6 +264,11 @@ int model_voice_interaction_mode_set(int interaction_mode)
     LISA_UI_INVOKE_BN_ARG_BASE(interaction_mode, {
         struct app_datas *app_datas = get_app_datas();
         if (app_datas == NULL) {
+            return;
+        }
+
+        if (app_interaction_mode_is_forced_single() &&
+            _invoke_interaction_mode != APP_INTERACTION_MODE_SINGLE) {
             return;
         }
 
@@ -266,6 +297,15 @@ int model_voice_wakeup_mode_set(model_voice_wakeup_mode_t mode)
         return -1;
     }
 
+#ifdef LISA_UI_PLATFORM_ARCS
+#ifdef CONFIG_BOARD_ARCS_MINI
+    if (!app_wakeup_is_available() && mode == MODEL_VOICE_WAKEUP_MODE_VOICE_MULTI) {
+        LISA_UI_LOGW("wakeup resources unavailable; continuous voice wakeup is disabled");
+        return -1;
+    }
+#endif
+#endif
+
     LISA_UI_LOGI("voice wakeup mode set, mode: %d", mode);
 
     model_voice_ctx.wakeup_mode = mode;
@@ -278,6 +318,11 @@ int model_voice_wakeup_mode_set(model_voice_wakeup_mode_t mode)
     LISA_UI_INVOKE_BN_ARG_BASE(mode, {
         struct app_datas *app_datas = get_app_datas();
         if (app_datas == NULL) {
+            return;
+        }
+
+        if (app_interaction_mode_is_forced_single() &&
+            _invoke_mode == MODEL_VOICE_WAKEUP_MODE_VOICE_MULTI) {
             return;
         }
 
@@ -313,7 +358,7 @@ int model_voice_wakeup_mode_set(model_voice_wakeup_mode_t mode)
 void model_voice_notify_interaction_mode_changed(void)
 {
     if (model_voice_ctx.cbs && model_voice_ctx.cbs->on_wakeup_mode_changed) {
-        model_voice_ctx.cbs->on_wakeup_mode_changed(model_voice_ctx.arg, model_voice_ctx.wakeup_mode);
+        model_voice_ctx.cbs->on_wakeup_mode_changed(model_voice_ctx.arg, model_voice_wakeup_mode_get());
     }
 }
 
@@ -337,7 +382,8 @@ static void voice_cloud_tts_txt(void *unused, uint32_t msg_id, void *data, uint3
 {
     if (msg_id == VOICE_MSG_CLOUD_TTS_TEXT_START) {
         if (voice_alarm_ui_suppressed()) return;
-        model_voice_ctx.tts_pending = 1;
+        /* Playback pending is owned by TTS_URL / player events. Subtitles
+         * may arrive after PLAYING and must not re-arm that flag. */
         LISA_UI_INVOKE_UI_ARG_NONE({
             if (voice_alarm_ui_suppressed()) return;
             if (model_voice_ctx.cbs && model_voice_ctx.cbs->on_tts_text_start) {
@@ -369,7 +415,6 @@ static void voice_cloud_tts_timeline(void *unused, uint32_t msg_id, void *data,
 {
     if (msg_id == VOICE_MSG_CLOUD_TTS_TIMELINE_START) {
         if (voice_alarm_ui_suppressed()) return;
-        model_voice_ctx.tts_pending = 1;
         LISA_UI_INVOKE_UI_ARG_NONE({
             if (voice_alarm_ui_suppressed()) return;
             if (model_voice_ctx.cbs && model_voice_ctx.cbs->on_tts_timeline_start) {
@@ -654,6 +699,32 @@ static void voice_cloud_tts_player_error(void *unused, uint32_t msg_id, void *da
         if (voice_alarm_ui_suppressed()) return;
         if (model_voice_ctx.cbs && model_voice_ctx.cbs->on_tts_error) {
             model_voice_ctx.cbs->on_tts_error(model_voice_ctx.arg);
+        }
+    });
+}
+
+static void voice_cloud_reply_interrupted(void *unused, uint32_t msg_id, void *data,
+                                          uint32_t len, void *user_data)
+{
+    (void)unused;
+    (void)msg_id;
+    (void)data;
+    (void)len;
+    (void)user_data;
+
+    /* Do not wait for the canceled player's filtered STOPPED callback.
+     * A new URL may already have been queued when the bus posted this event;
+     * in that case the new request owns the UI state. */
+    LISA_UI_INVOKE_UI_ARG_NONE({
+        if (voice_alarm_ui_suppressed()) return;
+        if (voice_player_tts_is_active()) return;
+        model_voice_ctx.tts_playing = 0;
+        model_voice_ctx.tts_pending = 0;
+        model_voice_ctx.pushup_tts = 0;
+        LISA_UI_LOGI("Reply interrupted, clear TTS UI state, running=%d",
+                     model_voice_ctx.running);
+        if (model_voice_ctx.cbs && model_voice_ctx.cbs->on_tts_stoped) {
+            model_voice_ctx.cbs->on_tts_stoped(model_voice_ctx.arg);
         }
     });
 }
@@ -1208,10 +1279,12 @@ int model_voice_init(void)
 
 #ifdef LISA_UI_PLATFORM_ARCS
     struct app_datas *app_datas = get_app_datas();
-    if (app_datas->voice_work_mode & VOICE_WORK_MODE_BUTTON_WAKEUP) {
+    if (!model_voice_wakeup_available()) {
+        model_voice_ctx.wakeup_mode = MODEL_VOICE_WAKEUP_MODE_BUTTON;
+    } else if (app_datas->voice_work_mode & VOICE_WORK_MODE_BUTTON_WAKEUP) {
         model_voice_ctx.wakeup_mode = MODEL_VOICE_WAKEUP_MODE_BUTTON;
     } else {
-        if (app_interaction_mode_is_continuous(app_datas->int_mode)) {
+        if (app_interaction_mode_is_continuous(app_interaction_mode_get_effective(app_datas))) {
             model_voice_ctx.wakeup_mode = MODEL_VOICE_WAKEUP_MODE_VOICE_MULTI;
         } else {
             model_voice_ctx.wakeup_mode = MODEL_VOICE_WAKEUP_MODE_VOICE_SINGLE;
@@ -1226,6 +1299,7 @@ int model_voice_init(void)
 
     voice_msg_sub(VOICE_MSG_CLOUD_SESSION_STARTING, voice_cloud_session_starting, NULL);
     voice_msg_sub(VOICE_MSG_CLOUD_SESSION_FINISHED, voice_cloud_session_finished, NULL);
+    voice_msg_sub(VOICE_MSG_CLOUD_REPLY_INTERRUPTED, voice_cloud_reply_interrupted, NULL);
     voice_msg_sub(VOICE_MSG_ALARM_TRIGGER, voice_alarm_triggered, NULL);
     voice_msg_sub(VOICE_MSG_CLOUD_TTS_URL, voice_cloud_tts_url_received, NULL);
     voice_msg_sub(VOICE_MSG_CLOUD_IMAGE_RECOGNITION_FAILED,

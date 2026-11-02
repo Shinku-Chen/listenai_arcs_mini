@@ -1626,6 +1626,16 @@ int app_player_play_stream(app_player_t *player, uint32_t sample_rate, uint8_t c
 
     PLAYER_MUTEX_LOCK(player->operation_lock, LISA_OS_WAIT_FOREVER);
 
+    /* A stream is a new playback request, just like play_ex. Stop/reset may
+     * leave cancellation from the previous request latched; do not let its
+     * token suppress this stream's PREPARED callback. */
+    PLAYER_MUTEX_LOCK(player->cancel_lock, LISA_OS_WAIT_FOREVER);
+    player->play_cancel_token = NULL;
+    player->play_request_tag = 0;
+    player->cancel_requested = false;
+    player->stop_preparing_requested = false;
+    PLAYER_MUTEX_UNLOCK(player->cancel_lock);
+
     // 调用 core 层流式播放（PA控制由PLAYING事件回调处理）
     int ret = app_player_core_play_stream(player, sample_rate, channels, bits);
     if (ret != 0) {

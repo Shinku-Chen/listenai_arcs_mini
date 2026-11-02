@@ -12,6 +12,10 @@
 | [04 状态灯](04-status-led.lua) | 2 | `led.on/off/blink`、`on_button_click`、`on_exit` | 灯光切换、闪烁、退出清理 |
 | [05 HTTP 与 JSON](05-http-json.lua) | 4 | `http.*`、`json.*`、`on_http_response` | 请求、解析、取消、错误及额度边界 |
 | [06 应用内 TTS](06-tts.lua) | 4 | `tts.*`、`on_tts_result` | 播报、繁忙、连续播报及取消 |
+| [07 扩展绘图](07-graphics.lua) | 4 | 圆角、圆、线、圆弧、透明度、文字布局 | 绘图效果、叠放顺序及满预算画面 |
+| [08 在线音频](08-online-audio.lua) | 5 | `audio.*` | MP3/HLS 直播、暂停恢复及语音抢占 |
+| [09 多声部合成](09-synth.lua) | 5 | `synth.*` | 四声部音乐循环、暂停恢复及抢占后的续播 |
+| [10 语音倒计时](10-voice-actions.lua) | 5 | `get_state`、`get_actions`、`on_action` | 查询状态、设置时长、暂停及继续 |
 
 面向带屏幕和功能键的设备，屏幕至少 200×200。完整接口见 [小应用文档](../../docs/miniapp.md)。
 
@@ -98,3 +102,45 @@ adb push tests/miniapp/06-tts.lua /miniapp/
 单击再次测试，快速双击取消；取消后不应继续收到该请求回调。
 语音唤醒、闹钟抢占和恢复需要单独进行音频竞争联调；本用例的自动流程不覆盖这些场景。
 若进入时设备正在对话，应显示 `failed/busy`，对话照常继续。
+
+### 07 扩展绘图
+
+```sh
+adb push tests/miniapp/07-graphics.lua /miniapp/
+```
+
+需要 240×240 屏幕和设备公布的 `graphics` 能力。单击依次切换 7 页，观察圆弧、透明度、叠放、
+文字布局和满预算画面，留意闪烁、残影及按键响应。
+第 3 页绿框内应看到先画的文字，第 4 页应遮住这行文字；第 6 页静态，第 7 页动态。
+
+### 08 在线音频（API 5）
+
+```sh
+adb push tests/miniapp/08-online-audio.lua /miniapp/
+```
+
+设备需联网。单击暂停/恢复，双击切换 MP3 和 HLS 电台；失败后单击重试。
+状态应从 loading 变为 playing。播放时唤醒，交互结束后应自动恢复；
+手动暂停后再唤醒，交互结束应保持暂停。退出或替换应用后音频应停止。
+
+### 09 多声部合成（API 5）
+
+```sh
+adb push tests/miniapp/09-synth.lua /miniapp/
+```
+
+无需联网或校时。四声部《欢乐颂》配低音和鼓组，16 秒一轮持续循环。
+单击原位暂停/恢复，留意循环衔接、爆音和卡顿；语音交互抢占后应自动续播，
+手动暂停应保持。语音动作声明支持暂停音效、恢复音效。
+旋律来源为 [Mutopia Project #528](https://www.mutopiaproject.org/cgibin/piece-info.cgi?id=528)
+的公版乐谱。
+
+### 10 语音倒计时（API 5）
+
+```sh
+adb push tests/miniapp/10-voice-actions.lua /miniapp/
+```
+
+默认 25 分钟且暂停，单击开始/暂停。云端支持小应用操作时，可唤醒后设置专注时间、
+继续倒计时、暂停倒计时或查询剩余时间，确认屏幕和回答一致。
+设置时长后重置并暂停，允许 1–180 分钟。

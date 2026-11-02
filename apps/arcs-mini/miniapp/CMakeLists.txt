@@ -14,8 +14,13 @@ set(MINIAPP_LUA_DIR ${PROJECT_TOP_DIR}/arcs-sdk/samples/subsys/lua/lua_binding_l
 
 listenai_library_sources(
     miniapp_storage.c
+    miniapp_actions.c
     miniapp_runtime.c
+    miniapp_lua_screen.c
+    miniapp_synth.c
+    miniapp_audio.c
     miniapp_ui.c
+    miniapp_draw.c
 )
 
 listenai_library_sources_ifdef(CONFIG_MINIAPP_ADB_DEBUG miniapp_adb.c)

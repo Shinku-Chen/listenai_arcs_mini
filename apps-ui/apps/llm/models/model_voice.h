@@ -92,6 +92,7 @@ uint8_t model_voice_img_rec_is_mcp(void);
 const char *model_voice_last_iat_text_get(void);
 
 model_voice_wakeup_mode_t model_voice_wakeup_mode_get(void);
+bool model_voice_wakeup_available(void);
 int model_voice_wakeup_mode_set(model_voice_wakeup_mode_t mode);
 int model_voice_interaction_mode_set(int interaction_mode);
 void model_voice_notify_interaction_mode_changed(void);

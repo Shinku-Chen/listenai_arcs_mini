@@ -22,6 +22,7 @@ typedef enum{
 }app_wakeup_sensitivity_level_e;
 
 int app_wakeup_init(struct wakeup_algo_resources *res);
+bool app_wakeup_is_available(void);
 
 #ifdef CONFIG_BOARD_ARCS_MINI
 typedef struct {
@@ -31,6 +32,7 @@ typedef struct {
     uint32_t output_buffers_since_wake;
     uint32_t output_bytes_since_wake;
     uint32_t cloud_frames_since_wake;
+    uint32_t mic_bypass_frames_since_wake;
     uint32_t cloud_non_silent_frames_since_wake;
     uint32_t cloud_send_failures_since_wake;
     uint32_t last_cloud_peak;

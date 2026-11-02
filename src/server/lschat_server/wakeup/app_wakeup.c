@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -54,6 +55,17 @@ static app_wakeup_audio_diag_t s_audio_diag;
 #endif
 static bool s_audio_inited = false;
 static bool s_wakeup_feed_enabled = false;
+/* Wakeword is optional: a resource/AP version mismatch must not disable the
+ * rest of the voice service or button-to-talk path. */
+static bool s_wakeup_available = true;
+/* Latched until reboot/init; IPC and audio tasks share this flag. */
+static uint32_t s_wakeup_runtime_failed;
+
+static bool wakeup_runtime_failed(void)
+{
+    return __atomic_load_n(&s_wakeup_runtime_failed, __ATOMIC_ACQUIRE) != 0U;
+}
+static bool s_audio_callback_registered = false;
 static TickType_t s_last_wakeup_keyword_tick = 0;
 
 lisa_device_t *g_audio_dev = NULL;
@@ -99,6 +111,7 @@ static void app_wakeup_audio_diag_begin_wake(void)
     s_audio_diag.output_buffers_since_wake = 0U;
     s_audio_diag.output_bytes_since_wake = 0U;
     s_audio_diag.cloud_frames_since_wake = 0U;
+    s_audio_diag.mic_bypass_frames_since_wake = 0U;
     s_audio_diag.cloud_non_silent_frames_since_wake = 0U;
     s_audio_diag.cloud_send_failures_since_wake = 0U;
     s_audio_diag.last_cloud_peak = 0U;
@@ -171,6 +184,12 @@ static int app_algo_command_extract(const uint8_t *const in, uint8_t *text, int 
 	if (in && text && is_wakeup_keyword) {
 		cJSON *root = cJSON_Parse(in);
 		if (root) {
+            /* Runtime transport error from new AP; old result JSON remains valid. */
+            cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
+            if (cJSON_IsString(error) && strcmp(error->valuestring, "audio_frame_mismatch") == 0) {
+                cJSON_Delete(root);
+                return -EPROTO;
+            }
 			cJSON *rlt_json = cJSON_GetObjectItem(root, "rlt");
 			if (rlt_json) {
 				if (cJSON_GetArraySize(rlt_json) > 0) {
@@ -220,9 +239,27 @@ static void wakeup_event_handler(uint32_t event, void *event_data, uint32_t even
     bool is_wakeup_keyword = false;
     int ret;
 
+    /* Continue draining stream notifications, but ignore stale engine events. */
+    if (wakeup_runtime_failed() && !(event & WAKEUP_CB_EVENT_STREAM_UPDATE)) {
+        return;
+    }
     if (event & WAKEUP_CB_EVENT_ENGINE_RLT) {
         LISA_LOGI(TAG, "wakeup result:%d,%s", event_data_len, (char *)event_data);
         ret = app_algo_command_extract(event_data, keyword, sizeof(keyword), &is_wakeup_keyword);
+        if (ret == -EPROTO) {
+            /* No synchronous IPC or deinit here: AP may be awaiting our reply,
+             * and audio tasks can still hold stream buffers. Keep handles alive.
+             * The async message lets the voice task stop an already active
+             * cloud session without doing IPC from the AP callback. */
+            if (__atomic_exchange_n(&s_wakeup_runtime_failed, 1U, __ATOMIC_ACQ_REL) == 0U) {
+                int notify_ret = voice_msg_pub(VOICE_MSG_CLOUD_SESSION_INTERRUPT, NULL, 0);
+                if (notify_ret != 0) {
+                    LISA_LOGW(TAG, "failed to notify cloud session of runtime mismatch: %d", notify_ret);
+                }
+            }
+            LISA_LOGW(TAG, "Repeated AP frame mismatch; use CP microphone until reboot");
+            return;
+        }
         if (ret == 0) {
             if (is_wakeup_keyword) {
                 TickType_t now = xTaskGetTickCount();
@@ -343,6 +380,57 @@ static void audio_stream_callback(const lisa_audio_event_t *event, void *user_da
     uint32_t buf_size;
     uint16_t desc_idx;
     ref_in_t *algo_ref_data = NULL;
+
+    /* When the wakeword engine is unavailable, keep the microphone usable for
+     * button-triggered cloud sessions by forwarding MIC0 directly. */
+    if (wakeup_runtime_failed() || (!s_wakeup_feed_enabled && !s_wakeup_available)) {
+        if (event == NULL || event->record_buffer == NULL || event->record_samples == 0) {
+            return;
+        }
+
+        mic_in_t *adc_data = (mic_in_t *)event->record_buffer;
+        uint32_t sample_count = event->record_samples;
+        if (sample_count > BUFFER_SAMPLES) {
+            sample_count = BUFFER_SAMPLES;
+        }
+
+        int16_t pcm[BUFFER_SAMPLES];
+        for (uint32_t i = 0; i < sample_count; i++) {
+            pcm[i] = adc_data[i].mic1;
+        }
+
+#ifdef CONFIG_BOARD_ARCS_MINI
+        s_audio_diag.record_events_since_wake++;
+        s_audio_diag.mic_bypass_frames_since_wake++;
+#endif
+        bool uploading = voice_cloud_is_uploading_audio();
+        int send_ret = voice_cloud_chat_send_audio((uint8_t *)pcm,
+                                                   (int)(sample_count * sizeof(pcm[0])));
+#ifdef CONFIG_BOARD_ARCS_MINI
+        if (uploading) {
+            uint32_t peak = 0U;
+            for (uint32_t i = 0; i < sample_count; i++) {
+                int32_t sample = pcm[i];
+                uint32_t magnitude = (uint32_t)(sample < 0 ? -sample : sample);
+                if (magnitude > peak) {
+                    peak = magnitude;
+                }
+            }
+            s_audio_diag.cloud_frames_since_wake++;
+            s_audio_diag.last_cloud_peak = peak;
+            if (peak > 0U) {
+                s_audio_diag.cloud_non_silent_frames_since_wake++;
+            }
+            if (send_ret != 0) {
+                s_audio_diag.cloud_send_failures_since_wake++;
+            }
+        }
+#else
+        (void)uploading;
+        (void)send_ret;
+#endif
+        return;
+    }
 
     if (!s_wakeup_feed_enabled) {
         return;
@@ -902,9 +990,10 @@ static void wakeup_out_task(void *pvParameters)
 
                 s_audio_diag.output_buffers_since_wake++;
                 s_audio_diag.output_bytes_since_wake += len;
-                wakeup_out_stream_to_cloud(buffer, len);
-
-                wakeup_stream_debug_data_output(buffer, len);
+                if (!wakeup_runtime_failed()) {
+                    wakeup_out_stream_to_cloud(buffer, len);
+                    wakeup_stream_debug_data_output(buffer, len);
+                }
 
                 /* 释放缓冲区 */
                 ret = acomp_wakeup_stream_rx_buffer_release(WAKEUP_AUDIO_OUT_STREAM_CH_INDEX, desc_idx, len, buffer);
@@ -926,10 +1015,23 @@ int app_wakeup_init(struct wakeup_algo_resources *algo_res)
     int ret = 0;
     bool wakeup_res_valid = false;
 
+    s_wakeup_available = false;
+    __atomic_store_n(&s_wakeup_runtime_failed, 0U, __ATOMIC_RELEASE);
+
     ret = audio_init();
     if (ret != 0) {
         LISA_LOGE(TAG, "Audio init failed: %d", ret);
         return ret;
+    }
+
+    if (!s_audio_callback_registered) {
+        ret = lisa_audio_register_callback(g_audio_dev, audio_stream_callback, NULL);
+        if (ret != LISA_DEVICE_OK) {
+            LISA_LOGE(TAG, "Failed to register audio callback: %d", ret);
+            return ret;
+        }
+        s_audio_callback_registered = true;
+        LISA_LOGI(TAG, "Audio callback registered");
     }
 
     wakeup_res_valid = (algo_res != NULL && algo_res->mlp.addr != NULL && algo_res->mlp.size > 0 &&
@@ -981,6 +1083,8 @@ int app_wakeup_init(struct wakeup_algo_resources *algo_res)
         goto wakeup_init_failed;
     }
 
+    /* Compatibility is determined by prepare/start, not firmware identities.
+     * In particular, legacy APs can still use their matching resources. */
     ret = acomp_wakeup_add_callback(WAKEUP_CB_EVENT_ENGINE_RLT
                                     | WAKEUP_CB_EVENT_STREAM_UPDATE
                                     | WAKEUP_CB_EVENT_ENGINE_TIMEOUT
@@ -1064,14 +1168,6 @@ int app_wakeup_init(struct wakeup_algo_resources *algo_res)
     }
     LISA_LOGI(TAG, "Audio device acquired");
  
-    /* Register unified callback */
-    ret = lisa_audio_register_callback(audio_dev, audio_stream_callback, NULL);
-    if (ret != LISA_DEVICE_OK) {
-        LISA_LOGE(TAG, "Failed to register callback: %d", ret);
-        return -1;
-    }
-    LISA_LOGI(TAG, "Audio callback registered");
-
     if (!audio_dev) {
         LISA_LOGE(TAG, "Failed to initialize audio device");
         return -1;
@@ -1082,6 +1178,7 @@ int app_wakeup_init(struct wakeup_algo_resources *algo_res)
 #if CONFIG_BOARD_ARCS_MINI
     s_wakeup_started = true;
 #endif
+    s_wakeup_available = true;
 
     return ret;
 
@@ -1093,7 +1190,14 @@ wakeup_init_failed:
     s_wakeup_started = false;
 #endif
     (void)acomp_wakeup_deinit();
+    s_wakeup_available = false;
+    LISA_LOGW(TAG, "Wakeup initialization failed (%d); CP microphone bypass enabled", ret);
     return ret;
+}
+
+bool app_wakeup_is_available(void)
+{
+    return s_wakeup_available && !wakeup_runtime_failed();
 }
 
 #ifdef CONFIG_BOARD_ARCS_MINI

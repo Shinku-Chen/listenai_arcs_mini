@@ -278,6 +278,7 @@ typedef struct {
     lisa_semaphore_t *cpdma_done_sem;  /**< CPDMA 完成信号量 */
     DMA_LLI *dma_llp_lists;            /**< 指向 DTCM 中的 DMA 链表数组 */
     uint8_t dma_channel;               /**< 分配的 DMA 通道号 */
+    volatile uint8_t dma_event;
 #endif
     lisa_mutex_t *rotate_mutex;        /**< 旋转缓冲区互斥锁（保护旋转资源）*/
     uint16_t rotate_buf_ping[ROTATE_BUF_MAX_HEIGHT * ROTATE_BUF_WIDTH];  /**< Ping 缓冲区 */
@@ -303,7 +304,10 @@ __dtcm_bss__ static DMA_LLI g_dma_llp_lists_0[ROTATE_BUF_MAX_HEIGHT];
 static void rotate_dma_drv_event(uint32_t event_info, uint32_t xfer_bytes, uint32_t usr_param)
 {
     panel_rotate_ctx_t *ctx = (panel_rotate_ctx_t *)usr_param;
-    lisa_semaphore_give(ctx->cpdma_done_sem);
+    if (event_info & (DMA_EVENT_TRANSFER_COMPLETE | DMA_EVENT_ERROR)) {
+        ctx->dma_event = (uint8_t)event_info;
+        lisa_semaphore_give(ctx->cpdma_done_sem);
+    }
 }
 #endif
 
@@ -479,6 +483,35 @@ static void panel_buf_rotate_270(panel_rotate_ctx_t *ctx, const uint16_t *src_bu
 #endif
 }
 
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+static int panel_dma_rotate_180_rows(panel_rotate_ctx_t *ctx, const uint16_t *src_buf,
+                                      uint16_t *dst_buf, uint16_t w, uint16_t h,
+                                      uint16_t row_start, uint16_t chunk_h)
+{
+    uint32_t pixels = (uint32_t)w * chunk_h;
+    const uint16_t *src = src_buf + (uint32_t)(h - row_start - chunk_h) * w;
+    uint32_t control = DMA_CH_CTLL_INT_EN | DMA_CH_CTLL_SRC_WIDTH(DMA_WIDTH_HALFWORD) |
+                       DMA_CH_CTLL_DST_WIDTH(DMA_WIDTH_HALFWORD) | DMA_CH_CTLL_SRC_INC |
+                       DMA_CH_CTLL_DST_DEC | DMA_CH_CTLL_SRC_BSIZE(DMA_BSIZE_1) |
+                       DMA_CH_CTLL_DST_BSIZE(DMA_BSIZE_1) | DMA_CH_CTLL_TTFC_M2M;
+    /* Drain a completion left by a previous failed request before reusing it. */
+    while (lisa_semaphore_take(ctx->cpdma_done_sem, 0) == 0) {
+    }
+    ctx->dma_event = 0;
+    int ret = dma_channel_configure(ctx->dma_channel, (uint32_t)src,
+                                    (uint32_t)(dst_buf + pixels - 1U), pixels, control,
+                                    DMA_CH_CFGL_CH_PRIOR(0), DMA_CH_CFGH_FIFO_MODE, 0, 0);
+    if (ret == 0 && (lisa_semaphore_take(ctx->cpdma_done_sem, 100) != 0 ||
+                     !(ctx->dma_event & DMA_EVENT_TRANSFER_COMPLETE) ||
+                     (ctx->dma_event & DMA_EVENT_ERROR))) {
+        ret = LISA_DEVICE_ERR_IO;
+    }
+    /* This channel is reserved by the panel; CPU fallback may now overwrite. */
+    dma_channel_disable(ctx->dma_channel, 1);
+    return ret;
+}
+#endif
+
 static void panel_buf_rotate_180_rows(const uint16_t *src_buf, uint16_t *dst_buf,
                                       uint16_t area_w, uint16_t area_h,
                                       uint16_t row_start, uint16_t chunk_h)
@@ -525,7 +558,12 @@ static int panel_send_data_with_sram_rotate_180(lisa_display_panel_t *panel, uin
             chunk_h = rows_per_chunk;
         }
 
-        panel_buf_rotate_180_rows(src_buf, ctx->rotate_buf_ping, w, h, row, chunk_h);
+#if CONFIG_LISA_DISPLAY_CPDMA_ROTATE
+        if (panel_dma_rotate_180_rows(ctx, src_buf, ctx->rotate_buf_ping, w, h, row, chunk_h) != 0)
+#endif
+        {
+            panel_buf_rotate_180_rows(src_buf, ctx->rotate_buf_ping, w, h, row, chunk_h);
+        }
 
         int ret = bus_api->write_pixels(panel->bus_dev, ctx->rotate_buf_ping,
                                         (size_t)w * chunk_h * sizeof(uint16_t));

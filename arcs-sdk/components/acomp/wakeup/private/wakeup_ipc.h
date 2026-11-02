@@ -55,6 +55,7 @@ typedef enum {
     WAKEUP_IPC_CONTROL_SUBCMD_FAN_STATE_SET = 5,
     WAKEUP_IPC_CONTROL_SUBCMD_CMD_TIMEOUT_SET = 6,
     WAKEUP_IPC_CONTROL_SUBCMD_TIMEOUT_SET = 7,
+    WAKEUP_IPC_CONTROL_SUBCMD_VAD_GATE_SET = 8,
 }wakeup_ipc_control_subcmd_e;
 
 typedef struct {
@@ -96,6 +97,10 @@ typedef struct {
 typedef struct {
     uint32_t timeout_ms;  // 超时时间(ms)
 }__attribute__((packed)) wakeup_ipc_control_subcmd_timeout_set_t;
+
+typedef struct {
+    uint8_t enable;  // 0: forward every frame, 1: enable standby VAD gate
+}__attribute__((packed)) wakeup_ipc_control_subcmd_vad_gate_set_t;
 
 /* ipc end */
 

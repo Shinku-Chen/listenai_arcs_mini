@@ -14,7 +14,7 @@ typedef struct {
     lv_obj_t *result_label;
     lv_obj_t *finger_icon;
     lv_obj_t *finger_hint_label;
-    char status_text[64];
+    char status_text[96];
 } lisa_ui_log_upload_view_t;
 
 static void log_upload_view_constructor(const lv_obj_class_t *class_p, lv_obj_t *obj);
@@ -46,13 +46,13 @@ static void log_upload_view_constructor(const lv_obj_class_t *class_p, lv_obj_t 
     }
 
     view->status_label = lv_label_create(container);
-    lv_label_set_text(view->status_label, "准备日志中…");
+    lv_label_set_text(view->status_label, "正在准备日志…");
     lv_label_set_long_mode(view->status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_color(view->status_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(view->status_label, &lv_font_chinese_16, 0);
-    lv_obj_set_width(view->status_label, lv_pct(100));
+    lv_obj_set_width(view->status_label, lv_pct(90));
     lv_obj_set_style_text_align(view->status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(view->status_label, LV_ALIGN_CENTER, 0, -16);
+    lv_obj_align(view->status_label, LV_ALIGN_CENTER, 0, -24);
 
     view->result_label = lv_label_create(container);
     lv_label_set_text(view->result_label, "");
@@ -60,9 +60,9 @@ static void log_upload_view_constructor(const lv_obj_class_t *class_p, lv_obj_t 
     lv_obj_set_style_text_color(view->result_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(view->result_label, &lv_font_chinese_16, 0);
     lv_obj_set_style_text_opa(view->result_label, LV_OPA_70, 0);
-    lv_obj_set_width(view->result_label, lv_pct(100));
+    lv_obj_set_width(view->result_label, lv_pct(90));
     lv_obj_set_style_text_align(view->result_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(view->result_label, LV_ALIGN_CENTER, 0, 8);
+    lv_obj_align(view->result_label, LV_ALIGN_CENTER, 0, 16);
 
     view->finger_icon = lv_img_create(obj);
     lv_img_set_src(view->finger_icon, &icons_icon_finger_png);
@@ -110,11 +110,11 @@ void lisa_ui_log_upload_view_update(lv_obj_t *obj, const log_upload_state_t *sta
 
     switch (state->state) {
     case LOG_UPLOAD_STATE_STARTING:
-        lv_label_set_text_static(view->status_label, "准备日志中…");
+        lv_label_set_text_static(view->status_label, "正在准备日志…");
         lv_label_set_text_static(view->result_label, "请稍后");
         break;
     case LOG_UPLOAD_STATE_UPLOADING:
-        lv_label_set_text_static(view->status_label, "日志上传中，请稍后");
+        lv_label_set_text_static(view->status_label, "正在上传日志…");
         lv_label_set_text_static(view->result_label, "");
         break;
     case LOG_UPLOAD_STATE_SUCCESSED:
@@ -123,7 +123,7 @@ void lisa_ui_log_upload_view_update(lv_obj_t *obj, const log_upload_state_t *sta
         break;
     case LOG_UPLOAD_STATE_FAILED:
         lv_label_set_text_static(view->status_label, "日志上传失败");
-        snprintf(view->status_text, sizeof(view->status_text), "错误码: %d", state->result);
+        snprintf(view->status_text, sizeof(view->status_text), "请稍后重新上传\n错误码：%d", state->result);
         lv_label_set_text_static(view->result_label, view->status_text);
         break;
     default:

@@ -40,6 +40,34 @@ typedef struct {
     bool is_blinking;
 } alarm_ring_view_t;
 
+static bool alarm_ring_glyph_ink_rows(uint32_t letter, const lv_font_glyph_dsc_t *glyph,
+                                      lv_coord_t *first, lv_coord_t *end)
+{
+    uint8_t bpp = glyph->bpp == 3 ? 4 : glyph->bpp;
+    const uint8_t *bitmap = lv_font_get_glyph_bitmap(glyph->resolved_font, letter);
+
+    *first = 0;
+    *end = glyph->box_h;
+    if (!bitmap || (bpp != 1 && bpp != 2 && bpp != 4 && bpp != 8)) {
+        return glyph->box_h > 0;
+    }
+
+    *first = glyph->box_h;
+    *end = 0;
+    for (uint32_t y = 0; y < glyph->box_h; y++) {
+        for (uint32_t x = 0; x < glyph->box_w; x++) {
+            uint32_t bit = (y * glyph->box_w + x) * bpp;
+            uint8_t mask = ((1U << bpp) - 1U) << (8U - bpp - bit % 8U);
+            if (bitmap[bit / 8U] & mask) {
+                *first = LV_MIN(*first, (lv_coord_t)y);
+                *end = y + 1;
+                break;
+            }
+        }
+    }
+    return *end > *first;
+}
+
 static void alarm_ring_view_update_text_label_layout(alarm_ring_view_t *view, const char *text)
 {
     lv_point_t text_size = {0};
@@ -50,6 +78,9 @@ static void alarm_ring_view_update_text_label_layout(alarm_ring_view_t *view, co
     lv_coord_t single_line_height;
     lv_coord_t max_width;
     lv_coord_t target_width;
+    lv_coord_t ink_top = lv_font_chinese_16.line_height;
+    lv_coord_t ink_bottom = 0;
+    uint32_t index = 0;
 
     if (!view || !view->text_label || !text) {
         return;
@@ -69,6 +100,33 @@ static void alarm_ring_view_update_text_label_layout(alarm_ring_view_t *view, co
 
     lv_txt_get_size(&text_size, text, &lv_font_chinese_16, letter_space, line_space, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
     target_width = text_size.x + pad_left + pad_right;
+
+    /* The compact font extends below its nominal line box, and some glyph
+     * boxes include transparent rows. Center only the visible bitmap rows. */
+    while (text[index] != '\0') {
+        uint32_t letter = _lv_txt_encoded_next(text, &index);
+        lv_font_glyph_dsc_t glyph;
+        if (lv_font_get_glyph_dsc(&lv_font_chinese_16, &glyph, letter, 0) && glyph.box_h > 0) {
+            lv_coord_t first;
+            lv_coord_t end;
+            lv_coord_t top = lv_font_chinese_16.line_height - lv_font_chinese_16.base_line -
+                             glyph.box_h - glyph.ofs_y;
+            if (alarm_ring_glyph_ink_rows(letter, &glyph, &first, &end)) {
+                ink_top = LV_MIN(ink_top, top + first);
+                ink_bottom = LV_MAX(ink_bottom, top + end);
+            }
+        }
+    }
+    if (ink_bottom > ink_top) {
+        single_line_height = LV_MAX(lv_font_chinese_16.line_height, ink_bottom - ink_top) +
+                             ALARM_RING_TEXT_VERTICAL_PADDING;
+        lv_obj_set_style_pad_top(view->text_label,
+                                (single_line_height - (ink_bottom - ink_top)) / 2 - ink_top,
+                                LV_PART_MAIN);
+    } else {
+        lv_obj_set_style_pad_top(view->text_label, ALARM_RING_TEXT_VERTICAL_PADDING / 2, LV_PART_MAIN);
+    }
+    lv_obj_set_style_pad_bottom(view->text_label, 0, LV_PART_MAIN);
 
     if (target_width > max_width) {
         lv_label_set_long_mode(view->text_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -166,7 +224,10 @@ static void alarm_ring_view_constructor(const lv_obj_class_t *class_p, lv_obj_t 
     lv_label_set_text(view->date_label, "");
     lv_obj_set_style_text_color(view->date_label, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(view->date_label, &lv_font_chinese_16, LV_PART_MAIN);
-    lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, -25, 5);
+    lv_obj_set_width(view->date_label, LV_PCT(90));
+    lv_obj_set_style_text_align(view->date_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_opa(view->date_label, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
 
     view->text_label = lv_label_create(obj);
     if (!view->text_label) {
@@ -335,6 +396,8 @@ void alarm_ring_view_set_time(lv_obj_t *obj, const char *time_str)
     alarm_ring_view_t *view = (alarm_ring_view_t *)obj;
     if (view->time_label) {
         lv_label_set_text(view->time_label, time_str);
+        lv_obj_update_layout(obj);
+        lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
     }
 }
 
@@ -345,6 +408,8 @@ void alarm_ring_view_set_date(lv_obj_t *obj, const char *date_str)
     alarm_ring_view_t *view = (alarm_ring_view_t *)obj;
     if (view->date_label) {
         lv_label_set_text(view->date_label, date_str);
+        lv_obj_update_layout(obj);
+        lv_obj_align_to(view->date_label, view->time_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
     }
 }
 

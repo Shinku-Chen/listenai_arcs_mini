@@ -124,6 +124,18 @@ static inline void lisa_jpeg_reset(void)
     jpeg_reset();
 }
 
+/* Validate a complete supported baseline JPEG; returns zero on success. */
+int lisa_jpeg_get_info(const uint8_t *data, uint32_t size, uint16_t *width, uint16_t *height);
+/* Validated, capacity-checked RGB565 decode. Serialize with encode operations. */
+uint32_t lisa_jpeg_decoder_bounded(const uint8_t *data, uint32_t size, uint8_t *output,
+                                   uint32_t capacity, uint16_t *width, uint16_t *height);
+
+/* Bounded encoder. Hardware codec calls must be serialized by the caller.
+ * q_factor is currently reserved: the hardware uses the SDK quantization table.
+ * Nonzero return means failure; out_size is zero unless encoding succeeded. */
+uint32_t lisa_jpeg_encoder_bounded(void *in_buf, void *out_buf, uint32_t capacity,
+                                   uint32_t *out_size, lisa_jpeg_encoder_cfg_t enc_cfg);
+
 static inline uint32_t lisa_jpeg_encoder(void *in_buf, void *out_buf, uint32_t *out_size, lisa_jpeg_encoder_cfg_t enc_cfg)
 {
     return jpeg_encoder(in_buf, out_buf, out_size, enc_cfg);

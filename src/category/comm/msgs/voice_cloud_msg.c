@@ -32,6 +32,7 @@ static bool s_voice_photo_result_restart_pending = false;
 static TimerHandle_t s_voice_idle_exit_timer = NULL;
 static uint32_t s_voice_idle_exit_timeout_ms = VOICE_IDLE_EXIT_TIMEOUT_MS_DEFAULT;
 static voice_msg_camera_preview_state_t s_camera_preview_state = {0};
+static bool s_camera_preview_canceled = false;
 
 static void camera_preview_parse(const void *data, uint32_t len)
 {
@@ -204,6 +205,14 @@ static bool voice_reply_interrupt_if_active(const char *reason)
         LOGW("reply interruption position not reported");
     }
 
+    /* Report the position before canceling the subtitle timeline. The player
+     * deliberately filters the old generation's STOPPED callback, so publish
+     * a separate UI notification without triggering normal TTS completion
+     * policies (session restart / background music restoration). */
+    voice_cloud_tts_text_cancel();
+    s_voice_cloud_tts_active = false;
+    voice_msg_pub(VOICE_MSG_CLOUD_REPLY_INTERRUPTED, NULL, 0);
+
     return true;
 }
 
@@ -256,7 +265,7 @@ static bool voice_interaction_mode_pauses_tts_uplink(void)
         return false;
     }
 
-    return app_datas->int_mode == APP_INTERACTION_MODE_MULTI_NO_INTERRUPT;
+    return app_interaction_mode_get_effective(app_datas) == APP_INTERACTION_MODE_MULTI_NO_INTERRUPT;
 }
 
 static bool voice_stop_current_session_during_tts(const char *reason, const char *policy)
@@ -283,6 +292,10 @@ static bool voice_stop_current_session_during_tts(const char *reason, const char
 
 static void voice_tts_uplink_pause_if_needed(const char *reason)
 {
+    if (app_interaction_mode_is_forced_single()) {
+        (void)voice_stop_current_session_during_tts(reason, "wakeup resource fallback");
+        return;
+    }
     if (!voice_interaction_mode_pauses_tts_uplink()) {
         return;
     }
@@ -344,7 +357,7 @@ static int voice_continuous_session_restart(const char *reason)
     }
 
     if (!voice_interaction_mode_pauses_tts_uplink()) {
-        LOGW("continuous session restart ignored, int_mode=%d", app_datas->int_mode);
+        LOGW("continuous session restart ignored, int_mode=%d", app_interaction_mode_get_effective(app_datas));
         return -1;
     }
 
@@ -406,7 +419,6 @@ static int camera_preview_result_bargein_session_start(void)
     const char *wakeword = NULL;
     const char *keywords[1];
     struct voice_cloud_chat_config chat_config = {0};
-    int stop_ret = 0;
     int ret = 0;
 
     if (app_datas == NULL) {
@@ -427,9 +439,18 @@ static int camera_preview_result_bargein_session_start(void)
         return -1;
     }
 
-    if (!app_interaction_mode_supports_barge_in(app_datas->int_mode)) {
-        LOGI("voice photo result barge-in start ignored, int_mode=%d", app_datas->int_mode);
+    if (!app_interaction_mode_supports_barge_in(app_interaction_mode_get_effective(app_datas))) {
+        LOGI("voice photo result barge-in start ignored, int_mode=%d", app_interaction_mode_get_effective(app_datas));
         return 0;
+    }
+
+    /* TTS URL can precede its subtitle URL. Restarting here replaces the rid
+     * and drops that late reply as an unknown session, even with timeline
+     * preservation enabled. The existing full-duplex session can accept audio
+     * again after the photo guard releases it; keep its reply routing intact. */
+    if (voice_cloud_session_is_running("photo result barge-in")) {
+        LOGI("voice photo result tts enter, reuse active session for subtitles and barge-in");
+        return voice_cloud_upload_audio_resume();
     }
 
     lisa_kv_get_string(KV_KEY_SYS_WAKEWORD, &kv_wakeword);
@@ -437,23 +458,12 @@ static int camera_preview_result_bargein_session_start(void)
     keywords[0] = wakeword;
     LOGI("barge-in wakeword: %s", wakeword);
 
-    chat_config.full_duplex = app_interaction_mode_is_continuous(app_datas->int_mode);
+    chat_config.full_duplex = app_interaction_mode_is_continuous(app_interaction_mode_get_effective(app_datas));
     chat_config.preserve_tts_timeline = 1;
     chat_config.timeout_ms = app_datas->full_duplex_timeout_ms;
-    chat_config.oneshot = app_interaction_mode_is_continuous(app_datas->int_mode) ? false : app_datas->oneshot;
+    chat_config.oneshot = app_interaction_mode_is_continuous(app_interaction_mode_get_effective(app_datas)) ? false : app_datas->oneshot;
     chat_config.words = (char **)keywords;
     chat_config.words_cnt = 1;
-
-    if (voice_cloud_session_is_running("photo result barge-in")) {
-        LOGI("voice photo result tts enter with existing session, restart silent barge-in session");
-        stop_ret = voice_cloud_chat_stop_local();
-        if (stop_ret != 0) {
-            LOGW("voice photo result barge-in stop old session failed: %d, force clear state", stop_ret);
-        }
-        s_voice_cloud_session_running = false;
-        voice_idle_exit_timer_stop();
-        voice_msg_pub(VOICE_MSG_CLOUD_SESSION_FINISHED, NULL, 0);
-    }
 
     LOGI("start silent barge-in session for photo result tts, timeout_ms=%u",
          (unsigned)chat_config.timeout_ms);
@@ -523,6 +533,7 @@ static void voice_camera_preview_start(void *unused, uint32_t msg_id, void *data
         return;
     }
 
+    s_camera_preview_canceled = false;
     if (req->mode != CAMERA_PREVIEW_MODE_MCP) {
         return;
     }
@@ -613,7 +624,7 @@ static void voice_cloud_iat_txt(void *unused, uint32_t msg_id, void *data, uint3
             struct app_datas *app_datas = get_app_datas();
 
             if (app_datas &&
-                app_interaction_mode_supports_barge_in(app_datas->int_mode) &&
+                app_interaction_mode_supports_barge_in(app_interaction_mode_get_effective(app_datas)) &&
                 s_voice_cloud_tts_active &&
                 voice_reply_interrupt_if_active("full-duplex IAT")) {
                 LOGI("keep full-duplex IAT session active after reply interruption");
@@ -784,6 +795,11 @@ static void voice_camera_preview_state_changed(void *unused, uint32_t msg_id, vo
         LOGW("invalid camera preview state payload");
         return;
     }
+    /* UI state published before cancellation may still be in the bus queue.
+     * Only a new preview request can reactivate the photo guard. */
+    if (s_camera_preview_canceled) {
+        return;
+    }
     s_camera_preview_state = *(const voice_msg_camera_preview_state_t *)data;
 
     enter_result_tts = !(prev_state.mode == CAMERA_PREVIEW_MODE_MCP &&
@@ -830,6 +846,17 @@ static void voice_camera_preview_exit(void *unused, uint32_t msg_id, void *data,
     (void)data;
     (void)len;
     (void)user_data;
+
+    if (voice_camera_preview_exit_is_wakeup(data, len)) {
+        s_camera_preview_canceled = true;
+        s_camera_preview_state = (voice_msg_camera_preview_state_t){0};
+        s_voice_photo_result_restart_pending = false;
+        s_voice_cloud_session_restart_after_tts = false;
+        s_voice_cloud_tts_active = false;
+        voice_cloud_image_recognition_drop_pending_result();
+        LOGI("photo guard cleared by explicit wakeup");
+        return;
+    }
 
     if (!camera_preview_is_active()) {
         return;

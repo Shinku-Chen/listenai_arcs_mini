@@ -218,6 +218,7 @@ enum {
     VOICE_MSG_CLOUD_TTS_TIMELINE_UPDATE,  /* voice_msg_tts_timeline_t * */
     VOICE_MSG_CLOUD_TTS_TIMELINE_END,
     VOICE_MSG_CLOUD_TTS_TIMELINE_FALLBACK,
+    VOICE_MSG_CLOUD_REPLY_INTERRUPTED, /* Reply canceled; the IAT session may remain active. */
     VOICE_MSG_CLOUD_MAX,
 
     /* Player事件 */
@@ -311,6 +312,8 @@ int voice_msg_unsub(uint32_t msg_id, voice_msg_cb_t cb);
 int voice_invoke(voice_invoke_worker_t worker, void *data, uint32_t len);
 int voice_invoke_sync(voice_invoke_sync_worker_t worker, void *data, uint32_t len, struct voice_invoke_rsp *rsp,
                       uint32_t timeout);
+int voice_invoke_sync_ex(voice_invoke_sync_worker_t worker, void *data, uint32_t len,
+                         struct voice_invoke_rsp *rsp, uint32_t rsp_len, uint32_t timeout);
 #ifdef __cplusplus
 }
 #endif

@@ -10,6 +10,9 @@
 
 #include "sys_init.h"
 #include "app_datas.h"
+#ifdef CONFIG_BOARD_ARCS_MINI
+#include "app_wakeup.h"
+#endif
 #include "lisa_log.h"
 #include "lisa_mem.h"
 
@@ -39,6 +42,24 @@
 #endif
 
 static struct app_datas *g_app_datas = NULL;
+
+bool app_interaction_mode_is_forced_single(void)
+{
+#ifdef CONFIG_BOARD_ARCS_MINI
+    return !app_wakeup_is_available();
+#else
+    return false;
+#endif
+}
+
+app_interaction_mode_t app_interaction_mode_get_effective(const struct app_datas *data)
+{
+    if (app_interaction_mode_is_forced_single()) {
+        return APP_INTERACTION_MODE_SINGLE;
+    }
+    return (app_interaction_mode_t)data->int_mode;
+}
+
 static TaskHandle_t g_app_datas_init_task = NULL;
 static struct romfs *romfs = NULL;
 

@@ -51,6 +51,9 @@ add_subdirectory(voice_player)
 
 listenai_add_executable(${PROJECT_NAME})
 
+# firmware_compat.h is shared by the application targets and lives in apps/.
+target_include_directories(${PROJECT_NAME} PRIVATE ${PROJECT_TOP_DIR}/apps)
+
 # res 目录命名约定：<app-name>[_variant]，BOARD 去掉 "arcs_mini" 前缀后即变体后缀。
 # 所有硬件/打包变体均应使用独立 BOARD，例如 arcs_mini_ls2663、arcs_mini3。
 string(REGEX REPLACE "^arcs_mini" "" _VARIANT_SUFFIX "${BOARD}")

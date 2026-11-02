@@ -22,6 +22,7 @@
 #include "sys_wifi.h"
 #include "tone.h"
 #include "voice_player_comm.h"
+#include "voice_player/tone_control/voice_player_network_tone.h"
 #include "battery/battery.h"
 #include "apps/llm/models/model_qrcode.h"
 #include "voice_cloud.h"
@@ -75,6 +76,11 @@ static void app_show_wifi_emoji(void)
 
 static void app_open_cloud_info(uint32_t status)
 {
+    /* Let the foreground miniapp display its own network error and retry.
+     * A passive network notification must not replace its page. */
+    if (miniapp_is_active()) {
+        return;
+    }
 #if CONFIG_WIFI_MANAGER
 #ifdef CONFIG_BOARD_ARCS_MINI_DOLL_V2
     if (status == QR_STATUS_NOT_CONNECTED) {
@@ -132,7 +138,7 @@ static void app_play_netcfg_tone_once(uint32_t status)
         return;
     }
 
-    voice_player_play_tone_url(app_tone_get_url(TONE_ID_70));
+    voice_player_network_tone_request_netcfg_tone();
     s_netcfg_tone_latched = true;
 }
 
@@ -283,6 +289,7 @@ int main(int argc, char **argv)
     }
 #endif
     app_show_initial_wifi_info_if_needed();
+    voice_player_network_tone_ui_ready();
 
 
     vTaskDelay(pdMS_TO_TICKS(3000));

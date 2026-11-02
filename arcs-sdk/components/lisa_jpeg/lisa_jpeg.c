@@ -1,4 +1,5 @@
 #include "lisa_jpeg.h"
+#include "sysheap.h"
 
 
 #define CSK_JPEG_GPDMA_ADDR_ALIGNMENT                   32       /* gpdma addr alignment requirements about psram */
@@ -67,10 +68,10 @@ extern const uint32_t jpeg_enc_htable_golden[384];
 extern const uint32_t jpeg_enc_qtable_golden[128];
 
 /* decode */
-static uint32_t jpeg_dec_base_table_golden[64];
-static uint32_t jpeg_dec_min_table_golden[16];
-static uint32_t jpeg_dec_symbol_table_golden[336];
-static uint32_t jpeg_dec_qtable_golden[256];
+static uint32_t jpeg_dec_base_table_golden[64] __attribute__((section(".psram.bss")));
+static uint32_t jpeg_dec_min_table_golden[16] __attribute__((section(".psram.bss")));
+static uint32_t jpeg_dec_symbol_table_golden[336] __attribute__((section(".psram.bss")));
+static uint32_t jpeg_dec_qtable_golden[256] __attribute__((section(".psram.bss")));
 
 /* Reusable buffer caches to avoid per-frame malloc/free */
 static uint8_t *s_ecs_buf_cache = NULL;
@@ -82,6 +83,9 @@ static uint32_t s_pix_buf_cache_size = 0;
 static uint8_t *s_gray_line_buf = NULL;
 static uint32_t s_gray_line_buf_size = 0;
 
+/* JPEG GPDMA accesses the PSRAM-backed camera/output path. Keep the temporary
+ * encoder buffers in the explicit PSRAM heap so they do not consume the small
+ * internal SRAM heap or depend on the default allocator's preference rules. */
 
 #define CHECK_RET_EQ(Ret, express)\
     do{\
@@ -394,12 +398,18 @@ int32_t jpeg_encode_gpdma_init(csk_gpdma_ch_t in_ch, csk_dma2d_ch_t out_ch)
     jpeg_gpdma_input_finish_cnt = 0;
     jpeg_gpdma_output_finish_cnt = 0;
 
-    ret = GPDMA_Initialize();
-    CHECK_RET_EQ(ret, CSK_DRIVER_OK);
-    SysTick_Delay_Ms(10);
-
-    ret = DMA2D_Initialize();
-    CHECK_RET_EQ(ret, CSK_DRIVER_OK);
+    static uint8_t gpdma_ready;
+    static uint8_t dma2d_ready;
+    if (!gpdma_ready) {
+        ret = GPDMA_Initialize();
+        CHECK_RET_EQ(ret, CSK_DRIVER_OK);
+        gpdma_ready = 1;
+    }
+    if (!dma2d_ready) {
+        ret = DMA2D_Initialize();
+        CHECK_RET_EQ(ret, CSK_DRIVER_OK);
+        dma2d_ready = 1;
+    }
 
     ret = GPDMA_Config(&jpeg_enc_input, jpeg_gpdma_input_callback, NULL);
     CHECK_RET_EQ(ret, CSK_DRIVER_OK);
@@ -812,7 +822,7 @@ uint32_t jpeg_encoder_jpeg_build(const uint8_t *in_buf, uint32_t in_size, uint8_
         jpeg_index += sizeof(sos_yuv);
     }
     /* ECS */
-    memcpy(&out_buf[jpeg_index], in_buf, in_size);
+    memmove(&out_buf[jpeg_index], in_buf, in_size);
     jpeg_index += in_size;
 
     /* EOI */
@@ -841,15 +851,15 @@ uint32_t jpeg_encoder_mcu_extract_gray(const uint8_t *in_buf, uint8_t **mcu_buf,
     uint16_t padding_v = jpeg_enc_cfg->img_height_align - jpeg_enc_cfg->img_height;
 
     /* Allocate memory for lines buffer */
-    if (NULL == (band = (uint8_t *)malloc(jpeg_enc_cfg->sampling_v*jpeg_enc_cfg->img_width_align)))
+    if (NULL == (band = (uint8_t *)psram_malloc_align(4, jpeg_enc_cfg->sampling_v*jpeg_enc_cfg->img_width_align)))
     {
         CLOGD("[%s:%d]malloc failed:size=%u", __func__, __LINE__);
         return CSK_DRIVER_ERROR;
     }
 
-    if (NULL == (mcu_data_ori = (uint8_t*)malloc(jpeg_enc_cfg->pixel_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1)))
+    if (NULL == (mcu_data_ori = (uint8_t*)psram_malloc_align(4, jpeg_enc_cfg->pixel_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1)))
     {
-        free(band);
+        psram_free(band);
         CLOGD("[%s:%d]malloc failed:size=%u", __func__, __LINE__, jpeg_enc_cfg->pixel_size);
         return CSK_DRIVER_ERROR;
     }
@@ -902,7 +912,7 @@ uint32_t jpeg_encoder_mcu_extract_gray(const uint8_t *in_buf, uint8_t **mcu_buf,
     HAL_FlushDCache_by_Addr((uint32_t*)mcu_data, jpeg_enc_cfg->pixel_size);
     *mcu_buf = mcu_data;
     *mcu_buf_ori = mcu_data_ori;
-    free(band);
+    psram_free(band);
 
     return ret;
 }
@@ -934,15 +944,15 @@ uint32_t jpeg_encoder_mcu_extract_rgb(const uint8_t *in_buf, uint8_t **mcu_buf, 
     uint16_t padding_v = jpeg_enc_cfg->img_height_align - jpeg_enc_cfg->img_height;
 
     /* Allocate memory for lines buffer */
-    if (NULL == (band = (uint8_t *)malloc(jpeg_enc_cfg->sampling_v*linesize)))
+    if (NULL == (band = (uint8_t *)psram_malloc_align(4, jpeg_enc_cfg->sampling_v*linesize)))
     {
         CLOGD("[%s:%d]malloc failed:size=%u", __func__, __LINE__);
         return CSK_DRIVER_ERROR;
     }
 
-    if (NULL == (mcu_data_ori = (uint8_t*)malloc(jpeg_enc_cfg->pixel_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1)))
+    if (NULL == (mcu_data_ori = (uint8_t*)psram_malloc_align(4, jpeg_enc_cfg->pixel_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1)))
     {
-        free(band);
+        psram_free(band);
         CLOGD("[%s:%d]malloc failed:size=%u", __func__, __LINE__, jpeg_enc_cfg->pixel_size);
         return CSK_DRIVER_ERROR;
     }
@@ -1075,7 +1085,7 @@ uint32_t jpeg_encoder_mcu_extract_rgb(const uint8_t *in_buf, uint8_t **mcu_buf, 
     HAL_FlushDCache_by_Addr((uint32_t*)mcu_data, jpeg_enc_cfg->pixel_size);
     *mcu_buf = mcu_data;
     *mcu_buf_ori = mcu_data_ori;
-    free(band);
+    psram_free(band);
 
     return ret;
 }
@@ -1099,7 +1109,7 @@ uint32_t jpeg_encoder_mcu_extract_yuv(const uint8_t *in_buf, uint8_t **mcu_buf, 
     uint32_t block_offset = (jpeg_enc_cfg->img_width - jpeg_enc_cfg->sampling_h)*pixel_bw;
     uint16_t padding_v = jpeg_enc_cfg->img_height_align - jpeg_enc_cfg->img_height;
 
-    if (NULL == (mcu_data_ori = (uint8_t*)malloc(jpeg_enc_cfg->pixel_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1)))
+    if (NULL == (mcu_data_ori = (uint8_t*)psram_malloc_align(4, jpeg_enc_cfg->pixel_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1)))
     {
         CLOGD("[%s:%d]malloc failed:size=%u", __func__, __LINE__, jpeg_enc_cfg->pixel_size);
         return CSK_DRIVER_ERROR;
@@ -1211,7 +1221,8 @@ uint32_t jpeg_encoder_mcu_extract(const uint8_t *in_buf, uint8_t **mcu_buf, uint
         return jpeg_encoder_mcu_extract_yuv(in_buf, mcu_buf, mcu_buf_ori, enc_cfg, jpeg_enc_cfg);
 }
 
-uint32_t jpeg_encoder(void *in_buf, void *out_buf, uint32_t *out_size, Jpeg_EncoderCfg enc_cfg)
+uint32_t lisa_jpeg_encoder_bounded(void *in_buf, void *out_buf, uint32_t capacity,
+                                   uint32_t *out_size, Jpeg_EncoderCfg enc_cfg)
 {
     int32_t ret = CSK_DRIVER_OK;
     uint32_t timeout = 0;
@@ -1220,6 +1231,7 @@ uint32_t jpeg_encoder(void *in_buf, void *out_buf, uint32_t *out_size, Jpeg_Enco
     uint8_t *ecs_output_buffer = NULL;
     uint8_t *ecs_output_buffer_ori = NULL;
     uint32_t ecs_len = 0;
+    uint32_t ecs_capacity = 0;
     Jpeg_InitTypeDef jpeg_enc_cfg = {
             .mode = JPEG_MODE_ENCODE,
             .format_in = JPEG_DECODE_IN_FORMAT_YUV420,
@@ -1233,9 +1245,15 @@ uint32_t jpeg_encoder(void *in_buf, void *out_buf, uint32_t *out_size, Jpeg_Enco
             .ht_index = {0x00,0x11,0x11,0x00}
     };
 
-    //CHECK_POINT_NOT_NULL(in_buf);
-    //CHECK_POINT_NOT_NULL(out_buf);
-    //CHECK_POINT_NOT_NULL(out_size);
+    if (!in_buf || !out_buf || !out_size || !enc_cfg.width || !enc_cfg.height ||
+        enc_cfg.width > 4096 || enc_cfg.height > 4096 || capacity < 1024 ||
+        (enc_cfg.input_format != JPEG_PIXEL_FORMAT_RGB888 &&
+         enc_cfg.input_format != JPEG_PIXEL_FORMAT_GRAY &&
+         enc_cfg.input_format != JPEG_PIXEL_FORMAT_YUV422 &&
+         enc_cfg.input_format != JPEG_PIXEL_FORMAT_YUV444)) {
+        return CSK_DRIVER_ERROR;
+    }
+    *out_size = 0;
 
     /* switch image to mcu block */
     if (JPEG_PIXEL_FORMAT_GRAY == enc_cfg.input_format)
@@ -1262,38 +1280,73 @@ uint32_t jpeg_encoder(void *in_buf, void *out_buf, uint32_t *out_size, Jpeg_Enco
     jpeg_enc_cfg.img_height_align = CSK_JPEG_BLOCK_ALIGN(jpeg_enc_cfg.img_height, jpeg_enc_cfg.sampling_v);
     jpeg_enc_cfg.pixel_size = jpeg_image_size(jpeg_enc_cfg.img_width_align, jpeg_enc_cfg.img_height_align, jpeg_enc_cfg.format_in);
     jpeg_enc_cfg.src_size = jpeg_enc_cfg.pixel_size;
-    jpeg_encoder_mcu_extract(in_buf, &mcu_data, &mcu_data_ori, &enc_cfg, &jpeg_enc_cfg);
+    ret = jpeg_encoder_mcu_extract(in_buf, &mcu_data, &mcu_data_ori, &enc_cfg, &jpeg_enc_cfg);
+    if (ret != CSK_DRIVER_OK) {
+        return ret;
+    }
 
-    jpeg_init(&jpeg_enc_cfg);
-    jpeg_send_huffman_table(jpeg_enc_htable_golden, sizeof(jpeg_enc_htable_golden)/sizeof(uint32_t));
-    jpeg_send_quantization_table(jpeg_enc_qtable_golden, sizeof(jpeg_enc_qtable_golden)/sizeof(uint32_t));
-    jpeg_start();
-
-    ecs_len = jpeg_enc_cfg.pixel_size;
-    if (NULL == (ecs_output_buffer_ori = (uint8_t*)malloc(ecs_len + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1)))
-    {
-        CLOGD("[%s:%d]malloc ecs_output_buffer failed:size=%u", __func__, __LINE__, ecs_len);
+    ret = jpeg_init(&jpeg_enc_cfg);
+    if (ret != CSK_DRIVER_OK) {
         goto error1;
     }
-    ecs_output_buffer = (uint8_t*)(((size_t)ecs_output_buffer_ori + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1) & ~(CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1));
+    jpeg_send_huffman_table(jpeg_enc_htable_golden, sizeof(jpeg_enc_htable_golden)/sizeof(uint32_t));
+    jpeg_send_quantization_table(jpeg_enc_qtable_golden, sizeof(jpeg_enc_qtable_golden)/sizeof(uint32_t));
+    ret = jpeg_start();
+    if (ret != CSK_DRIVER_OK) {
+        goto error1;
+    }
+
+    /* Baseline Huffman coding plus worst-case byte stuffing: at most eight
+     * bytes per input sample. Peripheral-flow DMA cannot enforce a byte cap. */
+    ecs_capacity = jpeg_enc_cfg.pixel_size * 8U + 32U;
+    ecs_len = ecs_capacity;
+    uintptr_t ecs_addr = ((uintptr_t)out_buf + 1024U + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1U) &
+                         ~(uintptr_t)(CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1U);
+    uint32_t ecs_offset = (uint32_t)(ecs_addr - (uintptr_t)out_buf);
+    /* Reserve header space and encode directly into a bounded caller buffer. */
+    if (capacity != UINT32_MAX && capacity >= ecs_offset &&
+        capacity - ecs_offset >= ecs_capacity) {
+        ecs_output_buffer = (uint8_t *)ecs_addr;
+    } else {
+        if (NULL == (ecs_output_buffer_ori = (uint8_t*)malloc(ecs_len + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1))) {
+            CLOGD("[%s:%d]malloc ecs_output_buffer failed:size=%u", __func__, __LINE__, ecs_len);
+            ret = CSK_DRIVER_ERROR;
+            goto error1;
+        }
+        ecs_output_buffer = (uint8_t*)(((size_t)ecs_output_buffer_ori + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1) & ~(CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1));
+    }
     memset(ecs_output_buffer, 0, ecs_len);
-    jpeg_encode_gpdma_init(LISA_JPEG_ENCODE_GPDMA_IN_CH, LISA_JPEG_ENCODE_DMA2D_OUT_CH);
-    jpeg_encode_gpdma_start(LISA_JPEG_ENCODE_GPDMA_IN_CH, (void*)mcu_data, jpeg_enc_cfg.pixel_size/sizeof(uint32_t), LISA_JPEG_ENCODE_DMA2D_OUT_CH, (void*)ecs_output_buffer, ecs_len/sizeof(uint32_t));
+    HAL_FlushDCache_by_Addr((uint32_t *)ecs_output_buffer, ecs_len);
+    ret = jpeg_encode_gpdma_init(LISA_JPEG_ENCODE_GPDMA_IN_CH, LISA_JPEG_ENCODE_DMA2D_OUT_CH);
+    if (ret != CSK_DRIVER_OK) {
+        goto error0;
+    }
+    ret = jpeg_encode_gpdma_start(LISA_JPEG_ENCODE_GPDMA_IN_CH, (void*)mcu_data, jpeg_enc_cfg.pixel_size/sizeof(uint32_t), LISA_JPEG_ENCODE_DMA2D_OUT_CH, (void*)ecs_output_buffer, ecs_len/sizeof(uint32_t));
+
+    if (ret != CSK_DRIVER_OK) {
+        goto error0;
+    }
 
     /* wait done */
     timeout = 1000000; // us
     CHECK_EQ_TIMEOUT_EXIT(jpeg_gpdma_output_finish_cnt_get(), 0, timeout, error0);
     ecs_len = IP_JPEG->REG_RESULT_DATA_LENGTH.bit.RESULT_LEN;
 
-    HAL_FlushDCache_by_Addr((uint32_t*)ecs_output_buffer, ecs_len);
-    jpeg_encoder_jpeg_build(ecs_output_buffer, ecs_len, out_buf, out_size, &jpeg_enc_cfg);
+    if (ecs_len == 0 || ecs_len > ecs_capacity || ecs_len > capacity - 1024U) {
+        ret = CSK_DRIVER_ERROR;
+        goto error0;
+    }
+    HAL_InvalidateDCache_by_Addr((uint32_t*)ecs_output_buffer, ecs_len);
+    ret = jpeg_encoder_jpeg_build(ecs_output_buffer, ecs_len, out_buf, out_size, &jpeg_enc_cfg);
 
 error0:
     //gpdma_reg_dump(LISA_JPEG_ENCODE_GPDMA_IN_CH);
     //gpdma_reg_dump(LISA_JPEG_ENCODE_DMA2D_OUT_CH);
     jpeg_encode_gpdma_stop(LISA_JPEG_ENCODE_GPDMA_IN_CH, LISA_JPEG_ENCODE_DMA2D_OUT_CH);
 error1:
-    jpeg_reg_dump();
+    if (ret != CSK_DRIVER_OK) {
+        jpeg_reg_dump();
+    }
     jpeg_stop();
     jpeg_deinit();
 
@@ -1310,7 +1363,7 @@ error1:
     /* release mem */
     if (mcu_data_ori)
     {
-        free(mcu_data_ori);
+        psram_free(mcu_data_ori);
         mcu_data = NULL;
         mcu_data_ori = NULL;
     }
@@ -1322,6 +1375,12 @@ error1:
     }
 
     return ret;
+}
+
+/* Compatibility entry point; callers still own the output-size contract. */
+uint32_t jpeg_encoder(void *in_buf, void *out_buf, uint32_t *out_size, Jpeg_EncoderCfg enc_cfg)
+{
+    return lisa_jpeg_encoder_bounded(in_buf, out_buf, UINT32_MAX, out_size, enc_cfg);
 }
 
 uint32_t jpeg_encoder_ext(void *in_buf, void *out_buf, uint32_t *out_size, Jpeg_EncoderCfg enc_cfg)
@@ -1544,11 +1603,11 @@ uint32_t jpeg_decoder_pixel_build_yuv(const uint8_t *in_buf, uint8_t *out_buf, J
     uint8_t pixel_bw = 3;
     uint8_t output_rgb565 = 0;
     static uint8_t yuv_lut_inited = 0;
-    static int16_t yuv_r_tbl[256];
-    static int16_t yuv_g_cb_tbl[256];
-    static int16_t yuv_g_cr_tbl[256];
-    static int16_t yuv_b_tbl[256];
-    static uint8_t s_clamp_tbl[768];
+    static int16_t yuv_r_tbl[256] __attribute__((section(".psram.bss")));
+    static int16_t yuv_g_cb_tbl[256] __attribute__((section(".psram.bss")));
+    static int16_t yuv_g_cr_tbl[256] __attribute__((section(".psram.bss")));
+    static int16_t yuv_b_tbl[256] __attribute__((section(".psram.bss")));
+    static uint8_t s_clamp_tbl[768] __attribute__((section(".psram.bss")));
 
     if (!yuv_lut_inited)
     {
@@ -1810,7 +1869,7 @@ uint32_t jpeg_decoder_parse_jpg(const uint8_t *in_buf, uint32_t in_size, uint8_t
     uint32_t start_index = 0;
 
     {
-        uint32_t need = in_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1;
+        uint32_t need = in_size + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1 + 4;
         if (s_ecs_buf_cache && s_ecs_buf_cache_size >= need) {
             ecs_data_ori = s_ecs_buf_cache;
         } else {
@@ -1932,23 +1991,27 @@ uint32_t jpeg_decoder_parse_jpg(const uint8_t *in_buf, uint32_t in_size, uint8_t
                 index += ((jpeg_data[index+1]<<8|jpeg_data[index+2])+1); /* segment length + segment data */
             }break;
 
-            case 0xdb : /* DQT */
+            case 0xdb : /* DQT: one segment may contain both tables */
             {
-                index += 3; /* Lq-16bit  Pq-4bit  Tq-4bit */
-                uint8_t pq = (jpeg_data[index]>>4)&0xF;
-                uint8_t tq_offset = ((0 == (jpeg_data[index]&0xF)) ? 0 : 1) * 64;   /* hardware support max 2 qtable */
-                for(i = 0; i < 64; i++)
-                {
-                    if (0 == pq)
-                        *(qtable + tq_offset + i) = jpeg_data[++index];
-                    else
-                        *(qtable + tq_offset + i) = (jpeg_data[++index]<<8)|jpeg_data[++index];
+                uint32_t end = index + 1 + ((jpeg_data[index+1] << 8) | jpeg_data[index+2]);
+                index += 3;
+                while (index < end) {
+                    uint8_t info = jpeg_data[index++];
+                    uint32_t offset = (info & 15) ? 64 : 0;
+                    for (i = 0; i < 64; i++) {
+                        uint32_t value = jpeg_data[index++];
+                        if (info >> 4) {
+                            value = (value << 8) | jpeg_data[index++];
+                        }
+                        qtable[offset + i] = value;
+                    }
                 }
             }break;
 
             case 0xc4 : /* DHT */
             {
-                lh = ((jpeg_data[++index]<<8)|jpeg_data[++index]) - 2;/* Lh-16bit  Tc-4bit  Th-4bit */
+                lh = ((jpeg_data[index + 1] << 8) | jpeg_data[index + 2]) - 2;
+                index += 2;
                 start_index = index;
                 do
                 {
@@ -2078,14 +2141,14 @@ uint32_t jpeg_decoder_parse_jpg(const uint8_t *in_buf, uint32_t in_size, uint8_t
         }
     }
 
-    /* Zero-pad to word boundary for DMA alignment */
+    /* Include the extra DMA word requested by jpeg_decode_gpdma_start. */
     {
-        uint32_t tail = (4 - (ecs_index & 3)) & 3;
+        uint32_t tail = 4 - (ecs_index & 3);
         if (tail) {
             memset(ecs_data + ecs_index, 0, tail);
         }
     }
-    HAL_FlushDCache_by_Addr((uint32_t*)ecs_data, ecs_index);
+    HAL_FlushDCache_by_Addr((uint32_t*)ecs_data, (ecs_index & ~3U) + 4U);
     jpeg_dec_cfg->ecs_size = ecs_index;
     *ecs_buf = ecs_data;
     *ecs_buf_ori = ecs_data_ori;
@@ -2146,12 +2209,18 @@ uint32_t jpeg_decoder(const uint8_t *in_buf, uint32_t in_size, uint8_t *out_buf,
     jpeg_dec_cfg.src_size = jpeg_dec_cfg.ecs_size;
 
     t0 = SysTick_Time();
-    jpeg_init(&jpeg_dec_cfg);
+    ret = jpeg_init(&jpeg_dec_cfg);
+    if (ret != CSK_DRIVER_OK) {
+        return ret;
+    }
     jpeg_send_base_table(jpeg_dec_base_table_golden, sizeof(jpeg_dec_base_table_golden)/sizeof(uint32_t));
     jpeg_send_min_table(jpeg_dec_min_table_golden, sizeof(jpeg_dec_min_table_golden)/sizeof(uint32_t));
     jpeg_send_symbol_table(jpeg_dec_symbol_table_golden, sizeof(jpeg_dec_symbol_table_golden)/sizeof(uint32_t));
     jpeg_send_quantization_table(jpeg_dec_qtable_golden, sizeof(jpeg_dec_qtable_golden)/sizeof(uint32_t) / 2);
-    jpeg_start();
+    ret = jpeg_start();
+    if (ret != CSK_DRIVER_OK) {
+        goto error1;
+    }
     t_setup_ms = SysTick_Time() - t0;
 
     t0 = SysTick_Time();
@@ -2167,6 +2236,7 @@ uint32_t jpeg_decoder(const uint8_t *in_buf, uint32_t in_size, uint8_t *out_buf,
             if (NULL == pix_output_buffer_ori) {
                 CLOGD("[%s:%d]malloc pix_output_buffer failed:size=%u", __func__, __LINE__, jpeg_dec_cfg.pixel_size);
                 t_dma_prep_ms = SysTick_Time() - t0;
+                ret = CSK_DRIVER_ERROR;
                 goto error1;
             }
             s_pix_buf_cache = pix_output_buffer_ori;
@@ -2174,14 +2244,22 @@ uint32_t jpeg_decoder(const uint8_t *in_buf, uint32_t in_size, uint8_t *out_buf,
         }
     }
     pix_output_buffer = (uint8_t*)(((size_t)pix_output_buffer_ori + CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1) & ~(CSK_JPEG_GPDMA_ADDR_ALIGNMENT - 1));
-    jpeg_decode_gpdma_init(LISA_JPEG_DECODE_GPDMA_IN_CH, LISA_JPEG_DECODE_GPDMA_OUT_CH);
-    jpeg_decode_gpdma_start(LISA_JPEG_DECODE_GPDMA_IN_CH,
+    HAL_FlushDCache_by_Addr((uint32_t *)pix_output_buffer, jpeg_dec_cfg.pixel_size);
+    ret = jpeg_decode_gpdma_init(LISA_JPEG_DECODE_GPDMA_IN_CH, LISA_JPEG_DECODE_GPDMA_OUT_CH);
+    if (ret != CSK_DRIVER_OK) {
+        goto error0;
+    }
+    ret = jpeg_decode_gpdma_start(LISA_JPEG_DECODE_GPDMA_IN_CH,
                             (void*)ecs_data,
                             jpeg_dec_cfg.ecs_size/sizeof(uint32_t) + 1,
                             LISA_JPEG_DECODE_GPDMA_OUT_CH,
                             (void*)pix_output_buffer,
                             jpeg_dec_cfg.pixel_size/sizeof(uint32_t));
     t_dma_prep_ms = SysTick_Time() - t0;
+
+    if (ret != CSK_DRIVER_OK) {
+        goto error0;
+    }
 
     /* wait done */
     t0 = SysTick_Time();
@@ -2198,7 +2276,7 @@ uint32_t jpeg_decoder(const uint8_t *in_buf, uint32_t in_size, uint8_t *out_buf,
     *width = jpeg_dec_cfg.img_width;
     *height = jpeg_dec_cfg.img_height;
     t0 = SysTick_Time();
-    jpeg_decoder_pixel_build(pix_output_buffer, out_buf, &dec_cfg, &jpeg_dec_cfg);
+    ret = jpeg_decoder_pixel_build(pix_output_buffer, out_buf, &dec_cfg, &jpeg_dec_cfg);
     t_build_ms = SysTick_Time() - t0;
 
 error0:

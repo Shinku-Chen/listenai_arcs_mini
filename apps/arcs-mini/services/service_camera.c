@@ -8,6 +8,9 @@
 #include "lisa_kv.h"
 #include "lisa_device.h"
 #include "lisa_camera.h"
+#ifdef CONFIG_LISA_CAMERA_CPDMA_TRANSFORM
+#include "lisa_camera_rgb565.h"
+#endif
 #include "lisa_gpio.h"
 
 #include "IOMuxManager.h"
@@ -348,6 +351,16 @@ int service_camera_capture(uint8_t *buffer, uint32_t buffer_len)
         service_camera_stop_stream();
         return ret;
     }
+
+#ifdef CONFIG_LISA_CAMERA_CPDMA_TRANSFORM
+    if (lisa_camera_rgb565_transform(fb->buf, fb->width, fb->height, buffer, buffer_len,
+                                     CAMERA_OUTPUT_WIDTH, CAMERA_OUTPUT_HEIGHT,
+                                     CAMERA_ROTATE_CW90 != 0, true) == 0) {
+        lisa_camera_release_fb(cam_ctx.camera_dev, fb);
+        return 0;
+    }
+    /* No free channel, allocation failure or DMA timeout: use the CPU path. */
+#endif
 
     /* fb→输出：最近邻降采样（fb==输出尺寸时退化为 1:1）+ RGB565 字节交换。
      * 除法项统一处理 640×480 全画幅与 320×240 跳采两种输入。*/

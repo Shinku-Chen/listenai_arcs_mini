@@ -32,7 +32,8 @@ int32_t flash_if_init(FLASH_DEV *dev, unsigned char ud0, unsigned char ud1)
 
     flash_dev = *dev;
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     ret = flash_init(&flash_dev, ud0, ud1);
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
@@ -46,7 +47,8 @@ int32_t flash_if_read_jedec_id(uint32_t *jedec_id)
 {
     int ret = -1;   
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     ret = flash_read_jedec_id(&flash_dev, jedec_id);
 
@@ -61,7 +63,8 @@ int32_t flash_if_sr_read(uint32_t idx, uint32_t id, uint32_t *value)
     int ret;
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
 
     ret = flash_status_register_get_by_idx(idx, &flash_dev, id, value);
@@ -78,7 +81,8 @@ int32_t flash_if_sr_write(uint32_t idx, uint32_t id, uint32_t value)
     int ret;
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     uint32_t out = 0;
     ret = flash_status_register_set_by_idx(idx, &flash_dev, id, value, &out);
@@ -95,7 +99,8 @@ int32_t flash_if_read_jedec_id_by_idx(uint32_t *jedec_id, uint8_t idx)
 {
     int ret = -1;   
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     ret = flash_read_jedec_id_by_idx(&flash_dev, jedec_id, idx);
 
@@ -111,7 +116,8 @@ int32_t flash_if_read(size_t offset, void *data, size_t len)
     int32_t ret = 0;
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     ret = flash_read(&flash_dev, offset, data, len);
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
@@ -144,7 +150,8 @@ int32_t flash_if_write(size_t offset, const void *data, size_t len)
         vPortExitCritical();
     }
 #endif
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     ret = flash_write(&flash_dev, offset, data, len);
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
@@ -159,7 +166,8 @@ int32_t flash_if_erase(size_t offset, size_t size)
     int32_t ret = 0;
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     ret = flash_erase(&flash_dev, offset, size);
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
@@ -174,7 +182,8 @@ int32_t flash_if_erase_page(off_t offset, size_t size)
     int32_t ret = 0;
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     ret = flash_erase_page(&flash_dev, offset, size);
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
@@ -194,7 +203,8 @@ int flash_if_security_read(off_t offset, void *data, size_t len)
     int32_t ret = 0;
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     flash_if_config_security_page_offset();
     offset += flash_sec_page_offset; // Adjust offset based on security page offset
@@ -229,7 +239,8 @@ int flash_if_security_write(off_t offset, const void *data, size_t len)
         vPortExitCritical();
     }
 #endif
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     flash_if_config_security_page_offset();
     offset += flash_sec_page_offset; // Adjust offset based on security page offset
@@ -246,7 +257,8 @@ int flash_if_security_erase(off_t offset)
     int32_t ret = 0;
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return -1;
 #endif
     flash_if_config_security_page_offset();
     offset += flash_sec_page_offset; // Adjust offset based on security page offset
@@ -287,7 +299,8 @@ uint8_t flash_if_check_security_support(void)
 {
 
 #if defined(CFG_AMP_IPC_FLASH_AGENT) && (CFG_AMP_IPC_FLASH_AGENT == 1)
-    ipc_halt_peer_core();
+    if (ipc_halt_peer_core() != 0)
+        return 0;
 #endif
 
     flash_if_config_security_page_offset();

@@ -9,6 +9,23 @@ menu "LISA Camera"
 
 if LISA_CAMERA_DEVICE
 
+config LISA_CAMERA_CPDMA_TRANSFORM
+    bool "CPDMA RGB565 camera transform"
+    depends on SOC_ARCS
+    help
+      Enable synchronous integer downsampling, 90-degree clockwise rotation
+      and byte swapping with CPDMA. Temporarily reserves the configured channel.
+
+config LISA_CAMERA_CPDMA_CH
+    int "Camera transform CPDMA channel"
+    depends on LISA_CAMERA_CPDMA_TRANSFORM
+    range 0 3
+    default 1
+    help
+      Select a channel owned by this core. Reservation state is local to each
+      core and cannot detect channels reserved by the other core.
+
+
 choice LISA_CAMERA_BUS_TYPE
 	prompt "Select bus type"
 	default LISA_CAMERA_BUS_SPI

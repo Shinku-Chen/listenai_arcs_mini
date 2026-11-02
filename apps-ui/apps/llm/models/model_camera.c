@@ -109,7 +109,7 @@ int model_camera_capture(uint8_t *in, uint32_t len)
         .buf_len = len,
     };
 
-    int r = voice_invoke_sync(bn_camera_capture, NULL, 0, (struct voice_invoke_rsp *)&rsp, 1000);
+    int r = voice_invoke_sync_ex(bn_camera_capture, NULL, 0, (struct voice_invoke_rsp *)&rsp, sizeof(rsp), 1000);
     if (r) {
         LISA_UI_LOGE("camera cap invoke sync failed, r: %d", r);
         return r;

@@ -411,6 +411,19 @@ int acomp_wakeup_set_algo_mode(acomp_wakeup_algo_mode_e mode)
     return ret;
 }
 
+int acomp_wakeup_set_vad_gate_enabled(uint8_t enable)
+{
+    wakeup_ipc_control_subcmd_vad_gate_set_t gate_set = {
+        .enable = enable ? 1U : 0U,
+    };
+    int ret = acomp_wakeup_control_subcmd(WAKEUP_IPC_CONTROL_SUBCMD_VAD_GATE_SET,
+                                          &gate_set, sizeof(gate_set));
+    if (ret != ACOMP_ERR_OK) {
+        LISA_LOGE(TAG, "acomp wakeup set standby VAD gate failed!");
+    }
+    return ret;
+}
+
 int acomp_wakeup_set_timeout(uint32_t timeout_ms)
 {
     LISA_LOGI(TAG, "acomp wakeup set timeout enter, timeout_ms=%u", timeout_ms);

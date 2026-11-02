@@ -17,6 +17,7 @@
 
 #include "voice_player_music.h"
 #include "miniapp.h"
+#include "miniapp_audio.h"
 
 /*
  * MUSIC 播放模块：集中管理音乐播放器的初始化、URL 播放、事件处理与播放控制。
@@ -128,6 +129,10 @@ static void voice_player_music_event(app_player_t *player,
 {
     (void)player;
     (void)user_data;
+
+    if (miniapp_audio_event(player, event) || miniapp_is_active()) {
+        return;
+    }
 
     switch (event) {
     case APP_PLAYER_EVENT_PREPARED:

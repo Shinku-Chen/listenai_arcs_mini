@@ -28,7 +28,7 @@ static void setting_wakeup_back_btn_cb(void *user_data)
 
 static void on_wakeup_mode_changed(uint16_t mode, void *user_data)
 {
-    (void)user_data;
+    struct setting_wakeup_nav_scr_data *scr_data = user_data;
     
     LISA_UI_LOGD("Wakeup mode changed to: %d", mode);
     
@@ -38,6 +38,12 @@ static void on_wakeup_mode_changed(uint16_t mode, void *user_data)
                      model_voice_wakeup_mode_name_get((model_voice_wakeup_mode_t)mode));
     } else {
         LISA_UI_LOGE("Failed to set wakeup mode: %d", ret);
+        if (scr_data && scr_data->view) {
+            /* The view checks the radio before invoking this callback. Restore
+             * the effective mode when the requested mode is unavailable. */
+            lisa_ui_setting_wakeup_view_set_mode(
+                scr_data->view, (uint16_t)model_voice_wakeup_mode_get());
+        }
     }
 }
 
@@ -61,7 +67,7 @@ static int setting_wakeup_nav_scr_open(const struct lisa_ui_nav_scr *scr, void *
     
     /* 注册返回按钮回调 */
     lisa_ui_setting_wakeup_view_set_back_cb(scr_data->view, setting_wakeup_back_btn_cb, NULL);
-    lisa_ui_setting_wakeup_view_set_mode_changed_cb(scr_data->view, on_wakeup_mode_changed, NULL);
+    lisa_ui_setting_wakeup_view_set_mode_changed_cb(scr_data->view, on_wakeup_mode_changed, scr_data);
 
     /* 初始化UI选中状态为当前模式 */
     lisa_ui_setting_wakeup_view_set_mode(scr_data->view, (uint16_t)model_voice_wakeup_mode_get());

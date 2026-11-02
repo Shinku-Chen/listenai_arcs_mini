@@ -330,8 +330,8 @@ static int findHeaderValueParserCallback( http_parser * pHttpParser,
  *
  * @param[in] pHttpParser Parsing object containing state and callback context.
  *
- * @return Returns #HTTP_PARSER_STOP_PARSING for the parser to halt further
- * execution, as all headers have been parsed in the response.
+ * @return Returns #HTTP_PARSER_CONTINUE_PARSING after pausing the parser,
+ * as all headers have been parsed in the response.
  */
 static int findHeaderOnHeaderCompleteCallback( http_parser * pHttpParser );
 
@@ -2643,8 +2643,11 @@ static int findHeaderOnHeaderCompleteCallback( http_parser * pHttpParser )
                 ( int ) ( pContext->fieldLen ),
                 pContext->pField ) );
 
-    /* No further parsing is required; thus, indicate the parser to stop parsing. */
-    return HTTP_PARSER_STOP_PARSING;
+    /* Returning 1 from on_headers_complete only skips the body. Any buffered
+     * stream bytes would then be parsed as a second HTTP response. Pause at
+     * the header boundary instead, including for close-delimited live audio. */
+    http_parser_pause( pHttpParser, 1 );
+    return HTTP_PARSER_CONTINUE_PARSING;
 }
 
 /*-----------------------------------------------------------*/
@@ -2744,11 +2747,11 @@ static HTTPStatus_t findHeaderInResponse( const uint8_t * pBuffer,
         returnStatus = HTTPParserInternalError;
     }
 
-    /* If header was not found, then the "on_header_complete" callback is
-     * expected to be called which should cause the http_parser.http_errno to be
-     * "OK" */
+    /* A complete header block pauses the search with HPE_PAUSED. HPE_OK is
+     * also possible if the input ended before the completion callback. */
     else if( ( returnStatus == HTTPHeaderNotFound ) &&
-             ( parser.http_errno != ( unsigned int ) ( HPE_OK ) ) )
+             ( parser.http_errno != ( unsigned int ) HPE_PAUSED ) &&
+             ( parser.http_errno != ( unsigned int ) HPE_OK ) )
     {
         LogError( ( "Header not found in response: http-parser returned error: "
                     "ParserError=%s",

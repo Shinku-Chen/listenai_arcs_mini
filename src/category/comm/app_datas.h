@@ -73,4 +73,8 @@ struct app_datas {
 struct app_datas *get_app_datas(void);
 int app_datas_init(void);
 
+/* Runtime fallback never overwrites int_mode or its persisted user preference. */
+bool app_interaction_mode_is_forced_single(void);
+app_interaction_mode_t app_interaction_mode_get_effective(const struct app_datas *data);
+
 #endif

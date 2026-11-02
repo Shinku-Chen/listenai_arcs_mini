@@ -30,7 +30,7 @@
 #include "ipc_core.h"
 #endif
 
-#define IPC_HALT_PEER_CORE_TIMEOUT         10000000   //10s
+#define IPC_HALT_PEER_CORE_TIMEOUT_MS      10000
 
 #ifdef CFG_AMP_IPC_HALT_BY_PEER_CORE
 static rtos_semaphore halt_by_peer_signal;
@@ -40,6 +40,8 @@ static IC_Mutex halt_peer_mutex;
 static rtos_task_handle halt_peer_owner;
 static uint32_t halt_peer_nest_count;
 static bool halt_peer_initialized;
+/* Fail closed until reboot after losing the flash coordination peer. */
+static bool halt_peer_failed;
 #endif
 
 #ifdef CFG_AMP_IPC
@@ -124,20 +126,30 @@ int32_t ipc_halt_peer_core(void)
 
     if (IC_Mutex_acquire(&halt_peer_mutex) == IC_MUTEX_OK)
     {
+        if (halt_peer_failed)
+        {
+            IC_Mutex_release(&halt_peer_mutex);
+            return -1;
+        }
         ipc_clear_app_status(AMP_APP_STATUS_HALT_PEER_ALL);
         __SMP_RWMB();
         ipc_send_signal(IPC_SIG_HALT);
 
-        start = (uint32_t)SysTimer_GetLoadValue();
+        start = rtos_now(false);
         do
         {
             if (ipc_get_app_status(AMP_APP_STATUS_HALT_PEER_ACK))
                 break;
-        } while ((uint32_t)((uint32_t)SysTimer_GetLoadValue() - start) < IPC_HALT_PEER_CORE_TIMEOUT);
+            rtos_task_suspend(1);
+        } while ((uint32_t)(rtos_now(false) - start) < IPC_HALT_PEER_CORE_TIMEOUT_MS);
 
         if (!ipc_get_app_status(AMP_APP_STATUS_HALT_PEER_ACK))
         {
             ret = -1;
+            halt_peer_failed = true;
+            /* A delayed halt handler must still be able to leave its wait. */
+            ipc_set_app_status(AMP_APP_STATUS_HALT_PEER_RESUME);
+            __SMP_RWMB();
             IC_Mutex_release(&halt_peer_mutex);
             CLOGE("Failed to halt the peer core");
         }
@@ -183,16 +195,18 @@ int32_t ipc_resume_peer_core(void)
     ipc_set_app_status(AMP_APP_STATUS_HALT_PEER_RESUME);
     __SMP_RWMB();
 
-    start = (uint32_t)SysTimer_GetLoadValue();
+    start = rtos_now(false);
     do
     {
         if (ipc_get_app_status(AMP_APP_STATUS_HALT_PEER_RESUME_ACK))
             break;
-    } while ((uint32_t)((uint32_t)SysTimer_GetLoadValue() - start) < IPC_HALT_PEER_CORE_TIMEOUT);
+        rtos_task_suspend(1);
+    } while ((uint32_t)(rtos_now(false) - start) < IPC_HALT_PEER_CORE_TIMEOUT_MS);
 
     if (!ipc_get_app_status(AMP_APP_STATUS_HALT_PEER_RESUME_ACK))
     {
         ret = -1;
+        halt_peer_failed = true;
         CLOGE("Failed to get RESUME_ACK");
     }
     __SMP_RWMB();
@@ -221,6 +235,7 @@ int32_t ipc_halt_peer_init(void)
     halt_peer_owner = NULL;
     halt_peer_nest_count = 0;
     halt_peer_initialized = true;
+    halt_peer_failed = false;
 #endif
     return 0;
 }

@@ -214,6 +214,13 @@ extern int acomp_wakeup_stop(void);
 extern int acomp_wakeup_set_algo_mode(acomp_wakeup_algo_mode_e mode);
 
 /**
+ * @brief Enable the AP VAD gate only while the device is in standby.
+ *
+ * A disabled gate forwards every audio frame to the wakeup algorithm.
+ */
+extern int acomp_wakeup_set_vad_gate_enabled(uint8_t enable);
+
+/**
  * @brief 设置唤醒门限等级
  *
  * @note 该函数必须在调用 acomp_wakeup_start() 之后设置才能生效

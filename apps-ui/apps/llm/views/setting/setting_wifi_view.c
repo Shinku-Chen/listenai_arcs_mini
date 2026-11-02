@@ -285,6 +285,8 @@ static lv_obj_t *create_wifi_item(lisa_ui_setting_wifi_view_t *view, const lisa_
     lv_label_set_text(ssid_label, ap_info->ssid);
     lv_obj_set_style_text_font(ssid_label, &lv_font_chinese_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(ssid_label, lv_color_white(), LV_PART_MAIN);
+    /* 中文和拉丁下行字母可能超出声明行高，滚动时也要完整显示。 */
+    lv_obj_set_height(ssid_label, lv_font_get_line_height(&lv_font_chinese_16) + 4);
     lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_width(ssid_label, 125);
     lv_obj_align(ssid_label, LV_ALIGN_LEFT_MID, 25, 0);

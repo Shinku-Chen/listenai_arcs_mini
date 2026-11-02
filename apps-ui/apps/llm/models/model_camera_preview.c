@@ -77,15 +77,16 @@ static void model_camera_preview_capture_msg_handle(void *unused, uint32_t msg_i
 static void model_camera_preview_exit_msg_handle(void *unused, uint32_t msg_id, void *data,
                                                  uint32_t len, void *user_data)
 {
+    bool wakeup = voice_camera_preview_exit_is_wakeup(data, len);
     (void)unused;
     (void)msg_id;
     (void)data;
     (void)len;
     (void)user_data;
 
-    LISA_UI_INVOKE_UI_ARG_NONE({
+    LISA_UI_INVOKE_UI_ARG_BASE(wakeup, {
         if (model_camera_preview_ctx.cbs && model_camera_preview_ctx.cbs->on_exit) {
-            model_camera_preview_ctx.cbs->on_exit(model_camera_preview_ctx.arg);
+            model_camera_preview_ctx.cbs->on_exit(model_camera_preview_ctx.arg, _invoke_wakeup);
         }
     });
 }

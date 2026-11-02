@@ -20,6 +20,7 @@
  *      DEFINES
  *********************/
 static SemaphoreHandle_t dma_sem = NULL;
+static volatile uint32_t dma_event;
 
 static void lv_draw_csk_dma2d_blend(lv_draw_ctx_t * draw_ctx, const lv_draw_sw_blend_dsc_t * dsc);
 static void lv_draw_csk_letter(lv_draw_ctx_t * draw_ctx, const lv_draw_label_dsc_t * dsc,  const lv_point_t * pos_p,
@@ -29,9 +30,32 @@ static int32_t lv_gpu_dma2d_blend(void *buf, uint16_t buf_w, void *map, uint8_t 
 
 static void DMA_DrvEvent(uint32_t event_info, uint32_t xfer_bytes, uint32_t usr_param)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(dma_sem, &xHigherPriorityTaskWoken);
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    (void)xfer_bytes;
+    (void)usr_param;
+    if (event_info & (DMA_EVENT_TRANSFER_COMPLETE | DMA_EVENT_ERROR)) {
+        BaseType_t wake = pdFALSE;
+        dma_event = event_info;
+        xSemaphoreGiveFromISR(dma_sem, &wake);
+        portYIELD_FROM_ISR(wake);
+    }
+}
+
+static bool dma_acquire(void)
+{
+    if (!dma_sem || dma_channel_reserve(CONFIG_LVGL_GPU_CSK_CPDMA_DMA2D_CH,
+                                        DMA_DrvEvent, 0, DMA_CACHE_SYNC_NOP) == DMA_CHANNEL_ANY) {
+        return false;
+    }
+    while (xSemaphoreTake(dma_sem, 0) == pdTRUE) {}
+    dma_event = 0;
+    return true;
+}
+
+static void dma_release(void)
+{
+    /* Stop before allowing software fallback or another client to use it. */
+    dma_channel_disable(CONFIG_LVGL_GPU_CSK_CPDMA_DMA2D_CH, 1);
+    dma_channel_unreserve(CONFIG_LVGL_GPU_CSK_CPDMA_DMA2D_CH);
 }
 
 void lv_draw_csk_dma2d_init(void)
@@ -41,12 +65,6 @@ void lv_draw_csk_dma2d_init(void)
 #endif
 
     dma_initialize();
-
-    uint8_t ch = dma_channel_reserve(CONFIG_LVGL_GPU_CSK_CPDMA_DMA2D_CH, DMA_DrvEvent, 0, DMA_CACHE_SYNC_NOP);
-    if (ch == DMA_CHANNEL_ANY) {
-        LOGE("[FAILED] NO free CP DMA channel for lvgl blend!!");
-        return;
-    }
 
 	// Create binary semaphore for DMA synchronization
 	dma_sem = xSemaphoreCreateBinary();
@@ -234,7 +252,10 @@ static int32_t lv_gpu_dma2d_fill(void *buf, uint16_t buf_w, uint32_t color, uint
 uint64_t dma2d_ready = get_time_cycle();
 #endif
 
-    uint8_t stat = 0;
+    if (!dma_acquire()) {
+        return -1;
+    }
+    int32_t stat = 0;
     if (buf_w == fill_w) {
 
         stat = dma_channel_configure (CONFIG_LVGL_GPU_CSK_CPDMA_DMA2D_CH, (uint32_t)&fill_color, (uint32_t)buf, fill_w * fill_h / 2,
@@ -245,19 +266,21 @@ uint64_t dma2d_ready = get_time_cycle();
                                     control, config_low, config_high, 0, dst_gath);
     }
 
-    if(stat == -1) {
+    if(stat != 0) {
         LOGE("[FAILED] dma_channel_configure failed!!\r\n");
         ret = -2;
         goto error;
     }
 
-    if (xSemaphoreTake(dma_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+    if (xSemaphoreTake(dma_sem, pdMS_TO_TICKS(500)) != pdTRUE ||
+        !(dma_event & DMA_EVENT_TRANSFER_COMPLETE) || (dma_event & DMA_EVENT_ERROR)) {
         ret = -3;
         goto error;
     }
 
 
 error:
+    dma_release();
 #if CONFIG_LV_CUSTOM_MONITOR
     g_dma2d_fill_total_time += calc_time_elapsed_cycle(start_time);
     g_dma2d_fill_dma_time += calc_time_elapsed_cycle(dma2d_ready);
@@ -293,20 +316,25 @@ uint64_t start_time = get_time_cycle();
 #if CONFIG_LV_CUSTOM_MONITOR
     uint64_t dma2d_ready = get_time_cycle();
 #endif
-    uint8_t stat = dma_channel_configure (CONFIG_LVGL_GPU_CSK_CPDMA_DMA2D_CH, (uint32_t)map, (uint32_t)buf, copy_w * copy_h / 2,
+    if (!dma_acquire()) {
+        return -1;
+    }
+    int32_t stat = dma_channel_configure (CONFIG_LVGL_GPU_CSK_CPDMA_DMA2D_CH, (uint32_t)map, (uint32_t)buf, copy_w * copy_h / 2,
                                 control, config_low, config_high, src_gath, dst_gath);
 
-    if(stat == -1) {
+    if(stat != 0) {
         ret = -2;
         goto error;
     }
 
-    if (xSemaphoreTake(dma_sem, pdMS_TO_TICKS(500)) != pdTRUE) {
+    if (xSemaphoreTake(dma_sem, pdMS_TO_TICKS(500)) != pdTRUE ||
+        !(dma_event & DMA_EVENT_TRANSFER_COMPLETE) || (dma_event & DMA_EVENT_ERROR)) {
         ret = -3;
         goto error;
     }
 
 error:
+    dma_release();
 #if CONFIG_LV_CUSTOM_MONITOR
     g_dma2d_copy_total_time += calc_time_elapsed_cycle(start_time);
     g_dma2d_copy_dma_time += calc_time_elapsed_cycle(dma2d_ready);

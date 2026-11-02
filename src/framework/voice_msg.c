@@ -26,12 +26,15 @@ struct voice_invoke {
 
 struct voice_invoke_sync {
     voice_invoke_sync_worker_t worker;
-    struct voice_invoke_rsp *rsp;
     uint32_t data_len;
-    uint8_t data[0];
+    uint32_t rsp_len;
+    SemaphoreHandle_t done_sem;
+    SemaphoreHandle_t release_sem;
+    struct voice_invoke_rsp *rsp;
+    void *worker_data;
+    struct voice_invoke_sync *context;
 };
 
-static SemaphoreHandle_t voice_invoke_sync_resp_sem = NULL;
 static SemaphoreHandle_t voice_invoke_sync_lock = NULL;
 
 static void voice_invoke_sumbit_msg_received(void *unused, uint32_t evt, void *data, uint32_t len, void *user_data)
@@ -50,18 +53,23 @@ static void voice_invoke_sumbit_msg_received(void *unused, uint32_t evt, void *d
 
 static void voice_invoke_sync_sumbit_msg_received(void *unused, uint32_t evt, void *data, uint32_t len, void *user_data)
 {
-    struct voice_invoke_sync *invoke = (struct voice_invoke_sync *)data;
-    if (invoke == NULL) {
+    struct voice_invoke_sync *message = (struct voice_invoke_sync *)data;
+    if (message == NULL || message->context == NULL) {
         return;
     }
+    struct voice_invoke_sync *invoke = message->context;
 
-    LOGI("voice invoke, worker: %p, data: %p, len: %d", invoke->worker, invoke->data, invoke->data_len);
+    LOGI("voice invoke, worker: %p, data: %p, len: %d", message->worker, message->worker_data, message->data_len);
 
-    if (invoke->worker) {
-        invoke->worker(invoke->data, invoke->data_len, invoke->rsp);
+    if (message->worker) {
+        message->worker(message->worker_data, message->data_len, message->rsp);
     }
 
-    xSemaphoreGive(voice_invoke_sync_resp_sem);
+    xSemaphoreGive(invoke->done_sem);
+    xSemaphoreTake(invoke->release_sem, portMAX_DELAY);
+    vSemaphoreDelete(invoke->done_sem);
+    vSemaphoreDelete(invoke->release_sem);
+    psram_free(invoke);
 }
 
 int voice_invoke(voice_invoke_worker_t worker, void *data, uint32_t len)
@@ -89,39 +97,89 @@ int voice_invoke(voice_invoke_worker_t worker, void *data, uint32_t len)
     return ret;
 }
 
-int voice_invoke_sync(voice_invoke_sync_worker_t worker, void *data, uint32_t len, struct voice_invoke_rsp *rsp,
-                      uint32_t timeout)
+int voice_invoke_sync_ex(voice_invoke_sync_worker_t worker, void *data, uint32_t len, struct voice_invoke_rsp *rsp,
+                         uint32_t rsp_len, uint32_t timeout)
 {
-    if (worker == NULL || rsp == NULL) {
+    if (worker == NULL || rsp == NULL || rsp_len < sizeof(struct voice_invoke_rsp) || (len && data == NULL)) {
         return -1;
     }
 
-    struct voice_invoke_sync *invoke_sync = psram_malloc(sizeof(*invoke_sync) + len);
+    if (rsp_len > UINT32_MAX - (sizeof(uint32_t) - 1U)) {
+        return -1;
+    }
+    const uint32_t rsp_storage_len = (rsp_len + sizeof(uint32_t) - 1U) & ~(sizeof(uint32_t) - 1U);
+    if (rsp_storage_len > UINT32_MAX - sizeof(struct voice_invoke_sync) ||
+        len > UINT32_MAX - sizeof(struct voice_invoke_sync) - rsp_storage_len) {
+        return -1;
+    }
+
+    struct voice_invoke_sync *invoke_sync = psram_malloc(sizeof(*invoke_sync) + rsp_storage_len + len);
     if (invoke_sync == NULL) {
         return -1;
     }
 
     invoke_sync->worker = worker;
     invoke_sync->data_len = len;
-    invoke_sync->rsp = rsp;
+    invoke_sync->rsp_len = rsp_len;
+    invoke_sync->done_sem = xSemaphoreCreateBinary();
+    invoke_sync->release_sem = xSemaphoreCreateBinary();
+    invoke_sync->rsp = (struct voice_invoke_rsp *)(invoke_sync + 1);
+    invoke_sync->worker_data = (uint8_t *)invoke_sync->rsp + rsp_storage_len;
+    invoke_sync->context = invoke_sync;
 
-    if (len) {
-        memcpy(invoke_sync->data, data, len);
-    }
-
-    BaseType_t r = xSemaphoreTake(voice_invoke_sync_lock, timeout);
-    if (r != pdPASS) {
+    if (invoke_sync->done_sem == NULL || invoke_sync->release_sem == NULL) {
+        if (invoke_sync->done_sem) {
+            vSemaphoreDelete(invoke_sync->done_sem);
+        }
+        if (invoke_sync->release_sem) {
+            vSemaphoreDelete(invoke_sync->release_sem);
+        }
         psram_free(invoke_sync);
         return -1;
     }
 
-    xSemaphoreTake(voice_invoke_sync_resp_sem, 0);
-    voice_msg_pub(VOICE_MSG_INVOKE_SYNC_SUBMIT, invoke_sync, sizeof(*invoke_sync) + len);
-    r = xSemaphoreTake(voice_invoke_sync_resp_sem, timeout);
+    memcpy(invoke_sync->rsp, rsp, rsp_len);
+
+    if (len) {
+        memcpy(invoke_sync->worker_data, data, len);
+    }
+
+    BaseType_t r = xSemaphoreTake(voice_invoke_sync_lock, timeout);
+    if (r != pdPASS) {
+        vSemaphoreDelete(invoke_sync->done_sem);
+        vSemaphoreDelete(invoke_sync->release_sem);
+        psram_free(invoke_sync);
+        return -1;
+    }
+
+    int pub_ret = voice_msg_pub(VOICE_MSG_INVOKE_SYNC_SUBMIT, invoke_sync, sizeof(*invoke_sync));
+    if (pub_ret == 0) {
+        r = xSemaphoreTake(invoke_sync->done_sem, timeout);
+    } else {
+        r = pdFAIL;
+    }
+
+    if (pub_ret != 0) {
+        vSemaphoreDelete(invoke_sync->done_sem);
+        vSemaphoreDelete(invoke_sync->release_sem);
+        psram_free(invoke_sync);
+    } else {
+        if (r == pdPASS) {
+            memcpy(rsp, invoke_sync->rsp, rsp_len);
+        }
+        /* The callback owns the context until it consumes this release. */
+        xSemaphoreGive(invoke_sync->release_sem);
+    }
 
     xSemaphoreGive(voice_invoke_sync_lock);
 
     return r == pdPASS ? 0 : -1;
+}
+
+int voice_invoke_sync(voice_invoke_sync_worker_t worker, void *data, uint32_t len, struct voice_invoke_rsp *rsp,
+                      uint32_t timeout)
+{
+    return voice_invoke_sync_ex(worker, data, len, rsp, sizeof(*rsp), timeout);
 }
 
 int voice_msg_init(void)
@@ -144,10 +202,6 @@ int voice_msg_init(void)
 
     voice_invoke_sync_lock = xSemaphoreCreateMutex();
     assert(voice_invoke_sync_lock);
-
-    voice_invoke_sync_resp_sem = xSemaphoreCreateBinary();
-    assert(voice_invoke_sync_resp_sem);
-
 
     voice_msg_sub(VOICE_MSG_INVOKE_SUBMIT, voice_invoke_sumbit_msg_received, NULL);
     voice_msg_sub(VOICE_MSG_INVOKE_SYNC_SUBMIT, voice_invoke_sync_sumbit_msg_received, NULL);

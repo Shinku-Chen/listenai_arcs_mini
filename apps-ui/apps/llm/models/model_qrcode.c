@@ -63,9 +63,9 @@ static const char *DEFAULT_NOT_CONNECTED_TEXT = "当前网络未连接\n请使�
 static const char *DEFAULT_CONNECTED_TEXT = "请使用微信扫码修改配置";
 static const char *DEFAULT_OUT_OF_LIMIT_TEXT = "今日交互额度已用完";
 static const char *DEFAULT_OUT_OF_LIMIT_BOTTOM_TEXT = "微信扫码开通会员\n获取更多交互额度";
-static const char *DEFAULT_BIND_TEXT = "\n请使用微信扫码绑定";
-static const char *DEFAULT_AUTH_FAILED_TEXT = "云端鉴权失败";
-static const char *DEFAULT_AUTH_FAILED_BOTTOM_TEXT = "请检查 pid/sid 是否正确";
+static const char *DEFAULT_BIND_TEXT = "请使用微信扫码绑定";
+static const char *DEFAULT_AUTH_FAILED_TEXT = "设备认证失败";
+static const char *DEFAULT_AUTH_FAILED_BOTTOM_TEXT = "请联系设备提供方\n检查设备配置";
 
 static int model_qrcode_get_device_mode(void)
 {
@@ -632,11 +632,8 @@ static int model_qrcode_get_auth_failed_data(qrcode_data_t *data)
     data->status = QR_STATUS_AUTH_FAILED;
     data->top_text = DEFAULT_AUTH_FAILED_TEXT;
     data->bottom_text = DEFAULT_AUTH_FAILED_BOTTOM_TEXT;
-    data->qr_image = model_qrcode_get_netcfg_image();
-
-#ifdef LISA_UI_PLATFORM_ARCS
-    app_ble_netcfg_adv_start_delayed();
-#endif
+    /* 配网不能修复应用凭据，避免用配网码误导用户。 */
+    data->qr_image = NULL;
 
     return 0;
 }
@@ -667,14 +664,9 @@ int model_qrcode_get_config_data(qrcode_data_t *data)
 
     data->status = QR_STATUS_CONNECTED;
     if (g_qrcode_ctx.role_setting_qrcode_img_raw == NULL) {
-        // 云端二维码未加载时，显示配网二维码作为备选
-        LISA_UI_LOGI("Role setting qrcode not ready, fallback to BLE config qrcode");
-        data->top_text = "云端二维码加载失败\n请使用微信扫码配网";
-        data->bottom_text = "";
-        data->qr_image = model_qrcode_get_netcfg_image();
-#ifdef LISA_UI_PLATFORM_ARCS
-        app_ble_netcfg_adv_start_delayed();
-#endif
+        data->top_text = "正在加载配置二维码…";
+        data->bottom_text = "单击返回";
+        data->qr_image = NULL;
         return 0;
     }
 
@@ -687,7 +679,7 @@ int model_qrcode_get_config_data(qrcode_data_t *data)
     g_qrcode_ctx.dynamic_qrcode_img.data = g_qrcode_ctx.role_setting_qrcode_img_raw;
 
     data->top_text = DEFAULT_CONNECTED_TEXT;
-    data->bottom_text = "";
+    data->bottom_text = "单击返回";
     data->qr_image = &g_qrcode_ctx.dynamic_qrcode_img;
     return 0;
 }

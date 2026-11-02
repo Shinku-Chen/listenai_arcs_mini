@@ -10,6 +10,7 @@
 #include "voice_intent_mgr.h"
 #include "FreeRTOS.h"
 #include "timers.h"
+#include "miniapp.h"
 
 /* ---- MUSIC intent hooks ----
 
@@ -66,6 +67,10 @@ static void music_intent_play_current(void)
 static void music_resume_timer_cb(TimerHandle_t xTimer)
 {
     (void)xTimer;
+
+    if (miniapp_is_active()) {
+        return;
+    }
 
     if (s_user_paused) {
         LOGI("MUSIC resume timer: user paused, skip");
@@ -140,6 +145,9 @@ static void on_music_playing(void *unused, uint32_t msg_id,
                               void *data, uint32_t len, void *user_data)
 {
     (void)unused; (void)msg_id; (void)data; (void)len; (void)user_data;
+    if (miniapp_is_active()) {
+        return;
+    }
     voice_intent_push(INTENT_MUSIC);
 }
 

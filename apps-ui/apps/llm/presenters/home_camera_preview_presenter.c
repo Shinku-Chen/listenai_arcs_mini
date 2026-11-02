@@ -11,6 +11,9 @@
 #include "model_camera.h"
 #include "model_voice.h"
 #include "voice_msg.h"
+#ifdef CONFIG_LISA_CAMERA_CPDMA_TRANSFORM
+#include "sysheap.h"
+#endif
 #ifdef LISA_UI_PLATFORM_ARCS
 #include "app_player.h"
 #include "app_tone.h"
@@ -210,7 +213,11 @@ void camera_preview_capture_timer_cb(lv_timer_t *timer)
             scr_data->cap_buf_size = 0;
         }
 
+#ifdef CONFIG_LISA_CAMERA_CPDMA_TRANSFORM
+        scr_data->cap_buf = psram_malloc_align(32, image_size);
+#else
         scr_data->cap_buf = lisa_ui_malloc(image_size);
+#endif
         if (!scr_data->cap_buf) {
             LISA_UI_LOGE("Failed to alloc capture buffer: %u", image_size);
             camera_preview_capture_timer_abort(scr_data, timer);
@@ -257,6 +264,7 @@ void camera_preview_hide(struct home_nav_scr_data *scr_data)
 
     camera_preview_stop_countdown_timer(scr_data);
     model_camera_preview_reset(&scr_data->camera_preview);
+    scr_data->camera_preview_result_pending = 0;
 
     lisa_ui_llm_primary_img_hide(scr_data->view);
 #ifdef CONFIG_BOARD_ARCS_MINI3
@@ -509,7 +517,7 @@ static void camera_preview_handle_start(void *arg, const model_camera_preview_re
         ret = model_camera_init();
         if (ret != 0) {
             LISA_UI_LOGE("Camera init failed for photo preview: %d", ret);
-            lisa_ui_toast_show(_("recognition error"));
+            lisa_ui_toast_show(_("camera unavailable"));
             return;
         }
     }
@@ -518,7 +526,7 @@ static void camera_preview_handle_start(void *arg, const model_camera_preview_re
     if (ret != 0 || width == 0 || height == 0) {
         LISA_UI_LOGE("Camera unavailable for photo preview: ret=%d, w=%u, h=%u", ret, width,
                      height);
-        lisa_ui_toast_show(_("recognition error"));
+        lisa_ui_toast_show(_("camera unavailable"));
         return;
     }
 
@@ -564,13 +572,20 @@ static void camera_preview_handle_capture(void *arg)
     camera_preview_capture_now(scr_data);
 }
 
-static void camera_preview_handle_exit(void *arg)
+static void camera_preview_handle_exit(void *arg, bool wakeup)
 {
     struct home_nav_scr_data *scr_data = arg;
 
     if (!scr_data ||
         (!model_camera_preview_is_active(&scr_data->camera_preview) &&
-         !camera_preview_is_camera_work_type(scr_data->work_type))) {
+         !camera_preview_is_camera_work_type(scr_data->work_type) &&
+         !scr_data->camera_preview_result_pending)) {
+        return;
+    }
+
+    if (wakeup) {
+        LISA_UI_LOGI("photo flow canceled by wakeup, switch to listening immediately");
+        home_camera_preview_cancel_for_wakeup(scr_data);
         return;
     }
 

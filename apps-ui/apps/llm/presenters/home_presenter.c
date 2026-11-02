@@ -263,9 +263,9 @@ static void home_update_full_duplex_icon(struct home_nav_scr_data *scr_data)
 
 #ifdef LISA_UI_PLATFORM_ARCS
     struct app_datas *app_datas = get_app_datas();
-    if (app_datas && app_interaction_mode_is_continuous(app_datas->int_mode)) {
+    if (app_datas && app_interaction_mode_is_continuous(app_interaction_mode_get_effective(app_datas))) {
         visible = true;
-        icon = app_interaction_mode_supports_barge_in(app_datas->int_mode) ?
+        icon = app_interaction_mode_supports_barge_in(app_interaction_mode_get_effective(app_datas)) ?
             &icons_ic_status_duplex_interruptible_png :
             &icons_ic_status_duplex_non_interruptible_png;
     }
@@ -629,9 +629,11 @@ static void home_power_state_changed(model_common_power_state_t state,
     LISA_UI_LOGI("power policy state=%u, reason=%u", (unsigned int)state,
                  (unsigned int)reason);
 
-    if ((state == MODEL_COMMON_POWER_STATE_IDLE ||
-         state == MODEL_COMMON_POWER_STATE_HIBERNATE) &&
-        lisa_ui_nav_scr_get_top_id() != LISA_UI_NAV_SCR_ID_HOME) {
+    int top_id = lisa_ui_nav_scr_get_top_id();
+    /* 扫码和认证说明页需要停留供用户阅读，浅待机只降低亮度。 */
+    if ((state == MODEL_COMMON_POWER_STATE_HIBERNATE ||
+         (state == MODEL_COMMON_POWER_STATE_IDLE && top_id != LISA_UI_NAV_SCR_ID_INFO)) &&
+        top_id != LISA_UI_NAV_SCR_ID_HOME) {
         lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_HOME);
     }
 
@@ -764,6 +766,13 @@ static void model_battery_on_battery_status_update(const model_battery_info_t *i
 void standby_text_timer_update(struct home_nav_scr_data *scr_data)
 {
     if (!scr_data || !scr_data->view) {
+        return;
+    }
+
+    if (!model_voice_wakeup_available()) {
+        if (scr_data->standby_text_timer) {
+            lv_timer_pause(scr_data->standby_text_timer);
+        }
         return;
     }
 
@@ -915,7 +924,7 @@ static void model_voice_on_image_preview(void *arg)
         ret = model_camera_init();
         if (ret != 0) {
             LISA_UI_LOGE("Camera init failed: %d", ret);
-            lisa_ui_toast_show(_("recognition error"));
+            lisa_ui_toast_show(_("camera unavailable"));
             return;
         }
     }
@@ -923,7 +932,7 @@ static void model_voice_on_image_preview(void *arg)
     ret = model_camera_get_framesize(&width, &height);
     if (ret != 0 || width == 0 || height == 0) {
         LISA_UI_LOGE("Camera unavailable for preview: ret=%d, w=%u, h=%u", ret, width, height);
-        lisa_ui_toast_show(_("recognition error"));
+        lisa_ui_toast_show(_("camera unavailable"));
         return;
     }
 
@@ -969,17 +978,19 @@ static void model_voice_on_image_url(void *arg, const char *url)
     lv_img_dsc_t *img_dsc = lv_img_net_load(url);
     if (!img_dsc) {
         LISA_UI_LOGE("load net image failed: %s", url);
+        lisa_ui_toast_show("图片加载失败，请重试");
         return;
     }
 
-    if (scr_data->net_img) {
+    if (scr_data->net_img && scr_data->net_img != img_dsc) {
+        lv_img_cache_invalidate_src(scr_data->net_img);
         lv_img_net_free(scr_data->net_img);
         scr_data->net_img = NULL;
     }
 
     scr_data->net_img = img_dsc;
     lisa_ui_llm_primary_img_show(scr_data->view, scr_data->net_img);
-    lisa_ui_llm_primary_img_hint_show(scr_data->view, "图片可在小聆AI小程序中查看");
+    lisa_ui_llm_primary_img_hint_show(scr_data->view, "图片可在小聆 AI 小程序查看");
     scr_data->work_type = WORK_TYPE_IMG_REC;
     scr_data->img_rec_running = false;
     scr_data->img_rec_in_progress = false;
@@ -1138,10 +1149,19 @@ static void model_sd_music_sync_on_state_change(const voice_msg_sd_music_sync_st
         return;
     }
 
+    /* 小应用在前台时暂停当前页面，显示云端索引进度；完成后由
+     * nav_back() 弹回原小应用并恢复其渲染。 */
+    if (lisa_ui_nav_scr_get_top_id() == LISA_UI_NAV_SCR_ID_MINIAPP &&
+        state->state != VOICE_MSG_SD_MUSIC_SYNC_STATE_FINISHED &&
+        state->state != VOICE_MSG_SD_MUSIC_SYNC_STATE_IDLE) {
+        LISA_UI_LOGI("TF 卡同步开始，暂停小应用并打开索引页面");
+        lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_SD_MUSIC_SYNC);
+        return;
+    }
+
     if (state->state == VOICE_MSG_SD_MUSIC_SYNC_STATE_FINISHED) {
-        if (lisa_ui_nav_scr_get_top_id() == LISA_UI_NAV_SCR_ID_SD_MUSIC_SYNC) {
-            lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_HOME);
-        }
+        /* 索引页自己的 presenter 负责延时返回，避免在同一条消息分发
+         * 中关闭页面并使其 listener 失效。 */
         return;
     }
 
@@ -1699,16 +1719,22 @@ static void model_voice_on_connected(void *arg)
     struct home_nav_scr_data *scr_data = arg;
     int top_id = lisa_ui_nav_scr_get_top_id();
 
-    /* SD 卡文件系统提示页显示期间，云端连接事件不能抢占页面。 */
-    if (top_id == LISA_UI_NAV_SCR_ID_SD_MUSIC_SYNC) {
-        LISA_UI_LOGI("云端连接完成，保持 SD 同步页不返回 HOME");
+    /* Reconnection must preserve the foreground app and its retry controls. */
+    if (top_id == LISA_UI_NAV_SCR_ID_SD_MUSIC_SYNC ||
+        top_id == LISA_UI_NAV_SCR_ID_MINIAPP) {
+        LISA_UI_LOGI("云端连接完成，保持当前应用页不返回 HOME");
     } else if (top_id != LISA_UI_NAV_SCR_ID_HOME) {
         lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_HOME);
     }
 
     lisa_ui_llm_primary_set_status_text(scr_data->view, LISA_UI_LLM_PRIMARY_STANDBY_TEXT);
 
-    lisa_ui_llm_primary_set_content_text(scr_data->view, model_voice_role_propmt_get());
+    if (!model_voice_wakeup_available()) {
+        lisa_ui_llm_primary_set_content_text(scr_data->view,
+                                             "语音唤醒不可用\n请更新唤醒词资源");
+    } else {
+        lisa_ui_llm_primary_set_content_text(scr_data->view, model_voice_role_propmt_get());
+    }
 }
 
 static void model_voice_on_disconnected(void *arg)
@@ -1788,6 +1814,9 @@ static void home_enter_standby_state(struct home_nav_scr_data *scr_data, const c
 
     if (keep_image) {
         lisa_ui_llm_primary_set_content_text(scr_data->view, "");
+    } else if (!model_voice_wakeup_available()) {
+        lisa_ui_llm_primary_set_content_text(scr_data->view,
+                                             "语音唤醒不可用\n请更新唤醒词资源");
     } else if (music_text) {
         /* 对话字幕会覆盖歌曲名；返回待机/主页时直接恢复缓存的歌曲名，
          * 不必等待播放器再次上报 PLAYING。 */
@@ -2097,6 +2126,19 @@ static void tts_text_interrupt(struct home_nav_scr_data *scr_data)
 }
 
 static void tts_text_timer_cb(lv_timer_t *timer);
+
+void home_camera_preview_cancel_for_wakeup(struct home_nav_scr_data *scr_data)
+{
+    if (!scr_data || !scr_data->view) {
+        return;
+    }
+
+    /* Explicit wakeup takes ownership even when the old player's STOPPED
+     * callback is discarded. Internal session restarts still keep the photo. */
+    model_camera_preview_reset(&scr_data->camera_preview);
+    tts_text_interrupt(scr_data);
+    model_voice_on_start(scr_data);
+}
 
 static void tts_text_try_show_next(struct home_nav_scr_data *scr_data)
 {
@@ -2563,6 +2605,10 @@ static void model_voice_on_standby_text_update(void *arg, const char *text, bool
     struct home_nav_scr_data *scr_data = arg;
 
     if (!scr_data || !scr_data->view) {
+        return;
+    }
+
+    if (!model_voice_wakeup_available() && is_cloud_text) {
         return;
     }
 

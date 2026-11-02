@@ -32,7 +32,8 @@ static void sd_music_sync_nav_to_home_ui(void *arg, uint32_t len)
     (void)len;
 
     if (lisa_ui_nav_scr_get_top_id() == LISA_UI_NAV_SCR_ID_SD_MUSIC_SYNC) {
-        lisa_ui_nav_scr_nav_to(LISA_UI_NAV_SCR_ID_HOME);
+        /* 返回进入索引页之前的页面：主页保持原行为，小应用则恢复运行。 */
+        lisa_ui_nav_scr_nav_back();
     }
 }
 

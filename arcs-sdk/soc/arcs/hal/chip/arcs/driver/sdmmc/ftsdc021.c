@@ -220,6 +220,25 @@ ftsdc021_print_err_msg(u8 ip_idx, u32 errSts)
     }
 }
 
+/* A reset can stall when a card disappears during a command. Bound MMIO
+ * polling without RTOS ticks: this helper is also called from the SD ISR,
+ * where the tick interrupt may not run. The caller retains the I/O error.
+ */
+static u32
+ftsdc021_reset_lines(u8 ip_idx, u8 mask)
+{
+    u32 polls = 100000;
+
+    gpRegSDC(ip_idx)->SoftRst |= mask;
+    while (gpRegSDC(ip_idx)->SoftRst & mask) {
+        if (--polls == 0) {
+            SDHost[ip_idx].reset_flag = 1;
+            return ERR_CMD_TIMEOUT;
+        }
+    }
+    return 0;
+}
+
 static u32
 ftsdc021_ErrorRecovery(u8 ip_idx)
 {
@@ -232,11 +251,15 @@ ftsdc021_ErrorRecovery(u8 ip_idx)
     if (SDHost[ip_idx].ErrRecover) {
         /* CMD12 */
         /* Step 10: Issue Abort CMD */
-        ftsdc021_send_abort_command(ip_idx);
+        if (ftsdc021_send_abort_command(ip_idx))
+            return ERR_NON_RECOVERABLE;
 
-        /* Step 11: Check Command Inhibit DAT and CMD */
-        while (gpRegSDC(ip_idx)->PresentState & (SDHCI_STS_CMD_INHIBIT | SDHCI_STS_CMD_DAT_INHIBIT))
-            ;
+        /* Step 11: A removed card may leave CMD/DAT inhibited forever. */
+        clock_t t0 = jiffies();
+        while (gpRegSDC(ip_idx)->PresentState & (SDHCI_STS_CMD_INHIBIT | SDHCI_STS_CMD_DAT_INHIBIT)) {
+            if (jiffies() - t0 > 1000)
+                return ERR_NON_RECOVERABLE;
+        }
 
         /* Step 12 */
         if (SDHost[ip_idx].Card->ErrorSts & SDHCI_INTR_ERR_CMD_LINE) {
@@ -713,9 +736,8 @@ ftsdc021_send_abort_command(u8 ip_idx)
     }
 
     // Reset the Data and Cmd line due to the None-auto CMD12.
-    gpRegSDC(ip_idx)->SoftRst |= (SDHCI_SOFTRST_CMD | SDHCI_SOFTRST_DAT);
-    while (gpRegSDC(ip_idx)->SoftRst & (SDHCI_SOFTRST_CMD | SDHCI_SOFTRST_DAT))
-        ;
+    if (ftsdc021_reset_lines(ip_idx, SDHCI_SOFTRST_CMD | SDHCI_SOFTRST_DAT))
+        return ERR_CMD_TIMEOUT;
 
     sdc_dbg_print_level(1, "Done.\n");
 
@@ -1921,7 +1943,7 @@ ftsdc021_0_IntrHandler()
     sts &= ~(SDHCI_INTR_STS_BUFF_READ_READY | SDHCI_INTR_STS_BUFF_WRITE_READY);
 
     /* Clear Interrupt Status immediately */
-    gpRegSDC(ip_idx)->IntrSts &= sts;
+    gpRegSDC(ip_idx)->IntrSts = sts;
 
     if (sts & SDHCI_INTR_STS_CARD_INTR) {
     }
@@ -1970,9 +1992,10 @@ ftsdc021_0_IntrHandler()
             }
 #endif
         } else {
-            sdc_dbg_print("!");
-            while (1)
-                ;
+            /* A late completion after timeout/reset is already acknowledged.
+             * Do not trap in the ISR or signal completion of a new request.
+             */
+            sdc_dbg_print("Ignoring stale transfer completion\n");
         }
     }
 
@@ -2002,27 +2025,13 @@ ftsdc021_0_IntrHandler()
         /* Step 2: Check CMD Line Error */
         if (SDHost[ip_idx].Card->ErrorSts & SDHCI_INTR_ERR_CMD_LINE) {
             /* Step 3: Software Reset for CMD line */
-            gpRegSDC(ip_idx)->SoftRst |= SDHCI_SOFTRST_CMD;
-            /* Step 4 */
-            while (gpRegSDC(ip_idx)->SoftRst & SDHCI_SOFTRST_CMD)
-                ;
+            ftsdc021_reset_lines(ip_idx, SDHCI_SOFTRST_CMD);
         }
 
         /* Step 5: Check DAT Line Error */
         if (SDHost[ip_idx].Card->ErrorSts & SDHCI_INTR_ERR_DAT_LINE) {
-#if CFG_RTOS
-            if((SDHost[ip_idx].dma_transfer_data ==1) && ((SDHost[ip_idx].Card->ErrorSts |  SDHCI_INTR_ERR_DAT_LINE) == SDHCI_INTR_ERR_DAT_LINE))
-            {
-                SDHost[ip_idx].dma_transfer_data = 0;
-                xSemaphoreGiveFromISR(SDHost[ip_idx].sdio_dma_semaphore, &xHPWoken);
-                sdc_dbg_print("DMA_DEBUG: release sempaphore, data error");
-            }
-#endif
-            /* Step 6: Software Reset for DAT line */
-            gpRegSDC(ip_idx)->SoftRst |= SDHCI_SOFTRST_DAT;
-            /* Step 7 */
-            while (gpRegSDC(ip_idx)->SoftRst & SDHCI_SOFTRST_DAT)
-                ;
+            /* Step 6/7: bound reset polling even if the card disappeared. */
+            ftsdc021_reset_lines(ip_idx, SDHCI_SOFTRST_DAT);
         }
 
         /* Auto CMD Error Status register is reset */
@@ -2030,6 +2039,16 @@ ftsdc021_0_IntrHandler()
             SDHost[ip_idx].Card->autoErr = gpRegSDC(ip_idx)->AutoCMDErr;
 
         gpRegSDC(ip_idx)->ErrSts = SDHost[ip_idx].Card->ErrorSts;
+
+#if CFG_RTOS
+        /* Wake DMA waiters for every error, including combined CMD/DAT and
+         * ADMA errors. Waiting only for a pure DAT error can strand a task.
+         */
+        if (SDHost[ip_idx].dma_transfer_data == 1) {
+            SDHost[ip_idx].dma_transfer_data = 0;
+            xSemaphoreGiveFromISR(SDHost[ip_idx].sdio_dma_semaphore, &xHPWoken);
+        }
+#endif
 
         if (SDHost[ip_idx].Card->ErrorSts & SDHCI_INTR_ERR_TUNING) {
             sdc_dbg_print(" INTR: ERR## ... Tuning Error.\n");

@@ -9,12 +9,15 @@
 - 控制状态灯亮灭及闪烁。
 - 通过扬声器播放指定频率和时长的蜂鸣声，使用系统音量。
 - API 4 可按设备能力发起 HTTP 请求、处理 JSON 和请求文本播报。
+- API 5 可通过系统音乐播放器播放 HTTP(S) 音频文件和直播（MP3、HLS/TS AAC）。
+- API 5 支持查询前台小应用状态、声明操作并接收经过校验的语音操作。
+- API 5 在设备提供 `synth` 能力时支持四声部实时音效合成。
 
 从桌面进入小应用时停止当前语音输入和音乐播放，保留触发本次安装的交互响应 TTS；语音安装与远程推送安装均按此规则处理。
 进入小应用或退出回桌面时结束当前交互，TTS 播完后不自动续聊，需重新唤醒，使新会话的 `start` 帧携带最新模式。
 设备原有的单工、半双工或全双工模式不变，再次唤醒后的交互遵循原模式。运行中的小应用被另一个小应用替换时也结束当前交互，使下次 `start` 帧携带新应用身份。
-运行期间的语音交互范围为重新生成、修改、切换和询问玩法；闹钟到点正常响铃提醒。
-端侧限制无关工具和音乐播放；云端依据下文的 `start` 帧模式，在产生回复之前过滤无关意图。
+运行期间的语音交互范围为重新生成、修改、切换、询问玩法及执行应用声明的操作；闹钟到点正常响铃提醒。
+端侧限制无关工具和普通歌单播放；小应用可使用 `audio` 接口播放自己的在线音频。云端依据下文的 `start` 帧模式，在产生回复之前过滤无关意图。
 功能键每次短按释放立即向小应用发送一次点击，脚本可根据点击间隔识别双击等操作；系统的多击快捷操作屏蔽，长按 3 秒返回桌面。
 长按退出后继续按住不会触发关机；需先松开，再次长按才会按桌面规则关机。
 
@@ -52,6 +55,12 @@ API 3 起提供的 `storage` 可单独持久化少量应用数据，不保存源
 `default_response_bytes`、`max_timeout_ms` 和 `default_timeout_ms`。
 请求头字节数按每行 `名称: 值\r\n` 累计；超时单位为毫秒。
 `runtime.lua_sdk.tts` 包含 `text_max_bytes`（UTF-8 字节）、`max_pending` 和 `timeout_ms`。
+API 5 的 `runtime.lua_sdk.audio` 包含 `max_url_bytes`（511）、`max_players`（1）、
+`live`（true）和 `state_query`（true）。使用在线音频需同时具有联网和扬声器能力。
+API 5 的 `runtime.lua_sdk.synth` 包含 `sample_rate`（16 kHz）、
+`max_voices`（4）、`max_notes`（256）、`max_duration_ms`（60,000）、`queue_depth`（4）、
+`waveforms`、`loop` 和 `pause_resume`。使用合成器需同时具有扬声器能力；能力字段
+不存在时，应用不得调用 `synth`。
 
 使用 HTTP 需要 `hardware.network == true` 且 `runtime.lua_sdk.http` 存在；
 使用 TTS 还需要扬声器及 `runtime.lua_sdk.tts`。接口或硬件能力缺失时不推断可用。
@@ -68,7 +77,7 @@ API 3 起提供的 `storage` 可单独持久化少量应用数据，不保存源
 | --- | --- | --- |
 | `id` | string | 小应用标识 |
 | `version` | string | 不可变版本标识 |
-| `name` | string | 小应用名称；协议保留，固件忽略此字段，不进行名称校验或保存 |
+| `name` | string | 小应用名称；非空，最多 127 UTF-8 字节，保存供状态查询使用 |
 | `url` | string | 裸 Lua 文件的签名下载地址，有效期为 300 秒 |
 | `size` | integer | 文件准确字节数，至少为 1，不超过设备公布的源码上限 |
 | `hash` | string | 文件 MD5，32 位小写十六进制字符串 |
@@ -79,6 +88,80 @@ API 3 起提供的 `storage` 可单独持久化少量应用数据，不保存源
 
 安装失败不替换仍可用的当前应用。调用超时或结果未知时，不自动重放整个安装请求。
 不提供额外的安装状态或进度查询工具。
+
+### 查询前台小应用：`ls.built_in.miniapp_describe`（API 5）
+
+无参数，`arguments` 可省略或为 `{}`；其他类型及多余字段报错。成功结果的 `text` 是 JSON：
+
+```json
+{
+  "running": true,
+  "app": {"id": "timer", "version": "v1", "name": "番茄时钟"},
+  "state": "倒计时已暂停，还剩 1200 秒",
+  "actions": {
+    "pause": {"description": "暂停倒计时", "parameters": {}},
+    "set_duration": {
+      "description": "设置专注时长，并重置倒计时",
+      "parameters": {
+        "minutes": {"type": "integer", "description": "专注分钟数", "required": true, "minimum": 1, "maximum": 180}
+      }
+    }
+  }
+}
+```
+
+没有前台小应用或闹钟抢占时，正常返回 `{"running":false}`，`isError=false`。
+`app` 保存本次成功安装的身份和名称；相同版本复用时更新名称。本地 ADB 安装以文件名（不含 `.lua`）作为名称。
+
+`state` 每次查询时调用 `get_state()`，必须返回字符串或 `nil` / `json.null`。
+缺失回调、类型不符、含 NUL 或超过 2,048 UTF-8 字节时返回 `null`。
+`actions` 来自启动时唯一一次 `get_actions()` 调用，运行期间固定不变。
+缺失 `get_actions` / `on_action` 中任意一个函数，或声明不合法时，返回 `{}`，拒绝所有操作。
+声明中任意一项不合法都会使整份声明失效，不发布部分操作。
+
+### 执行操作：`ls.built_in.miniapp_action`（API 5）
+
+先查询上述工具，再按 `actions` 提供的声明调用：
+
+```json
+{"name":"ls.built_in.miniapp_action","arguments":{"action":"set_duration","arguments":{"minutes":40}}}
+```
+
+`action` 和 `arguments` 均必填，分别为非空字符串和对象；无参数的操作也传 `{}`。
+运行器严格区分大小写，拒绝未知操作、未知或重复参数、缺失必填项、错误类型、非有限数字、越界及不在枚举中的值；
+不会把字符串 `"40"` 转换成整数。校验通过后，才在 Lua 任务中串行调用 `on_action(name, args)`。
+返回值必须为 `{ok = boolean, message = string}`，其中 `message` 最多 2,048 UTF-8 字节且不含 NUL。
+MCP 返回 `isError = not ok`，`content[0].text = message`。回调返回类型错误、应用已退出、
+应用已被替换或闹钟抢占均返回 `isError=true`；被拒绝的操作不留待恢复后重放。
+Lua 异常或超预算遵循运行器既有规则，终止实例并返回错误；启动阶段异常仍保留旧实例。
+操作若已执行但回包失败，不自动重试，云端应重新查询状态。
+
+小应用工具使用统一的 `ls.built_in` 前缀：`ls.built_in.miniapp_describe`、
+`ls.built_in.miniapp_action`、`ls.built_in.miniapp_install` 和 `ls.built_in.miniapp_exit`。
+
+#### 操作声明约定
+
+`get_state()`、`get_actions()` 应当无副作用，脚本不应在查询回调中修改应用状态。
+启动成功后固定使用当时的操作声明及 `on_action` 函数；后续修改表或重定义函数不会更改已发布的协议。
+以下是当前固件和云侧模拟器需要共同遵循的声明格式：
+
+| 字段 | 约束 |
+| --- | --- |
+| 操作表 | 字符串键对象，最多 16 个操作，操作名 1–63 字节 |
+| 操作定义 | 仅包含必填 `description`（1–512 字节）和 `parameters` 对象 |
+| 参数表 | 最多 16 个参数，参数名 1–63 字节；无参数用空表 `{}` |
+| 参数 `type` | 必填；`string`、`boolean`、`integer` 或 `number` |
+| 参数 `description` | 可选字符串，最多 512 字节 |
+| 参数 `required` | 可选布尔值，默认 false；与标准 JSON Schema 的 required 数组不同 |
+| `minimum` / `maximum` | 可选有限数字，仅对数值参数有效，含边界，minimum 不得大于 maximum |
+| `enum` | 可选非空数组，最多 32 项，每项必须匹配参数 type |
+
+未知声明字段或约束会被拒绝，不会静默忽略。当前操作参数不支持嵌套对象、数组或 null。
+整数须为精确可表示的整数（绝对值不超过 `2^53-1`）。
+声明转换预算为 16 KiB、调用参数预算为 8 KiB（按键和值原始字节加节点开销计，不是 JSON 转义后的长度）。
+这些限制不改变通用 `json` API 的能力。
+
+可直接联调的完整 Lua 示例见 [10-voice-actions.lua](../tests/miniapp/10-voice-actions.lua)。
 
 ### 退出小应用：`ls.built_in.miniapp_exit`
 
@@ -130,7 +213,8 @@ adb push ./miniapp.lua /miniapp/demo.lua
 
 ## Lua 基础接口
 
-API 2 提供下述基础接口；API 3 增加系统时间与存档，API 4 增加 HTTP、JSON 与文本播报。
+API 2 提供下述基础接口；API 3 增加系统时间与存档，API 4 增加 HTTP、JSON 与文本播报，
+API 5 增加在线音频、语音操作回调和多声部音效合成。
 新版本保留旧接口，应用按目标 `runtime.lua_sdk.version` 和能力对象选择接口。
 
 仅接受 UTF-8 Lua 文本，不接受字节码。默认源码上限 65,536 字节，每个实例堆上限
@@ -140,18 +224,75 @@ API 2 提供下述基础接口；API 3 增加系统时间与存档，API 4 增�
 | --- | --- |
 | `app.api_version` | API 版本整数 |
 | `app.width`、`app.height` | 启用屏幕时的画布尺寸，默认 240 × 240 |
-| `screen.begin(rgb)` | 清空绘制列表并设置背景，颜色使用 `0xRRGGBB` |
-| `screen.rect(x, y, w, h, rgb)` | 每帧最多 128 个矩形，尺寸为正，必须完全位于画布内 |
-| `screen.text(text, x, y, rgb)` | 每帧最多 8 段文字，每段最多 63 字节，固定 16 像素字体 |
-| `screen.present()` | 提交当前帧；新帧可合并，渲染约每 20 ms 更新一次 |
+| `screen.begin(rgb[, options])` | 清空绘制列表并设置背景，颜色使用 `0xRRGGBB`；`ordered=true` 时按调用顺序叠放 |
+| `screen.rect(x, y, w, h, rgb[, options])` | 矩形，尺寸为正，必须完全位于画布内；支持圆角、边框及透明度 |
+| `screen.text(text, x, y, rgb[, options])` | 每帧最多 16 段文字，每段最多 63 字节，固定 16 像素字体；支持宽度、对齐、透明度 |
+| `screen.present()` | 提交当前帧；中间帧合并，跟随显示刷新周期（默认 30 ms），相同画面不重复刷新 |
 | `led.on("status")`、`led.off("status")` | 控制状态灯 |
 | `led.blink("status", on_ms, off_ms)` | 亮、灭时长各为 10–5,000 ms |
-| `buzzer.play(hz, ms)` | 100–5,000 Hz、20–3,000 ms；异步队列最多 4 项 |
+| `buzzer.play(hz, ms)` | 100–5,000 Hz、20–3,000 ms；异步队列最多 4 项；固定合成幅度，再随系统音量调节；无返回值，繁忙时允许丢弃 |
+
+### 多声部音效合成（API 5）
+
+API 5 设备公布 `runtime.lua_sdk.synth` 能力时才可使用。`synth.play(score[, options])`
+接受 1–256 个音符，乐段最长 60 秒，采样率 16 kHz，最多 4 个声部。音符字段为：
+
+- `at`：相对乐段开始的毫秒数，0–60,000；
+- `ms`：持续时间，20–3,000；
+- `hz`：频率，50–5,000；
+- `voice`：声部 1–4，同一声部的音符不能重叠；
+- `wave`：`square`、`triangle` 或 `noise`；
+- `volume`：0–100 的声部音量。
+
+选项 `{loop=true}` 会循环最后一个音符结束形成的乐段。`synth.play()` 返回布尔值，
+表示乐段是否被接收（安装验证阶段暂存，安装成功后入队），不保证最终播放成功；
+队列满、应用退出或播放器未初始化时返回 `false`。参数格式错误、同声部重叠、
+超过额度或内存不足时抛出 Lua 错误。`synth.pause()` 和 `synth.resume()`
+暂停或恢复当前乐段；语音会话、TTS、闹钟和其他提示音抢占时保存播放位置，资源释放
+后继续。退出或替换应用会清理合成任务，不会在新应用中恢复旧乐段。
+
+合成器与 `buzzer` 共用 FIFO：最多 4 个等待项，另有 1 个正在播放的项；不混播多个
+乐段。循环乐段持续占用播放位置，后续乐段和蜂鸣器等待到应用退出或替换后一起
+被清理；暂停不会跳过循环乐段。连续交互音效应使用有限乐段，避免循环。
+
+生成端接入时应读取 API 版本和设备公布的 `runtime.lua_sdk.synth` 能力对象，
+确认支持的波形及额度，不能仅凭主 API 版本判断合成器可用。
+无合成能力时降级为旧蜂鸣器或无声反馈；`synth.play()` 被拒绝时跳过本次音效，
+禁止在 Lua 回调里忙等重试。
+
+### 扩展绘图
+
+API 4 及以上设备公布 `runtime.lua_sdk.graphics` 能力时才可使用扩展绘图。`graphics` 中的
+`max_shapes`、`max_texts`、`text_max_bytes` 是实际设备预算；本版本分别为 256、16、63。
+矩形、圆、线和圆弧共享图形额度，文字单独计数。预算是每帧上限，不保证满载帧率。
+
+- `screen.circle(cx, cy, radius, rgb[, options])`：实心圆或圆环。
+- `screen.line(x1, y1, x2, y2, rgb[, options])`：线段。
+- `screen.arc(cx, cy, radius, start_deg, end_deg, rgb[, options])`：圆弧。
+
+公共选项 `opacity` 为 0–255，默认 255。矩形和圆支持 `fill`（默认 true）、
+`border_width`（0–64，默认填充时 0、不填充时 1）、`border_color`（默认 rgb）；
+矩形额外支持 `radius` 圆角半径。线和圆弧支持 `width`（1–64，默认 1）和
+`rounded`（默认 false，控制端点）。圆弧线宽不得超过半径。
+圆/弧半径为 1 至画布宽高较大者，中心或线段端点可在各轴 `-画布尺寸` 至
+`2 × 画布尺寸` 范围内，超出画布的部分裁剪。圆弧角度为 0–360，0° 在右侧，
+顺时针增加；起止相同为空弧，0→360 为整圆，可跨越 0°。
+
+文字选项：`width` 为文本框宽度（1 至画布剩余宽度），支持自动换行；
+`align` 为 `left`、`center`、`right`，居中和右对齐必须指定 width；
+`opacity` 同上。不传选项保持原有字体和布局。
+
+`screen.begin(rgb, {ordered=true})` 按调用顺序绘制图形和文字。省略选项保留
+旧应用的图形在下、文字在上的行为。局部更新会重绘变化范围内的所有相交内容，
+移动或删除半透明图形不会留下残影。逻辑 `on_tick` 仍保持约 20 ms，
+不保证每次 tick 提交的画面都独立显示。
 
 未启用的硬件接口不注册相应 Lua 全局表。功能键未启用时不产生脚本按键回调，长按退出仍保留。
 
 `on_tick(dt_ms)` 必须定义，正常调度间隔约 20 ms。可选回调为 `on_start()`、
-`on_button_click(button_id)` 和 `on_exit()`，目前按钮 ID 为 `function`。
+`on_button_click(button_id)`、`on_audio_state(state)` 和 `on_exit()`，目前按钮 ID 为
+`function`。在线音频状态变化时调用 `on_audio_state(state)`，其参数与
+`audio.get_state()` 返回值相同。
 启用屏幕时，启动阶段（源码执行、`on_start`、第一次 `on_tick`）必须至少提交一帧。
 
 ```lua
@@ -179,6 +320,50 @@ Lua 执行受指令预算和检查点耗时限制；它不提供抢占 C 库函�
 
 蜂鸣使用系统音量；TTS 或闹钟播放期间跳过蜂鸣，闹钟或新 TTS 到来时中断当前蜂鸣。队列满时丢弃新增蜂鸣，不阻塞脚本，也不导致小应用退出。
 闹钟期间暂停脚本 tick 和按键输入，提醒结束后继续原实例，按键优先用于闹钟操作。
+
+## 在线音频（API 5）
+
+| 接口 | 说明 |
+| --- | --- |
+| `audio.play(url)` | 异步替换当前音频，返回是否接受请求；HTTP(S) URL 最长 511 字节，不允许空白、控制字符和内嵌 NUL |
+| `audio.pause()` | 用户主动暂停，语音交互结束后也保持暂停 |
+| `audio.resume()` | 解除用户暂停；有语音交互、TTS 或闹钟时，等待其结束再恢复 |
+| `audio.stop()` | 停止并取消待播请求，后续恢复不会重播；需重新调用 `play` |
+| `audio.get_state()` | 返回 `idle`、`loading`、`playing`、`paused`、`interrupted` 或 `error`，可在 `on_tick` 中查询 |
+
+`idle` 表示无音频、主动停止或自然播放完成；`loading` 表示等待缓冲；`paused` 表示用户主动暂停；
+`interrupted` 表示唤醒、语音交互、TTS 或闹钟临时抢占；`error` 表示请求、联网、格式或解码失败，
+保持到下一次 `play` 或 `stop`。
+控制接口不等待网络或解码完成，`play` 返回 true 不表示已经开始发声。
+在首次加载完成前暂停会取消本次加载，保留 URL；恢复时重新加载。已开始播放后的暂停/恢复
+使用播放器原有的暂停/继续接口，不重新打开 URL。
+同一应用只有一路音频，使用系统音量，不进入普通歌单、不自动切歌或循环。
+静态文件、连续 MP3 直播和 M3U8/TS AAC 直播直接交给系统播放器处理；直播暂停后恢复的
+位置由直播服务及播放器缓冲决定，不保证回到直播的当前时刻。
+
+唤醒/语音交互期间自动暂停，整轮交互和 TTS 结束后恢复。闹钟同样优先；手动暂停不会被
+这些恢复流程撤销。短促蜂鸣仍沿用音频焦点优先级，结束后恢复在线音频。
+退出、脚本异常或成功替换应用时停止并取消音频；旧请求的完成/错误不会改变新应用状态。
+网络断开或云端重连时保留小应用页面，应用可显示播放错误并在联网后重新调用 `audio.play`。
+启动阶段的播放/暂停/停止仅记录候选应用的最终意图，安装成功后执行；安装失败保留旧应用音频。
+
+```lua
+function on_start()
+  assert(audio.play("https://lhttp.qtfm.cn/live/339/64k.mp3"))
+  screen.begin(0x101820)
+  screen.text("Radio", 16, 16, 0xffffff)
+  screen.present()
+end
+function on_tick(dt_ms)
+  local state = audio.get_state()
+  -- 根据状态更新画面；error 后可由用户操作重新 play。
+end
+function on_button_click(id)
+  if audio.get_state() == "paused" then audio.resume() else audio.pause() end
+end
+```
+
+参考电台与设备验收步骤见 `tests/miniapp/08-online-audio.lua` 和测试集说明。
 
 ## 系统时间与存档
 
@@ -292,9 +477,10 @@ JSON 对象使用字符串键，数组使用从 1 开始的连续整数键；不
 断线重连后的会话同样读取当前状态，不复用上一次会话的模式。
 安装失败并保留旧应用时，继续携带 `miniapp`。
 
-云端收到此模式后，只处理重新生成、修改、切换和询问玩法；应在产生业务 TTS 或调用工具前
-过滤播放音乐、闲聊及其他无关意图。本期不把“掷骰子”“向左转”等语音变成脚本操作事件。
-端侧同时拒绝除能力查询、安装和退出小应用以外的 MCP 调用，拦截音乐播放；主动推送 TTS 正常播放。
+云端收到此模式后，处理重新生成、修改、切换、询问玩法，以及应用已声明的语音操作；应在产生业务 TTS 或调用工具前
+过滤播放音乐、闲聊及其他无关意图。对“暂停倒计时”等应用内操作，先调用 `ls.built_in.miniapp_describe`，
+确认 `running=true`，依据 `actions` 选择操作并调用 `ls.built_in.miniapp_action`；不得凭空猜测操作名或参数。
+端侧仅放行能力查询、安装、退出、描述和操作小应用的 MCP 调用，拦截音乐播放；主动推送 TTS 正常播放。
 已设闹钟仍由本地调度触发，不受 MCP 白名单影响。
 
 `mode` 是会话开始时的快照，不会追溯修改已发出的 `start` 帧。

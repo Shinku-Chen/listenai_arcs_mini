@@ -259,6 +259,34 @@ int arcs_wifi_sta_connect(wifi_mgr_wifi_sta_config_t *sta_config, uint32_t timeo
     EventBits_t uxBits;
     int ret;
 
+    if (sta_config == NULL || memchr(sta_config->pwd, '\0', sizeof(sta_config->pwd)) == NULL) {
+        return -EINVAL;
+    }
+
+    size_t pwd_len = strlen(sta_config->pwd);
+    switch (sta_config->encryption_mode) {
+    case WIFI_MGR_WIFI_AUTH_AUTO:
+        /* An empty key selects an open network in AUTO mode. */
+        if (pwd_len == 0) {
+            break;
+        }
+        /* fall through */
+    case WIFI_MGR_WIFI_AUTH_WPA_PSK:
+    case WIFI_MGR_WIFI_AUTH_WPA2_PSK:
+    case WIFI_MGR_WIFI_AUTH_WPA_WPA2_PSK:
+    case WIFI_MGR_WIFI_AUTH_WPA2_WPA3_PSK:
+        /* The ARCS library's invalid-PSK cleanup can corrupt the heap.
+         * Reject short passphrases before changing connection state or PMK. */
+        if (pwd_len < 8) {
+            LISA_LOGW(TAG, "Invalid WiFi passphrase length: %u", (unsigned int)pwd_len);
+            return -EINVAL;
+        }
+        break;
+    default:
+        /* WEP, enterprise and SAE have different credential requirements. */
+        break;
+    }
+
     pcfg = PLATFORM_MEM_NOCACHE_MALLOC(sizeof(wifi_connect_cfg_t));
     if(pcfg == NULL){
         LISA_LOGE(TAG,"[%s %d]malloc failed",__FUNCTION__,__LINE__);

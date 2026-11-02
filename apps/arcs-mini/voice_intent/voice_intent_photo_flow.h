@@ -36,6 +36,18 @@ typedef struct {
     camera_flow_phase_t phase;
 } voice_msg_camera_preview_state_t;
 
+/* PREVIEW_EXIT without a payload keeps the normal upload/result handoff.
+ * An explicit wakeup cancels the entire flow, including pending result TTS. */
+typedef struct {
+    bool wakeup;
+} voice_msg_camera_preview_exit_t;
+
+static inline bool voice_camera_preview_exit_is_wakeup(const void *data, uint32_t len)
+{
+    return data && len >= sizeof(voice_msg_camera_preview_exit_t) &&
+           ((const voice_msg_camera_preview_exit_t *)data)->wakeup;
+}
+
 /* ==================== PHOTO_FLOW intent API ==================== */
 
 int voice_intent_photo_flow_register(void);

@@ -33,7 +33,7 @@ static lv_obj_t *create_center_label(lv_obj_t *parent, const char *text, lv_coor
     lv_obj_set_style_text_color(label, lv_color_white(), 0);
     lv_obj_set_style_text_font(label, &lv_font_chinese_16, 0);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(label, lv_pct(100));
+    lv_obj_set_width(label, lv_pct(90));
     lv_obj_align(label, LV_ALIGN_CENTER, 0, y);
     return label;
 }
@@ -66,8 +66,8 @@ static void sd_music_sync_view_constructor(const lv_obj_class_t *class_p, lv_obj
         return;
     }
 
-    view->title_label = create_center_label(container, "检测到TF卡插入，扫描中..", -12);
-    view->detail_label = create_center_label(container, "请勿拔卡或关机", 14);
+    view->title_label = create_center_label(container, "正在扫描 TF 卡…", -24);
+    view->detail_label = create_center_label(container, "请勿拔卡或关机", 16);
     lv_obj_set_style_text_opa(view->detail_label, LV_OPA_70, 0);
 
     view->progress_label = create_center_label(container, "", 0);
@@ -98,10 +98,12 @@ void lisa_ui_sd_music_sync_view_update(lv_obj_t *obj,
 
     view = (lisa_ui_sd_music_sync_view_t *)obj;
 
+    lv_obj_set_style_text_align(view->progress_label, LV_TEXT_ALIGN_CENTER, 0);
+
     switch ((voice_msg_sd_music_sync_state_e)state->state) {
     case VOICE_MSG_SD_MUSIC_SYNC_STATE_START:
-        align_sync_labels(view, -12, 14, 0);
-        lv_label_set_text_static(view->title_label, "检测到TF卡插入，扫描中..");
+        align_sync_labels(view, -24, 16, 0);
+        lv_label_set_text_static(view->title_label, "正在扫描 TF 卡…");
         lv_label_set_text_static(view->detail_label, "请勿拔卡或关机");
         lv_label_set_text_static(view->progress_label, "");
         break;
@@ -113,8 +115,8 @@ void lisa_ui_sd_music_sync_view_update(lv_obj_t *obj,
             total_count = (unsigned int)state->uploaded_count;
         }
 
-        align_sync_labels(view, -12, 20, 0);
-        lv_label_set_text_static(view->title_label, "正在处理TF卡音频文件列表");
+        align_sync_labels(view, -24, 16, 0);
+        lv_label_set_text_static(view->title_label, "正在同步音频列表");
         if (total_count > 0) {
             snprintf(view->detail_text, sizeof(view->detail_text),
                      "已成功处理 %u / %u 个",
@@ -132,13 +134,14 @@ void lisa_ui_sd_music_sync_view_update(lv_obj_t *obj,
     case VOICE_MSG_SD_MUSIC_SYNC_STATE_SUCCESSED:
         if (state->result == VOICE_MSG_SD_MUSIC_SYNC_RESULT_DATA_UNCHANGED) {
             align_sync_labels(view, 0, 0, 0);
-            lv_label_set_text_static(view->title_label, "检测到TF卡插入，但数据无变化");
+            lv_label_set_text_static(view->title_label, "音频列表已是最新");
             lv_label_set_text_static(view->detail_label, "");
             lv_label_set_text_static(view->progress_label, "");
         } else if (state->result == VOICE_MSG_SD_MUSIC_SYNC_RESULT_NO_MP3) {
             align_sync_labels(view, 0, 0, 0);
-            lv_label_set_text_static(view->title_label, "TF卡内未检测到MP3音频文件，请添加后重试");
-            lv_label_set_text_static(view->detail_label, "");
+            lv_label_set_text_static(view->title_label, "未找到 MP3 音频");
+            align_sync_labels(view, -24, 16, 0);
+            lv_label_set_text_static(view->detail_label, "请将 MP3 文件放入\naudio 文件夹后重试");
             lv_label_set_text_static(view->progress_label, "");
         } else if (state->skipped_count > 0) {
             unsigned int total_count = (unsigned int)state->total_count;
@@ -147,27 +150,27 @@ void lisa_ui_sd_music_sync_view_update(lv_obj_t *obj,
                 total_count = (unsigned int)state->uploaded_count;
             }
 
-            align_sync_labels(view, -62, -36, 28);
-            lv_label_set_text_static(view->title_label, "处理完成");
+            align_sync_labels(view, -76, -48, 18);
+            lv_label_set_text_static(view->title_label, "部分文件未同步");
             snprintf(view->detail_text, sizeof(view->detail_text),
-                     "成功处理 %u 个 / 共 %u 个",
+                     "已同步 %u / %u 个文件",
                      (unsigned int)state->uploaded_count,
                      total_count + (unsigned int)state->skipped_count);
             lv_label_set_text_static(view->detail_label, view->detail_text);
             lv_obj_set_style_text_align(view->progress_label, LV_TEXT_ALIGN_LEFT, 0);
             snprintf(view->progress_text, sizeof(view->progress_text),
-                     "未处理 %u 个，原因可能有：\n"
-                     "　1. 文件名是否超过 64 字\n"
-                     "　2. 文件夹名是否超过 32 字\n"
-                     "　3. 文件夹层数是否超过 3 层\n"
-                     "　4. 文件是否都在audio文件夹内",
+                     "跳过 %u 个，请检查：\n"
+                     "文件名不超过 64 字\n"
+                     "文件夹名不超过 32 字\n"
+                     "目录层级不超过 3 层\n"
+                     "文件放在 audio 文件夹内",
                      (unsigned int)state->skipped_count);
             lv_label_set_text(view->progress_label, view->progress_text);
         } else {
-            align_sync_labels(view, -12, 14, 0);
-            lv_label_set_text_static(view->title_label, "处理完成");
+            align_sync_labels(view, -24, 16, 0);
+            lv_label_set_text_static(view->title_label, "同步完成");
             snprintf(view->detail_text, sizeof(view->detail_text),
-                     "成功处理 %u 个音频文件",
+                     "已同步 %u 个音频文件",
                      (unsigned int)state->uploaded_count);
             lv_label_set_text_static(view->detail_label, view->detail_text);
             lv_label_set_text_static(view->progress_label, "");
@@ -176,30 +179,27 @@ void lisa_ui_sd_music_sync_view_update(lv_obj_t *obj,
     case VOICE_MSG_SD_MUSIC_SYNC_STATE_FAILED:
     {
         if (state->result == VOICE_MSG_SD_MUSIC_SYNC_RESULT_FS_UNSUPPORTED) {
-            align_sync_labels(view, -12, 14, 0);
-            lv_label_set_text_static(view->title_label, "TF卡仅支持FAT32文件系统");
-            lv_label_set_text_static(view->detail_label, "请重新格式化");
+            align_sync_labels(view, -24, 16, 0);
+            lv_label_set_text_static(view->title_label, "TF 卡格式不受支持");
+            lv_label_set_text_static(view->detail_label, "请先备份文件\n再将卡格式化为 FAT32");
             lv_label_set_text_static(view->progress_label, "");
             break;
         }
 
-        bool has_http_error = state->http_status_code || state->http_error_code;
-
-        align_sync_labels(view, has_http_error ? -12 : 0,
-                          has_http_error ? 14 : 0, 0);
-        lv_label_set_text_static(view->title_label, "TF卡文件列表上报失败");
+        align_sync_labels(view, -32, 0, 36);
+        lv_label_set_text_static(view->title_label, "音频列表同步失败");
         if (state->http_status_code) {
             snprintf(view->progress_text, sizeof(view->progress_text),
-                     "HTTP响应码：%u",
+                     "请稍后重新插卡重试\n服务响应：%u",
                      (unsigned int)state->http_status_code);
             lv_label_set_text_static(view->detail_label, view->progress_text);
         } else if (state->http_error_code) {
             snprintf(view->progress_text, sizeof(view->progress_text),
-                     "HTTP错误码：%d",
+                     "请稍后重新插卡重试\n错误码：%d",
                      (int)state->http_error_code);
             lv_label_set_text_static(view->detail_label, view->progress_text);
         } else {
-            lv_label_set_text_static(view->detail_label, "");
+            lv_label_set_text_static(view->detail_label, "请稍后重新插卡重试");
         }
         lv_label_set_text_static(view->progress_label, "");
         break;

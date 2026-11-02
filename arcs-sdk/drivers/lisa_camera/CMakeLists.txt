@@ -2,6 +2,7 @@
 if(CONFIG_LISA_CAMERA_DEVICE)
 
 listenai_library_named(lisa_camera_drv)
+listenai_library_sources_ifdef(CONFIG_LISA_CAMERA_CPDMA_TRANSFORM lisa_camera_rgb565.c)
 
 listenai_library_sources_ifdef(CONFIG_SOC_ARCS  lisa_camera.c)
 listenai_library_sources_ifdef(CONFIG_SOC_VENUSA  lisa_camera.c)

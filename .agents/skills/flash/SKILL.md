@@ -64,6 +64,21 @@ description: 烧录 ARCS 固件到开发板时使用。用户提到 /flash、烧
 - 目标设备：`adb devices` 唯一在线时直接用；多设备时让用户选择。
 - 串口设备：按上表查找，多设备时让用户选择。
 
+### 板型与 Boot 选择（ADB / 串口共用）
+
+烧录前核对用户指定板型、目标构建目录 `CMakeCache.txt` 中的 `BOARD` 与设备身份；不一致时先解决，不按构建目录名或文件时间猜板型。串口号本身不能证明板型。
+
+| 板型 | 资源目录 `<res-dir>` | 开发 Boot | 恢复用常规 Boot |
+| --- | --- | --- | --- |
+| `arcs_mini` | `res/arcs-mini` | `res/arcs-mini/boot-dev-autostart.bin` | `res/arcs-mini/boot.bin` |
+| `arcs_mini3` | `res/arcs-mini3` | `res/arcs-mini3/boot-dev-autostart.bin` | `res/arcs-mini3/boot.bin` |
+
+- Mini3 必须使用 Mini3 的开发 Boot、常规 Boot 和 AP，不能回退使用 Mini 的同名文件。其它板型按其资源与构建配置核对，不默认套用此表。
+- `<res-dir>` 是下文命令中的占位符，执行前替换为所选资源目录；`build/` 同样替换为本次核对过的构建目录。
+- 分区地址和镜像路径以所选目录的 `partition_table.json` 为准；相对路径以该资源目录为基准解析。开发 Boot 是临时覆盖项，常规 Boot 从分区表的 boot 项确定。
+- 确认本次涉及的镜像均存在，记录开发 Boot 和恢复 Boot 的路径；缺少对应板型镜像时停止写入，不借用其它板型文件。
+- 下文 ADB 示例以 Mini 为例；Mini3 将 `-S res/arcs-mini` 改为 `-S res/arcs-mini3`，并按需通过 `-B` 指定构建目录。
+
 ### 2a. 默认：ADB 整包烧录（推荐）
 
 使用仓库根目录的 ADB 烧录脚本，`tools/adb` 只存放内置 ADB 工具。脚本支持单设备和多设备烧录：
@@ -123,7 +138,7 @@ powershell -ExecutionPolicy Bypass -File adb_download.ps1 -S res/arcs-mini boot
 `BOOT-*`，脚本再通过 USB 端口和 `transport_id` 关联前后两种身份。不要再按固定的
 `FFBBCCDDEE001124` 序列号选择设备。
 
-**分区映射**（来自 `res/arcs-mini/partition_table.json`）：
+**分区映射示例**（Mini；实际以所选资源目录的分区表为准）：
 
 | 分区 | 地址 | 文件 |
 | --- | --- | --- |
@@ -152,7 +167,7 @@ powershell -ExecutionPolicy Bypass -File adb_download.ps1 -S res/arcs-mini app
 
 ### 2c. 救砖：cskburn 串口烧录
 
-仅当设备无法进入 ADB 时使用。优先使用系统全局的 `cskburn`，如果没有，则使用仓库内 `tools/cskburn/cskburn`。
+用户明确指定串口烧录、开发板串口开发或设备无法进入 ADB 时使用。优先使用系统全局的 `cskburn`；没有则按平台使用仓库内 `tools/cskburn/cskburn` 或 `tools/cskburn/cskburn.exe`。
 
 > **注意**：Linux/macOS 下首次使用需 `chmod +x tools/cskburn/cskburn` 确保可执行权限。
 
@@ -160,39 +175,50 @@ powershell -ExecutionPolicy Bypass -File adb_download.ps1 -S res/arcs-mini app
 
 **ARCS-MINI 串口烧录强制使用开发 Boot**：
 
-`res/arcs-mini/boot-dev-autostart.bin` 是串口开发专用 Boot 镜像。**只要使用 cskburn 串口烧录，无论本次目标是 CP、AP、资源分区还是整包，都必须确保该文件在所有会覆盖 `0x0` 的操作之后写入 `0x0`。**
+`<res-dir>/boot-dev-autostart.bin` 是串口开发专用 Boot 镜像。**只要使用 cskburn 串口烧录，无论本次目标是 CP、AP、资源分区还是整包，都必须确保该文件在所有会覆盖 `0x0` 的操作之后写入 `0x0`。**
 
 ```bash
 # 串口烧录其它分区时，可在同一命令中写入开发 Boot
 cskburn -C arcs -b 1500000 -s <tty> --verify-all \
-  0x0 res/arcs-mini/boot-dev-autostart.bin \
+  0x0 <res-dir>/boot-dev-autostart.bin \
   0x600000 build/<project>.bin
 ```
 
 - 该文件只替换 Boot 分区，不包含 AP、CP 和静态资源；首次整机恢复时还需烧录其它必要分区。
 - 现有 `res/*/boot.bin` 等常规 `0x0` Boot 镜像用 cskburn 烧录并复位后不会直接进入业务，需要手动长按开机键。
-- 不要用专用 Boot 覆盖 `res/arcs-mini/boot.bin`，也不要修改 `partition_table.json` 的默认引用；这样可避免改变现有 ADB/发布烧录流程。
+- 不要用专用 Boot 覆盖 `<res-dir>/boot.bin`，也不要修改 `partition_table.json` 的默认引用；这样可避免改变现有 ADB/发布烧录流程。
 - 开发专用 Boot 仅供串口开发期间临时使用；完成功能检查与日志分析后，必须按下文恢复原 Boot。
 
 **CP 固件烧录**（仅改 CP）：
 
 ```bash
 cskburn -C arcs -b 1500000 -s <tty> --verify-all \
-  0x0 res/arcs-mini/boot-dev-autostart.bin \
+  0x0 <res-dir>/boot-dev-autostart.bin \
   0x600000 build/<project>.bin
 ```
 
-**AP 改动或恢复：整包烧录**：
+**明确只更新 AP + CP（保留现有资源）**：
+
+确认设备已有所需资源，且本次没有资源变更时，可按所选分区表分别写入 AP、CP，无需为了更新 AP 强制整包烧录。例如 Mini3：
+
+```powershell
+.\tools\cskburn\cskburn.exe -C arcs -b 1500000 -s <tty> --verify-all `
+  0x040000 res/arcs-mini3/ap.bin `
+  0x600000 build/arcs-mini.bin `
+  0x0 res/arcs-mini3/boot-dev-autostart.bin
+```
+
+**首次恢复或同时更新资源：整包烧录**：
 
 ```bash
 cskburn -C arcs -s <tty> -b 1500000 --verify-all 0x0 build/<project>-all.bin
 
 # 整包会覆盖 0x0，烧录完后必须再写入开发 Boot
 cskburn -C arcs -s <tty> -b 1500000 --verify-all \
-  0x0 res/arcs-mini/boot-dev-autostart.bin
+  0x0 <res-dir>/boot-dev-autostart.bin
 ```
 
-`build/<project>-all.bin` 及常规 `res/*/boot.bin` 在 `0x0` 的启动行为与开发专用 Boot 不同；整包烧录后必须再将 `res/arcs-mini/boot-dev-autostart.bin` 单独写入 `0x0`。
+`build/<project>-all.bin` 及常规 `res/*/boot.bin` 在 `0x0` 的启动行为与开发专用 Boot 不同；整包烧录后必须再将 `<res-dir>/boot-dev-autostart.bin` 单独写入 `0x0`。
 
 - `<project>.bin` 名称由 `apps/<app>/CMakeLists.txt` 的 `project()` 决定（arcs-mini 为 `arcs-mini.bin`）。
 - `<project>-all.bin` 由 `-DPACK_IMAGES=y` 生成；若不存在，提示先执行 `build` skill 整包编译。
@@ -215,7 +241,7 @@ cskburn -C arcs -s <tty> -b 1500000 --verify-all \
 
 ```bash
 cskburn -C arcs -b 1500000 -s <tty> --verify-all \
-  0x0 res/arcs-mini/boot.bin
+  0x0 <res-dir>/boot.bin
 ```
 
 - 恢复命令必须保留 `--verify-all`；烧录或校验失败时，不得将设备视为已完成交付。
@@ -226,7 +252,7 @@ cskburn -C arcs -b 1500000 -s <tty> --verify-all \
 
 原 Boot 烧录与 `--verify-all` 校验成功后，立即通知用户：
 
-- 开发专用 Boot 已移除，`res/arcs-mini/boot.bin` 已恢复。
+- 开发专用 Boot 已移除，`<res-dir>/boot.bin` 已恢复。
 - 恢复后不会自动进入业务，请用户长按开机键启动。
 - 请用户在常规 Boot 下验证本次目标功能，并反馈结果。
 - 最终回复必须说明日志检查结果、原 Boot 的恢复/校验结果，以及用户需执行的验证动作。
@@ -250,7 +276,7 @@ Windows: COM3, COM4 等
 - 不在烧录失败后继续后续步骤；先排查再重试。
 - 不得跳过串口烧录后的开发 Boot 写入，即使本次只烧 CP 或资源分区。
 - 不得在日志检查通过前恢复原 Boot。
-- 不得在开发任务结束后将 `boot-dev-autostart.bin` 留在设备 `0x0`；必须恢复 `res/arcs-mini/boot.bin` 并通知用户验证功能。
+- 不得在开发任务结束后将 `boot-dev-autostart.bin` 留在设备 `0x0`；必须恢复 `<res-dir>/boot.bin` 并通知用户验证功能。
 
 ## 常见问题
 

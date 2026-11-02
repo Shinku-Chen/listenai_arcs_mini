@@ -77,5 +77,6 @@ struct home_nav_scr_data {
 void standby_text_timer_update(struct home_nav_scr_data *scr_data);
 void home_handle_activity(struct home_nav_scr_data *scr_data);
 void home_reset(struct home_nav_scr_data *scr_data);
+void home_camera_preview_cancel_for_wakeup(struct home_nav_scr_data *scr_data);
 
 #endif // __HOME_PRESENTER_H__

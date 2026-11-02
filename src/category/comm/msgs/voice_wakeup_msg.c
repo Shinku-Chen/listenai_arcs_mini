@@ -1,5 +1,6 @@
 #include "stdint.h"
 #include "stddef.h"
+#include "string.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -11,11 +12,13 @@
 
 #include "voice_cloud.h"
 #include "service_image.h"
+#include "app_wakeup.h"
 
 #include "app_player.h"
 #include "tone.h"
 #include "voice_player_comm.h"
 #include "voice_player/voice_player_tts.h"
+#include "voice_intent_photo_flow.h"
 #include "lisa_log.h"
 
 __attribute__((weak)) bool app_voice_interaction_blocked(void)
@@ -36,6 +39,14 @@ static bool is_valid_keyword(char *keyword)
     }
 
     return true;
+}
+
+/* arcs-mini maps a single K1 click to this synthetic keyword so it can use
+ * the same one-shot cloud interaction path as a voice wake.  It must remain
+ * usable when the optional wakeword engine failed to load. */
+static bool is_button_wakeup_keyword(const char *keyword)
+{
+    return keyword != NULL && strcmp(keyword, "xiao ling xiao ling") == 0;
 }
 
 static bool voice_wakeup_should_open_info(uint32_t *status_out)
@@ -125,13 +136,17 @@ static bool start_voice_cloud(struct app_datas *app_datas)
         return false;
     }
 
+    const app_interaction_mode_t mode = app_interaction_mode_get_effective(app_datas);
+    LOGI("interaction mode: configured=%u effective=%u forced=%u",
+         app_datas->int_mode, mode, app_interaction_mode_is_forced_single());
     const char *keywords[] = {CONFIG_APP_WAKE_WORD_DEFAULT};
     struct voice_cloud_chat_config chat_config = {
-        .full_duplex = app_interaction_mode_is_continuous(app_datas->int_mode),
-        .wait_wakeup_tone = app_datas->int_mode == APP_INTERACTION_MODE_MULTI_NO_INTERRUPT ||
-                            app_datas->int_mode == APP_INTERACTION_MODE_SINGLE,
+        .full_duplex = app_interaction_mode_is_continuous(mode),
+        .wait_wakeup_tone = mode == APP_INTERACTION_MODE_MULTI_NO_INTERRUPT ||
+                            mode == APP_INTERACTION_MODE_SINGLE,
         .timeout_ms = app_datas->full_duplex_timeout_ms,
-        .oneshot = app_interaction_mode_is_continuous(app_datas->int_mode) ? false : app_datas->oneshot,
+        .oneshot = app_interaction_mode_is_forced_single() ||
+                   (!app_interaction_mode_is_continuous(mode) && app_datas->oneshot),
         .words = (char **)keywords,
         .words_cnt = 1,
     };
@@ -156,6 +171,7 @@ static bool voice_wakeup_tts_interrupt_needed(void)
 
 static void interrupt_photo_flow(const char *source)
 {
+    voice_msg_camera_preview_exit_t exit = {.wakeup = true};
     app_player_state_t state;
     uint32_t playback_position_ms = 0;
     bool position_valid = false;
@@ -183,8 +199,11 @@ static void interrupt_photo_flow(const char *source)
         if (voice_cloud_is_session_active() && voice_cloud_chat_stop() != 0) {
             LOGW("cancel interrupted cloud session failed");
         }
+    } else if (voice_player_tts_is_active()) {
+        /* A result URL can be queued before the player enters PREPARING. */
+        voice_player_tts_stop_async();
     }
-    voice_msg_pub(VOICE_MSG_APP_CAMERA_PREVIEW_EXIT, NULL, 0);
+    voice_msg_pub(VOICE_MSG_APP_CAMERA_PREVIEW_EXIT, &exit, sizeof(exit));
 }
 
 static void voice_wakeup_keyword(void *unused, uint32_t msg_id, void *data, uint32_t len, void *user_data)
@@ -199,6 +218,11 @@ static void voice_wakeup_keyword(void *unused, uint32_t msg_id, void *data, uint
 
     if ((app_datas->voice_work_mode & VOICE_WORK_MODE_VOICE_WAKEUP) == 0) {
         LOGW("ignore wakeup evt, voice work mode: %d", app_datas->voice_work_mode);
+        return;
+    }
+
+    if (!app_wakeup_is_available() && !is_button_wakeup_keyword((const char *)data)) {
+        LOGW("ignore wakeup keyword: wakeword resource unavailable");
         return;
     }
 
@@ -274,7 +298,8 @@ static void voice_msg_btn_wakeup_start(void *unused, uint32_t msg_id, void *data
         return;
     }
 
-    if ((app_datas->voice_work_mode & VOICE_WORK_MODE_BUTTON_WAKEUP) == 0) {
+    if ((app_datas->voice_work_mode & VOICE_WORK_MODE_BUTTON_WAKEUP) == 0 &&
+        app_wakeup_is_available()) {
         LOGW("ignore button evt, voice work mode: %d", app_datas->voice_work_mode);
         return;
     }
@@ -304,7 +329,8 @@ static void voice_msg_btn_wakeup_stop(void *unused, uint32_t msg_id, void *data,
         return;
     }
 
-    if ((app_datas->voice_work_mode & VOICE_WORK_MODE_BUTTON_WAKEUP) == 0) {
+    if ((app_datas->voice_work_mode & VOICE_WORK_MODE_BUTTON_WAKEUP) == 0 &&
+        app_wakeup_is_available()) {
         LOGW("ignore button evt, voice work mode: %d", app_datas->voice_work_mode);
         return;
     }

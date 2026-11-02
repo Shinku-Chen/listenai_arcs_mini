@@ -17,16 +17,23 @@
 #define BRIGHTNESS_CONTROL_NAME "ls.display_set_brightness"
 #define VOLUME_CONTROL_NAME "ls.set_volume"
 #define DUPLEX_SWITCH_NAME "ls.built_in.switch_full_duplex_v2"
+#define DESCRIBE_NAME "ls.built_in.miniapp_describe"
+#define ACTION_NAME "ls.built_in.miniapp_action"
 
 bool app_mcp_tool_call_allowed(const char *name)
 {
     return !miniapp_is_active() || (name &&
            (strcmp(name, INSTALL_NAME) == 0 ||
             strcmp(name, "ls.built_in.miniapp_exit") == 0 ||
+            /* 结束语音对话时保留小应用运行。 */
+            strcmp(name, "ls.built_in.exit") == 0 ||
+            strcmp(name, "ls.built_in.show_qrcode") == 0 ||
             strcmp(name, "ls.built_in.get_device_capabilities") == 0 ||
             strcmp(name, DEVICE_CONTROL_NAME) == 0 ||
             strcmp(name, BRIGHTNESS_CONTROL_NAME) == 0 ||
             strcmp(name, VOLUME_CONTROL_NAME) == 0 ||
+            strcmp(name, DESCRIBE_NAME) == 0 ||
+            strcmp(name, ACTION_NAME) == 0 ||
             strcmp(name, DUPLEX_SWITCH_NAME) == 0));
 }
 
@@ -56,6 +63,7 @@ static cJSON *miniapp_install_list(const char *name)
     cJSON *properties = mcp_tool_info_properties_get(tool);
     const struct { const char *key; int max; } limits[] = {
         {"id", MINIAPP_ID_MAX}, {"version", MINIAPP_VERSION_MAX},
+        {"name", MINIAPP_NAME_MAX},
         {"url", HTTP_CLIENT_MAX_URL_LENGTH - 1},
     };
     for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); ++i) {
@@ -207,6 +215,7 @@ static cJSON *miniapp_install_call(const char *id, const char *name, cJSON *args
     const cJSON *size = cJSON_GetObjectItemCaseSensitive(args, "size");
     bool valid = copy_string(args, "id", job->package.id, sizeof(job->package.id)) &&
         copy_string(args, "version", job->package.version, sizeof(job->package.version)) &&
+        copy_string(args, "name", job->package.name, sizeof(job->package.name)) &&
         copy_string(args, "url", job->url, sizeof(job->url)) &&
         copy_string(args, "hash", job->package.hash, sizeof(job->package.hash)) &&
         strlen(job->package.hash) == 32 &&
@@ -223,7 +232,7 @@ static cJSON *miniapp_install_call(const char *id, const char *name, cJSON *args
     }
     if (!valid) {
         lisa_mem_free(job);
-        return miniapp_mcp_result(name, "invalid id, version, url, size or hash", true);
+        return miniapp_mcp_result(name, "invalid id, version, name, url, size or hash", true);
     }
     job->package.size = (uint32_t)size->valuedouble;
     memcpy(job->call_id, id, strlen(id) + 1);

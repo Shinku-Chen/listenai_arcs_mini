@@ -47,7 +47,7 @@ typedef struct {
 struct model_camera_preview_cb {
     void (*on_start)(void *arg, const model_camera_preview_req_t *req);
     void (*on_capture)(void *arg);
-    void (*on_exit)(void *arg);
+    void (*on_exit)(void *arg, bool wakeup);
     void (*on_result_tts_ready)(void *arg);
 };
 

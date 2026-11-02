@@ -19,11 +19,14 @@
 #include "service_volume.h"
 #include "service_brightness.h"
 
-static void kv_apply_interaction_mode(app_interaction_mode_t interaction_mode)
+static int kv_apply_interaction_mode(app_interaction_mode_t interaction_mode)
 {
-    model_voice_interaction_mode_set((int)interaction_mode);
+    if (model_voice_interaction_mode_set((int)interaction_mode) != 0) {
+        return -1;
+    }
 
     voice_msg_pub(VOICE_MSG_CLOUD_MCP_CHAT_EXIT, NULL, 0);
+    return 0;
 }
 
 static int kv_cmd_del(int argc, char **argv)
@@ -136,13 +139,19 @@ static int kv_cmd_set(int argc, char **argv)
                 return 0;
             }
 
+            if (!strcmp(key, KV_KEY_INT_MODE)) {
+                if (kv_apply_interaction_mode((app_interaction_mode_t)int_temp) != 0) {
+                    shellPrint(shellGetCurrent(), "interaction mode unavailable: wakeup resources require single mode\n");
+                    return -1;
+                }
+                shellPrint(shellGetCurrent(), "interaction mode change requested: %d\n", int_temp);
+                return 0;
+            }
+
             if (lisa_kv_set_int(key, int_temp) != 0) {
                 shellPrint(shellGetCurrent(),"flash set %s:%d failed\n", key, int_temp);
             } else {
                 shellPrint(shellGetCurrent(),"flash set %s:%d success\n", key, int_temp);
-                if (!strcmp(key, KV_KEY_INT_MODE)) {
-                    kv_apply_interaction_mode((app_interaction_mode_t)int_temp);
-                }
             }
         } else if (!strcmp(type, "bool")) {
             int bool_temp = atoi(value);

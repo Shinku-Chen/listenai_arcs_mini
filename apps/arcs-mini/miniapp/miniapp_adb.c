@@ -115,6 +115,7 @@ static bool parse_path(miniapp_adb_t *ctx)
               (c >= '0' && c <= '9') || c == '_' || c == '-')) return false;
     }
     snprintf(ctx->package.id, sizeof(ctx->package.id), "local:%.*s", (int)id_len, id);
+    snprintf(ctx->package.name, sizeof(ctx->package.name), "%.*s", (int)id_len, id);
     return true;
 }
 

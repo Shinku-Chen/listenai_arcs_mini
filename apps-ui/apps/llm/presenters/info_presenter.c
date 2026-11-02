@@ -17,6 +17,7 @@ struct info_nav_scr_data {
     lv_timer_t *retry_qr;    /**< QR data retry timer */
     lv_timer_t *guard_timer; /**< Provisioning guard timer */
     bool provision_locked;   /**< Whether provisioning page is currently forced */
+    uint32_t qr_wait_started;
 };
 
 static void auto_return_timer_cb(lv_timer_t *timer);
@@ -102,12 +103,16 @@ static void retry_qr_timer_cb(lv_timer_t *timer)
         lisa_ui_info_view_set_top_text(scr_data->view, qr_data.top_text);
         lisa_ui_info_view_set_bottom_text(scr_data->view, qr_data.bottom_text);
 
-        if (qr_data.qr_image) {
-            lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
+        lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
+        if (qr_data.qr_image || qr_data.status != QR_STATUS_CONNECTED) {
             if (scr_data->retry_qr) {
                 lv_timer_del(scr_data->retry_qr);
                 scr_data->retry_qr = NULL;
             }
+        } else if (lv_tick_elaps(scr_data->qr_wait_started) >= 10000) {
+            /* 继续等待迟到的下载结果，但不要无限显示“加载中”。 */
+            lisa_ui_info_view_set_top_text(scr_data->view, "二维码暂未就绪");
+            lisa_ui_info_view_set_bottom_text(scr_data->view, "请稍后重试\n单击返回");
         }
     } else {
         LISA_UI_LOGE("Failed to get QR data on retry, will retry again");
@@ -154,11 +159,11 @@ static int info_nav_scr_open(const struct lisa_ui_nav_scr *scr, void **data)
         lisa_ui_info_view_set_top_text(scr_data->view, qr_data.top_text);
         lisa_ui_info_view_set_bottom_text(scr_data->view, qr_data.bottom_text);
 
-        if (qr_data.qr_image) {
-            lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
-        } else {
+        lisa_ui_info_view_set_qr_image(scr_data->view, qr_data.qr_image);
+        if (!qr_data.qr_image && qr_data.status == QR_STATUS_CONNECTED) {
             LISA_UI_LOGD("QR image not ready, creating retry timer");
-            scr_data->retry_qr = lv_timer_create(retry_qr_timer_cb, 100, scr_data);
+            scr_data->qr_wait_started = lv_tick_get();
+            scr_data->retry_qr = lv_timer_create(retry_qr_timer_cb, 500, scr_data);
         }
     } else {
         LISA_UI_LOGE("Failed to get QR data from model");

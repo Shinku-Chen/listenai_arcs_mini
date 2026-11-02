@@ -14,6 +14,7 @@
 #include "lisa_log.h"
 
 #include "acomp_logger.h"
+#include "acomp_wakeup.h"
 #include "app_tone.h"
 #include "app_wakeup.h"
 #include "battery/battery.h"
@@ -63,6 +64,7 @@ struct power_policy_context {
     bool interaction_active;
     bool tts_active;
     bool music_active;
+    bool alarm_active;
     bool miniapp_active;
     bool warning_waiting;
     bool countdown_active;
@@ -71,6 +73,17 @@ struct power_policy_context {
 };
 
 static struct power_policy_context s_policy;
+
+static int power_policy_set_vad_gate(bool enabled)
+{
+    int ret = acomp_wakeup_set_vad_gate_enabled(enabled ? 1U : 0U);
+
+    if (ret != 0) {
+        LISA_LOGW(TAG, "Standby VAD gate switch failed: enabled=%u ret=%d",
+                  (unsigned int)enabled, ret);
+    }
+    return ret;
+}
 
 static const char *power_policy_state_name(service_power_policy_state_t state)
 {
@@ -142,6 +155,13 @@ int service_power_policy_set_runtime_suspended(bool suspended)
         }
 #endif
 
+        if (service_power_policy_get_state() == VOICE_MSG_POWER_POLICY_STATE_HIBERNATE) {
+            step_ret = power_policy_set_vad_gate(true);
+            if (step_ret != 0 && ret == 0) {
+                ret = step_ret;
+            }
+        }
+
 #if CONFIG_WIFI
         step_ret = sys_wifi_set_standby_power_save(true);
         if (step_ret != 0) {
@@ -168,6 +188,11 @@ int service_power_policy_set_runtime_suspended(bool suspended)
         xSemaphoreGive(s_policy.runtime_lock);
         LISA_LOGI(TAG, "Runtime hibernate active: audio/logger/battery reduced, WiFi DTIM power-save, core 150 MHz");
         return ret;
+    }
+
+    step_ret = power_policy_set_vad_gate(false);
+    if (step_ret != 0) {
+        ret = step_ret;
     }
 
     LISA_LOGI(TAG, "Runtime resume: core clock begin");
@@ -450,6 +475,29 @@ static void power_policy_on_button(void *unused, uint32_t msg_id, void *data,
     power_policy_mark_activity(VOICE_MSG_POWER_POLICY_REASON_BUTTON);
 }
 
+static void power_policy_on_alarm(void *unused, uint32_t msg_id, void *data,
+                                  uint32_t len, void *user_data)
+{
+    bool active = msg_id == VOICE_MSG_ALARM_TRIGGER;
+
+    (void)unused;
+    (void)data;
+    (void)len;
+    (void)user_data;
+
+    /* Track the alarm session, including gaps between reminder speech and
+     * repeating tones. Stopping or snoozing starts a fresh idle interval. */
+    xSemaphoreTake(s_policy.state_lock, portMAX_DELAY);
+    s_policy.alarm_active = active;
+    s_policy.last_activity_tick = xTaskGetTickCount();
+    xSemaphoreGive(s_policy.state_lock);
+
+    if (active) {
+        (void)power_policy_transition(VOICE_MSG_POWER_POLICY_STATE_NORMAL,
+                                      VOICE_MSG_POWER_POLICY_REASON_INTERACTION);
+    }
+}
+
 static void power_policy_on_tone_completed(void *unused, uint32_t msg_id,
                                            void *data, uint32_t len,
                                            void *user_data)
@@ -495,7 +543,7 @@ static void power_policy_task(void *arg)
         xSemaphoreTake(s_policy.state_lock, portMAX_DELAY);
         state = s_policy.state;
         busy = s_policy.interaction_active || s_policy.tts_active ||
-               s_policy.music_active;
+               s_policy.music_active || s_policy.alarm_active;
         miniapp_active = s_policy.miniapp_active;
         elapsed = now - s_policy.last_activity_tick;
         warning_waiting = s_policy.warning_waiting;
@@ -610,6 +658,8 @@ int service_power_policy_init(void)
     ret |= voice_msg_sub(VOICE_MSG_PLAYER_MUSIC_PLAYING, power_policy_on_player, NULL);
     ret |= voice_msg_sub(VOICE_MSG_PLAYER_MUSIC_STOPPED, power_policy_on_player, NULL);
     ret |= voice_msg_sub(VOICE_MSG_BUTTON_CHANGE, power_policy_on_button, NULL);
+    ret |= voice_msg_sub(VOICE_MSG_ALARM_TRIGGER, power_policy_on_alarm, NULL);
+    ret |= voice_msg_sub(VOICE_MSG_ALARM_STOPPED, power_policy_on_alarm, NULL);
     ret |= voice_msg_sub(VOICE_MSG_PLAYER_TONE_COMPLETED,
                          power_policy_on_tone_completed, NULL);
     if (ret != 0) {
@@ -672,9 +722,12 @@ static int power_policy_shell_cmd(int argc, char **argv)
                (unsigned int)audio_diag.cloud_non_silent_frames_since_wake,
                (unsigned int)audio_diag.cloud_send_failures_since_wake,
                (unsigned int)audio_diag.last_cloud_peak);
+        printf("audio_route wakeup_available=%u mic_bypass_frames=%u\n",
+               (unsigned int)app_wakeup_is_available(),
+               (unsigned int)audio_diag.mic_bypass_frames_since_wake);
         printf("audio_power suspend=%u resume=%u resume_fail=%u adc_low=%u "
                "ref_off=%u playback_off=%u interaction=%u tts=%u music=%u "
-               "miniapp=%u\n",
+               "miniapp=%u alarm=%u\n",
                (unsigned int)audio_diag.suspend_count,
                (unsigned int)audio_diag.resume_count,
                (unsigned int)audio_diag.resume_failures,
@@ -684,7 +737,8 @@ static int power_policy_shell_cmd(int argc, char **argv)
                (unsigned int)s_policy.interaction_active,
                (unsigned int)s_policy.tts_active,
                (unsigned int)s_policy.music_active,
-               (unsigned int)s_policy.miniapp_active);
+               (unsigned int)s_policy.miniapp_active,
+               (unsigned int)s_policy.alarm_active);
         return 0;
     }
 

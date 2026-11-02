@@ -1,4 +1,5 @@
 #include "miniapp.h"
+#include "miniapp_draw.h"
 
 #if MINIAPP_HAS_SCREEN
 
@@ -20,10 +21,6 @@
 typedef struct {
     lv_obj_t *root;
     lv_timer_t *render_timer;
-    lv_obj_t *rects[MINIAPP_MAX_RECTS];
-    lv_obj_t *texts[MINIAPP_MAX_TEXTS];
-    uint16_t rect_count;
-    uint16_t text_count;
     uint32_t applied_sequence;
 } miniapp_page_t;
 
@@ -33,66 +30,49 @@ static int s_nav_result;
 static uint32_t s_nav_generation;
 static uint32_t s_nav_completed;
 static SemaphoreHandle_t s_scene_lock;
-// A complete scene is just over 2 KB. Keep both handoff buffers in PSRAM so
-// enabling miniapps does not consume the default board's scarce static SRAM.
+// Keep command buffers in PSRAM; no per-command LVGL objects are allocated.
 static miniapp_scene_t *s_pending_scene;
 static miniapp_scene_t *s_render_scene;
 static uint32_t s_scene_sequence;
 static uint32_t s_applied_sequence;
 static bool s_page_open;
 
-static void miniapp_apply_scene(miniapp_page_t *page, const miniapp_scene_t *scene)
+static void miniapp_draw_event(lv_event_t *event)
 {
-    lv_obj_set_style_bg_color(page->root, lv_color_hex(scene->background), 0);
-    for (size_t i = 0; i < scene->rect_count; ++i) {
-        lv_obj_t *obj = page->rects[i];
-        const miniapp_rect_t *rect = &scene->rects[i];
-        lv_obj_set_pos(obj, rect->x, rect->y);
-        lv_obj_set_size(obj, rect->w, rect->h);
-        lv_obj_set_style_bg_color(obj, lv_color_hex(rect->color), 0);
-        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
-        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
-    }
-    for (size_t i = scene->rect_count; i < page->rect_count; ++i) {
-        lv_obj_add_flag(page->rects[i], LV_OBJ_FLAG_HIDDEN);
-    }
-    page->rect_count = scene->rect_count;
-
-    for (size_t i = 0; i < scene->text_count; ++i) {
-        lv_obj_t *label = page->texts[i];
-        const miniapp_text_t *text = &scene->texts[i];
-        lv_obj_set_pos(label, text->x, text->y);
-        lv_obj_set_style_text_color(label, lv_color_hex(text->color), 0);
-        lv_label_set_text(label, text->text);
-        lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
-    }
-    for (size_t i = scene->text_count; i < page->text_count; ++i) {
-        lv_obj_add_flag(page->texts[i], LV_OBJ_FLAG_HIDDEN);
-    }
-    page->text_count = scene->text_count;
+    lv_obj_t *obj = lv_event_get_target(event);
+    lv_area_t area;
+    lv_obj_get_coords(obj, &area);
+    miniapp_draw_scene(lv_event_get_draw_ctx(event), s_render_scene, area.x1, area.y1);
 }
 
 static void miniapp_render_timer_cb(lv_timer_t *timer)
 {
     miniapp_page_t *page = timer ? timer->user_data : NULL;
-    miniapp_scene_t *scene = s_render_scene;
-    uint32_t sequence;
-
-    if (!page || !scene || !s_pending_scene || !s_scene_lock ||
-        xSemaphoreTake(s_scene_lock, 0) != pdTRUE) {
+    if (!page || !s_render_scene || !s_pending_scene || !s_scene_lock || xSemaphoreTake(s_scene_lock, 0) != pdTRUE) {
         return;
     }
-    sequence = s_scene_sequence;
+    uint32_t sequence = s_scene_sequence;
     if (sequence == page->applied_sequence) {
         xSemaphoreGive(s_scene_lock);
         return;
     }
-    *scene = *s_pending_scene;
+    lv_area_t damage;
+    bool changed = miniapp_scene_damage(s_render_scene, s_pending_scene, &damage);
+    miniapp_scene_copy(s_render_scene, s_pending_scene);
     xSemaphoreGive(s_scene_lock);
-
-    miniapp_apply_scene(page, scene);
     page->applied_sequence = sequence;
-
+    if (changed) {
+        lv_area_t coords;
+        lv_obj_get_coords(page->root, &coords);
+        damage.x1 += coords.x1;
+        damage.x2 += coords.x1;
+        damage.y1 += coords.y1;
+        damage.y2 += coords.y1;
+        lv_obj_invalidate_area(page->root, &damage);
+        /* Apply and refresh together, at the display cadence. This avoids a
+         * second free-running phase and never calls LVGL from the Lua task. */
+        lv_refr_now(lv_obj_get_disp(page->root));
+    }
     xSemaphoreTake(s_scene_lock, portMAX_DELAY);
     s_applied_sequence = sequence;
     xSemaphoreGive(s_scene_lock);
@@ -120,31 +100,10 @@ static int miniapp_page_open(const struct lisa_ui_nav_scr *scr, void **data)
     lv_obj_set_style_bg_color(page->root, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(page->root, LV_OPA_COVER, 0);
 
-    for (size_t i = 0; i < MINIAPP_MAX_RECTS; ++i) {
-        page->rects[i] = lv_obj_create(page->root);
-        if (!page->rects[i]) {
-            lv_obj_del(page->root);
-            lisa_ui_free(page);
-            return -1;
-        }
-        lv_obj_clear_flag(page->rects[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_border_width(page->rects[i], 0, 0);
-        lv_obj_set_style_radius(page->rects[i], 0, 0);
-        lv_obj_set_style_pad_all(page->rects[i], 0, 0);
-        lv_obj_add_flag(page->rects[i], LV_OBJ_FLAG_HIDDEN);
-    }
-    for (size_t i = 0; i < MINIAPP_MAX_TEXTS; ++i) {
-        page->texts[i] = lv_label_create(page->root);
-        if (!page->texts[i]) {
-            lv_obj_del(page->root);
-            lisa_ui_free(page);
-            return -1;
-        }
-        lv_obj_set_style_text_font(page->texts[i], &lv_font_chinese_16, 0);
-        lv_obj_set_style_text_align(page->texts[i], LV_TEXT_ALIGN_LEFT, 0);
-        lv_obj_add_flag(page->texts[i], LV_OBJ_FLAG_HIDDEN);
-    }
-    page->render_timer = lv_timer_create(miniapp_render_timer_cb, 20, page);
+    lv_obj_add_event_cb(page->root, miniapp_draw_event, LV_EVENT_DRAW_MAIN, NULL);
+    lv_timer_t *refresh = _lv_disp_get_refr_timer(lv_obj_get_disp(page->root));
+    page->render_timer = lv_timer_create(miniapp_render_timer_cb,
+                                        refresh ? refresh->period : LV_DISP_DEF_REFR_PERIOD, page);
     if (!page->render_timer) {
         lv_obj_del(page->root);
         lisa_ui_free(page);
@@ -331,7 +290,7 @@ int miniapp_ui_present(const miniapp_scene_t *scene)
     }
 
     xSemaphoreTake(s_scene_lock, portMAX_DELAY);
-    *s_pending_scene = *scene;
+    miniapp_scene_copy(s_pending_scene, scene);
     s_scene_sequence++;
     xSemaphoreGive(s_scene_lock);
     return 0;

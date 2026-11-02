@@ -302,6 +302,7 @@ static cJSON *mcp_do_tools_call(const char *id, cJSON *msg)
 
     const char *name_str = name->valuestring;
     if (!app_mcp_tool_call_allowed(name_str)) {
+        LOGW("mcp tool %.127s rejected in current application mode", name_str);
         return cJSON_Parse("{\"isError\":true,\"content\":[{\"type\":\"text\","
                            "\"text\":\"tool unavailable in current application mode\"}]}");
     }

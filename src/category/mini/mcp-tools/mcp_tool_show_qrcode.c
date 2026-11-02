@@ -55,21 +55,33 @@ static cJSON *show_qrcode_list(const char *name)
 
 static cJSON *show_qrcode_call(const char *id, const char *name, cJSON *args)
 {
+    (void)id;
+    bool exit_failed = false;
     const cJSON *url_json = mcp_tool_call_args_get(args, "url");
     const cJSON *message_json = mcp_tool_call_args_get(args, "message");
     const cJSON *err_code_json = mcp_tool_call_args_get(args, "err_code");
 
-    if (!url_json || !url_json->valuestring) {
+    if (!cJSON_IsString(url_json) || !url_json->valuestring[0]) {
         LOGE("MCP tool call args get url failed");
         return NULL;
     }
 
     const char *url = url_json->valuestring;
-    const char *message = (message_json && message_json->valuestring) ? message_json->valuestring : "";
-    const char *err_code = (err_code_json && err_code_json->valuestring) ? err_code_json->valuestring : "";
+    const char *message = cJSON_IsString(message_json) ? message_json->valuestring : "";
+    const char *err_code = cJSON_IsString(err_code_json) ? err_code_json->valuestring : "";
 
     LOGI("MCP show_qrcode received - url: %s, message: %s, err_code: %s", url, message, err_code);
 
+    /* End voice input while preserving the foreground app and the quota
+     * announcement that the cloud may send after this tool call. */
+    if (strncmp(err_code, "OutOfChatLimit", strlen("OutOfChatLimit")) == 0) {
+        if (voice_msg_pub(VOICE_MSG_CLOUD_MCP_CHAT_EXIT, NULL, 0) != 0) {
+            LOGE("Failed to end voice session for quota limit");
+            exit_failed = true;
+        } else {
+            LOGI("End voice session due to %s", err_code);
+        }
+    }
 
     cJSON *payload = cJSON_CreateObject();
     if (!payload) {
@@ -96,10 +108,11 @@ static cJSON *show_qrcode_call(const char *id, const char *name, cJSON *args)
     cJSON *content_array = cJSON_CreateArray();
     cJSON *content_item = cJSON_CreateObject();
     cJSON_AddStringToObject(content_item, "type", "text");
-    cJSON_AddStringToObject(content_item, "text", "Operation completed");
+    cJSON_AddStringToObject(content_item, "text",
+                           exit_failed ? "Failed to end voice session" : "Operation completed");
     cJSON_AddItemToArray(content_array, content_item);
     cJSON_AddItemToObject(result, "content", content_array);
-    cJSON_AddBoolToObject(result, "isError", false);
+    cJSON_AddBoolToObject(result, "isError", exit_failed);
 
     return result;
 }

@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include "mcp.h"
 #include "miniapp.h"
+#include "miniapp_synth.h"
+#include "miniapp_audio.h"
 #include "miniapp_storage.h"
 #include "project_version.h"
 #ifdef CONFIG_LISA_DISPLAY_DEVICE
@@ -80,9 +82,35 @@ static cJSON *capabilities_call(const char *id, const char *name, cJSON *args)
         !cJSON_AddNumberToObject(sdk, "heap_max_bytes", MINIAPP_LUA_HEAP_LIMIT)) {
         goto failed;
     }
+#if MINIAPP_HAS_SCREEN
+    cJSON *graphics = cJSON_AddObjectToObject(sdk, "graphics");
+    if (!graphics || !cJSON_AddNumberToObject(graphics, "max_shapes", MINIAPP_MAX_SHAPES) ||
+        !cJSON_AddNumberToObject(graphics, "max_texts", MINIAPP_MAX_TEXTS) ||
+        !cJSON_AddNumberToObject(graphics, "text_max_bytes", MINIAPP_TEXT_MAX)) goto failed;
+#endif
     cJSON *http = cJSON_AddObjectToObject(sdk, "http");
     cJSON *tts = cJSON_AddObjectToObject(sdk, "tts");
-    if (!http || !tts) goto failed;
+    cJSON *audio = cJSON_AddObjectToObject(sdk, "audio");
+    if (!http || !tts || !audio ||
+        !cJSON_AddNumberToObject(audio, "max_url_bytes", MINIAPP_AUDIO_MAX_URL_BYTES) ||
+        !cJSON_AddNumberToObject(audio, "max_players", 1) ||
+        !cJSON_AddBoolToObject(audio, "live", true) ||
+        !cJSON_AddBoolToObject(audio, "state_query", true)) goto failed;
+#if MINIAPP_HAS_BUZZER
+    cJSON *synth = cJSON_AddObjectToObject(sdk, "synth");
+    if (!synth || !cJSON_AddNumberToObject(synth, "sample_rate", MINIAPP_SYNTH_RATE) ||
+        !cJSON_AddNumberToObject(synth, "max_voices", MINIAPP_SYNTH_VOICES) ||
+        !cJSON_AddNumberToObject(synth, "max_notes", MINIAPP_SYNTH_NOTES) ||
+        !cJSON_AddNumberToObject(synth, "max_duration_ms", MINIAPP_SYNTH_MAX_DURATION_MS) ||
+        !cJSON_AddNumberToObject(synth, "queue_depth", MINIAPP_SYNTH_QUEUE_DEPTH) ||
+        !cJSON_AddBoolToObject(synth, "loop", true) ||
+        !cJSON_AddBoolToObject(synth, "pause_resume", true)) goto failed;
+    cJSON *waveforms = cJSON_Parse("[\"square\",\"triangle\",\"noise\"]");
+    if (!waveforms || !cJSON_AddItemToObject(synth, "waveforms", waveforms)) {
+        cJSON_Delete(waveforms);
+        goto failed;
+    }
+#endif
     cJSON *methods = cJSON_Parse("[\"GET\",\"POST\"]");
     if (!methods || !cJSON_AddItemToObject(http, "methods", methods)) {
         cJSON_Delete(methods);

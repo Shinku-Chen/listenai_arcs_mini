@@ -35,6 +35,7 @@ typedef struct {
     voice_msg_camera_preview_state_t preview;
     mcp_tts_state_t mcp_tts;
     button_photo_state_t button;
+    bool canceled;
 } photo_flow_context_t;
 
 static photo_flow_context_t s_photo_flow = {0};
@@ -109,6 +110,9 @@ static void photo_flow_intent_on_enter(void)
 static void photo_flow_intent_on_exit(void)
 {
     LOGI("PHOTO_FLOW on_exit");
+    if (s_photo_flow.canceled) {
+        return;
+    }
     mcp_photo_flow_exit();
 }
 
@@ -144,6 +148,10 @@ static void on_camera_preview_state_changed(void *unused, uint32_t msg_id,
         return;
     }
 
+    if (s_photo_flow.canceled) {
+        return;
+    }
+
     /* 按键拍照：检测拍照提交，标记等待结果 TTS。 */
     if (s_photo_flow.button == BUTTON_PHOTO_STATE_PREVIEW &&
         new_state->mode == CAMERA_PREVIEW_MODE_NONE &&
@@ -169,6 +177,7 @@ static void on_camera_preview_start(void *unused, uint32_t msg_id,
         return;
     }
 
+    s_photo_flow.canceled = false;
     switch (req->mode) {
     case CAMERA_PREVIEW_MODE_MCP:
         s_photo_flow.preview.active = 1;
@@ -217,6 +226,23 @@ static void on_camera_preview_exit(void *unused, uint32_t msg_id,
     (void)data;
     (void)len;
     (void)user_data;
+
+    if (voice_camera_preview_exit_is_wakeup(data, len)) {
+        /* A URL already queued behind WAKEUP may have started a new player
+         * request before this EXIT reaches the bus. Cancel that request too. */
+        if (voice_player_tts_is_active()) {
+            voice_player_tts_stop_async();
+        }
+        /* Cancel before popping so on_exit cannot replay the interrupted reply
+         * or emit a synthetic STOPPED into the new wakeup session. */
+        s_photo_flow = (photo_flow_context_t){.canceled = true};
+        voice_player_tts_discard_prepared_replay();
+        if (voice_intent_contains(INTENT_PHOTO_FLOW)) {
+            voice_intent_pop(INTENT_PHOTO_FLOW);
+        }
+        LOGI("photo flow canceled by wakeup, discard pending result TTS");
+        return;
+    }
 
     if (s_photo_flow.button != BUTTON_PHOTO_STATE_IDLE) {
         /* 按键预览取消（未拍照），直接退出 PHOTO_FLOW。 */

@@ -484,6 +484,26 @@ int app_player_core_stop_sync(app_player_t *player)
 
     PLAYER_MUTEX_LOCK(player->core_lock, LISA_OS_WAIT_FOREVER);
 
+    /* A cancelled URL can finish preparing without ever playing. The decoder
+     * cannot stop/reset directly from PREPARED. Use the same silent drain as
+     * play_ex: do not acquire PA or publish its intermediate PLAYING event. */
+    if (lisa_player_get_state(player->hld) == PLAYER_ST_PREPARED) {
+        player->drain_in_progress = true;
+        int drain_ret = lisa_player_play(player->hld);
+        if (drain_ret == PLAYER_OK) drain_ret = lisa_player_stop_sync(player->hld);
+        player->drain_in_progress = false;
+        if (drain_ret != PLAYER_OK) {
+            LISA_LOGW(TAG, "Core stop: prepared drain failed: %d", drain_ret);
+            PLAYER_MUTEX_UNLOCK(player->core_lock);
+            return -1;
+        }
+        player->is_preparing = false;
+        player->pause_preparing = false;
+        __enqueue_callback_event(player, APP_PLAYER_EVENT_STOPPED);
+        PLAYER_MUTEX_UNLOCK(player->core_lock);
+        return 0;
+    }
+
     int ret = lisa_player_stop_sync(player->hld);
     if (ret != PLAYER_OK) {
         LISA_LOGW(TAG, "Core stop sync failed: %d, resetting player", ret);

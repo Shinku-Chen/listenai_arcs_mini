@@ -320,10 +320,12 @@ lv_obj_t *lisa_ui_llm_primary_create(lv_obj_t *parent)
     lv_obj_add_flag(llm_primary->img, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(llm_primary->img, LV_OBJ_FLAG_FLOATING);  /* Make img ignore flex layout from the start */
 
-    lv_label_set_text(llm_primary->img_hint, "图片可在小聆AI小程序中查看");
+    lv_label_set_text(llm_primary->img_hint, "");
     lv_obj_set_style_text_color(llm_primary->img_hint, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_obj_set_style_text_font(llm_primary->img_hint, &lv_font_chinese_16, LV_PART_MAIN);
     lv_obj_set_style_text_align(llm_primary->img_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(llm_primary->img_hint, lv_disp_get_hor_res(NULL) - 24);
+    lv_label_set_long_mode(llm_primary->img_hint, LV_LABEL_LONG_WRAP);
     lv_obj_add_flag(llm_primary->img_hint, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(llm_primary->img_hint, LV_OBJ_FLAG_IGNORE_LAYOUT);
     lv_obj_align(llm_primary->img_hint, LV_ALIGN_BOTTOM_MID, 0, -5);
@@ -842,8 +844,14 @@ void lisa_ui_llm_primary_img_hint_show(lv_obj_t *obj, const char *text)
         return;
     }
 
-    lv_label_set_text(llm_primary->img_hint, text ? text : "");
-    lv_obj_align(llm_primary->img_hint, LV_ALIGN_BOTTOM_MID, 0, -5);
+    const char *hint = text ? text : "";
+    lv_point_t size;
+    lv_txt_get_size(&size, hint, &lv_font_chinese_16, 0, 0,
+                    lv_disp_get_hor_res(NULL) - 24, LV_TEXT_FLAG_NONE);
+    lv_label_set_text(llm_primary->img_hint, hint);
+    /* This font's visible glyphs extend below its nominal line height. */
+    lv_obj_set_height(llm_primary->img_hint, size.y + 4);
+    lv_obj_align(llm_primary->img_hint, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_obj_move_foreground(llm_primary->img_hint);
     lv_obj_clear_flag(llm_primary->img_hint, LV_OBJ_FLAG_HIDDEN);
 }

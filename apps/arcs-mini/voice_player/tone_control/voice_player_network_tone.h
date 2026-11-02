@@ -12,4 +12,10 @@
  */
 int voice_player_network_tone_init(void);
 
+/* 请求播放配网提示音；UI 未就绪时会延迟到 UI 就绪后播放。 */
+void voice_player_network_tone_request_netcfg_tone(void);
+
+/* UI 完成初始化后再允许播放启动阶段的网络提示音。 */
+void voice_player_network_tone_ui_ready(void);
+
 #endif /* VOICE_PLAYER_NETWORK_TONE_H */

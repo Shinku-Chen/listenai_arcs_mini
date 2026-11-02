@@ -5,6 +5,9 @@
 #include "task.h"
 
 #include "lvgl.h"
+#ifdef CONFIG_LISA_JPEG
+#include "lv_img_hw_jpeg.h"
+#endif
 #include "lv_port_disp.h"
 
 #include "lisa_log.h"
@@ -32,6 +35,9 @@ static bool s_lvgl_handler_pending;
 int lisa_ui_lvgl_init()
 {
     lv_init();
+#ifdef CONFIG_LISA_JPEG
+    lv_img_hw_jpeg_init();
+#endif
 
     char *locale = NULL;
 
